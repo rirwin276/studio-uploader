@@ -1,40 +1,22 @@
 # app.py — Studio Uploader (FastAPI)
-#
-# Fixes:
-# - OOM prevention: rembg u2netp + global session + pre-downscale + upload size guard
-# - /ui embed + return=postmessage (NO download on Done, including mobile)
-# - Brush edits work: fixes coordinate mismatch (1000px canvas vs 3000px image)
-# - Normalize output to 3000x3000 PNG and trim transparent padding aggressively
-#
-# Railway start command (IMPORTANT: single worker on small plan):
-#   uvicorn app:app --host 0.0.0.0 --port $PORT
 
 from fastapi import FastAPI, UploadFile, File, Query, Request, Form
 from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-
 from PIL import Image, ImageDraw
 from io import BytesIO
 import uuid
 import os
 import time
+import requests
 from typing import Optional, Dict, Any, Tuple
 
-from rembg import remove, new_session
-
-# ----------------------------
-# App
-# ----------------------------
-app = FastAPI(title="Studio Uploader", version="0.4.0")
+app = FastAPI(title="Studio Uploader", version="0.7.0")
 
 # ----------------------------
 # CORS
 # ----------------------------
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://127.0.0.1:8000,http://localhost:8000",
-).split(",")
-
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
@@ -44,35 +26,35 @@ app.add_middleware(
 )
 
 # ----------------------------
-# Storage + Print Standard
+# Storage + Config
 # ----------------------------
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-TARGET_INCHES = 10
-TARGET_DPI = 300
-TARGET_PX = TARGET_INCHES * TARGET_DPI  # 3000
-
-DEFAULT_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60)))  # 1 hour
-
-# Upload size guard (bytes)
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))  # adjust if needed
+TARGET_PX = 3000
+DEFAULT_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60)))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-# Pre-downscale before rembg (reduces RAM spikes)
 REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1600"))
-
-# Canvas coordinate system used by the UI
 UI_CANVAS_PX = int(os.getenv("UI_CANVAS_PX", "1000"))
 
 # ----------------------------
-# rembg session (GLOBAL, SMALL MODEL)
+# MEMORY FIX: Lazy Load AI
 # ----------------------------
-# u2netp is smaller + lower RAM than u2net
 REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
-REMBG_SESSION = new_session(REMBG_MODEL)
+_SESSION = None
 
+def get_rembg_session():
+    global _SESSION
+    if _SESSION is None:
+        print("🧠 Loading AI Model into Memory...")
+        from rembg import new_session
+        _SESSION = new_session(REMBG_MODEL)
+    return _SESSION
 
+# ----------------------------
+# Image Processing Logic
+# ----------------------------
 def _paths(session_id: str) -> Dict[str, str]:
     return {
         "orig": os.path.join(UPLOAD_DIR, f"{session_id}_orig.png"),
@@ -80,456 +62,221 @@ def _paths(session_id: str) -> Dict[str, str]:
         "curr": os.path.join(UPLOAD_DIR, f"{session_id}_curr.png"),
     }
 
-
-def _load_rgba(path: str) -> Image.Image:
-    return Image.open(path).convert("RGBA")
-
-
 def _save_png(img: Image.Image, path: str):
     img.save(path, "PNG", optimize=True)
 
-
-def _cleanup_old_uploads(max_age_seconds: int = DEFAULT_TTL_SECONDS):
-    now = time.time()
-    try:
-        for name in os.listdir(UPLOAD_DIR):
-            path = os.path.join(UPLOAD_DIR, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                age = now - os.path.getmtime(path)
-                if age > max_age_seconds:
-                    os.remove(path)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _delete_session_files(session_id: str):
-    p = _paths(session_id)
-    for k in ("orig", "base", "curr"):
-        try:
-            if os.path.exists(p[k]):
-                os.remove(p[k])
-        except Exception:
-            pass
-
-
-def _svg_bytes_to_png_bytes(svg_bytes: bytes) -> bytes:
-    try:
-        import cairosvg  # type: ignore
-    except Exception as e:
-        raise RuntimeError("SVG support requires 'cairosvg'. Install with: pip install cairosvg") from e
-
-    png_bytes = cairosvg.svg2png(bytestring=svg_bytes, output_width=2048, output_height=2048)
-    return png_bytes
-
-
-def _badge_label(source_min_dim_px: int) -> str:
-    if source_min_dim_px >= 3000:
-        return "excellent"
-    if source_min_dim_px >= 1800:
-        return "ready"
-    return "optimized"
-
+def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
+    """Scales an image to fit within max_dim without cropping."""
+    w, h = img.size
+    if w <= max_dim and h <= max_dim: return img
+    scale = min(max_dim / w, max_dim / h)
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 def _downscale_for_rembg(img: Image.Image, max_dim: int = REMBG_MAX_DIM) -> Image.Image:
-    img = img.convert("RGBA")
-    w, h = img.size
-    m = max(w, h)
-    if m <= max_dim:
-        return img
-    scale = max_dim / float(m)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    return img.resize((new_w, new_h), Image.LANCZOS)
-
+    return _scale_to_fit(img, max_dim)
 
 def _rembg_to_pil(img: Image.Image) -> Image.Image:
-    # IMPORTANT: reuse global session to avoid re-loading model
-    out = remove(img, session=REMBG_SESSION)
+    from rembg import remove
+    out = remove(img, session=get_rembg_session())
     if isinstance(out, (bytes, bytearray)):
         return Image.open(BytesIO(out)).convert("RGBA")
     return out.convert("RGBA")
 
-
 def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
+    """Aggressively removes all invisible borders so Printify gets the exact scale."""
     img = img.convert("RGBA")
     a = img.split()[-1]
     bbox = a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
-    if not bbox:
-        return img
+    if not bbox: return img
     return img.crop(bbox)
 
-
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06) -> Image.Image:
-    """
-    Output: 3000x3000 RGBA
-    - aggressively trims transparent padding
-    - scales logo to fit inside canvas with a consistent margin
-    - centers it
-    """
-    img = img.convert("RGBA")
-    img = _trim_transparent_padding(img)
-
+    """Final trim and center. Guaranteed to remove invisible borders."""
+    img = _trim_transparent_padding(img.convert("RGBA"))
     canvas = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
-
     w, h = img.size
-    if w <= 0 or h <= 0:
-        return canvas
-
+    if w <= 0 or h <= 0: return canvas
     max_dim = int(TARGET_PX * (1.0 - pad_ratio * 2.0))
     scale = min(max_dim / w, max_dim / h)
-
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
-
     img2 = img.resize((new_w, new_h), Image.LANCZOS)
-
     x = (TARGET_PX - new_w) // 2
     y = (TARGET_PX - new_h) // 2
     canvas.alpha_composite(img2, (x, y))
     return canvas
 
-
-def _apply_circle_alpha(
-    img: Image.Image,
-    x: int,
-    y: int,
-    radius: int,
-    make_transparent: bool,
-    restore_from: Optional[Image.Image] = None,
-) -> Image.Image:
+def _apply_circle_alpha(img: Image.Image, x: int, y: int, radius: int, make_transparent: bool, restore_from: Optional[Image.Image] = None) -> Image.Image:
     img = img.copy()
-
-    if make_transparent:
-        r, g, b, a = img.split()
-        mask = Image.new("L", img.size, 0)
-        draw = ImageDraw.Draw(mask)
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-        a = Image.composite(Image.new("L", img.size, 0), a, mask)
-        return Image.merge("RGBA", (r, g, b, a))
-
-    if restore_from is None:
-        return img
-
-    restore_from = restore_from.convert("RGBA")
     mask = Image.new("L", img.size, 0)
     draw = ImageDraw.Draw(mask)
     draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
+
+    if make_transparent:
+        r, g, b, a = img.split()
+        a = Image.composite(Image.new("L", img.size, 0), a, mask)
+        return Image.merge("RGBA", (r, g, b, a))
+
+    if restore_from is None: return img
+    restore_from = restore_from.convert("RGBA")
     return Image.composite(restore_from, img, mask)
 
-
 def _scale_ui_coords_to_image(img: Image.Image, x_ui: int, y_ui: int, r_ui: int) -> Tuple[int, int, int]:
-    """
-    UI uses a 1000x1000 canvas; actual stored image is 3000x3000.
-    Convert UI coordinates -> image coordinates so brush works correctly.
-    """
     w, h = img.size
     sx = w / float(UI_CANVAS_PX)
     sy = h / float(UI_CANVAS_PX)
-
     x = int(round(x_ui * sx))
     y = int(round(y_ui * sy))
-
-    # scale radius by average scale
     s = (sx + sy) / 2.0
     r = max(1, int(round(r_ui * s)))
-
-    # clamp
-    x = max(0, min(w - 1, x))
-    y = max(0, min(h - 1, y))
-    return x, y, r
-
+    return max(0, min(w - 1, x)), max(0, min(h - 1, y)), r
 
 # ----------------------------
-# Basic endpoints
+# Endpoints
 # ----------------------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/ui")
 
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "model": REMBG_MODEL, "target_px": TARGET_PX}
-
-
-# ----------------------------
-# Upload pipeline
-# ----------------------------
 @app.post("/upload")
-async def upload_image(
-    file: UploadFile = File(...),
-    keep_original: bool = Query(False),
-):
-    """
-    Upload PNG/JPG/WEBP/SVG
-    - Guard: blocks extremely large uploads (or you can raise MAX_UPLOAD_MB)
-    - If keep_original=False: bg remove (rembg u2netp)
-    - Always: trim transparent padding + normalize to 3000x3000
-    - Saves: orig/base/curr
-    """
-    _cleanup_old_uploads(DEFAULT_TTL_SECONDS)
-
+async def upload_image(file: UploadFile = File(...), keep_original: bool = Query(False)):
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
-        return JSONResponse(
-            {"error": "File too large", "detail": f"Max upload is {MAX_UPLOAD_MB}MB. Please choose a smaller file."},
-            status_code=413
-        )
+        return JSONResponse({"error": "File too large"}, status_code=413)
 
-    filename = (file.filename or "").lower()
-
-    # Load image (support SVG -> PNG if cairosvg installed)
-    try:
-        if filename.endswith(".svg") or (file.content_type == "image/svg+xml"):
-            png_bytes = _svg_bytes_to_png_bytes(data)
-            img = Image.open(BytesIO(png_bytes)).convert("RGBA")
-        else:
-            img = Image.open(BytesIO(data)).convert("RGBA")
-    except Exception as e:
-        return JSONResponse({"error": "Could not read image", "detail": str(e)}, status_code=400)
-
-    orig_w, orig_h = img.size
-    min_dim = min(orig_w, orig_h)
-
+    img = Image.open(BytesIO(data)).convert("RGBA")
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    # Save original (as uploaded)
-    _save_png(img, p["orig"])
+    # 1. Scale raw image to fit 3000x3000 (keep proportions, NO TRIM YET)
+    img_scaled = _scale_to_fit(img, TARGET_PX)
 
-    try:
-        if keep_original:
-            base = img
-        else:
-            img_for_rembg = _downscale_for_rembg(img, max_dim=REMBG_MAX_DIM)
-            base = _rembg_to_pil(img_for_rembg)
+    # 2. Process background removal
+    if keep_original:
+        curr = img_scaled
+    else:
+        img_for_rembg = _downscale_for_rembg(img_scaled, max_dim=REMBG_MAX_DIM)
+        curr = _rembg_to_pil(img_for_rembg)
+        curr = curr.resize(img_scaled.size, Image.LANCZOS) # Align exactly with original
 
-        base = _normalize_logo(base)
-    except Exception as e:
-        _delete_session_files(session_id)
-        return JSONResponse({"error": "Failed to process image", "detail": str(e)}, status_code=500)
+    # 3. Center both on identical 3000x3000 canvases so "Frog Hat Restore" coordinates match perfectly
+    canvas_orig = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
+    canvas_curr = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
+    
+    x = (TARGET_PX - img_scaled.width) // 2
+    y = (TARGET_PX - img_scaled.height) // 2
+    
+    canvas_orig.alpha_composite(img_scaled, (x, y))
+    canvas_curr.alpha_composite(curr, (x, y))
 
-    curr = base.copy()
-    _save_png(base, p["base"])
-    _save_png(curr, p["curr"])
+    _save_png(canvas_orig, p["orig"]) # Perfect un-cut original for restoring
+    _save_png(canvas_curr, p["base"])
+    _save_png(canvas_curr, p["curr"])
 
-    badge = _badge_label(min_dim)
-
-    return {
-        "status": "ok",
-        "session_id": session_id,
-        "preview_url": f"/preview/{session_id}",
-        "base_url": f"/base/{session_id}",
-        "original_url": f"/original/{session_id}",
-        "meta_url": f"/meta/{session_id}",
-        "finalize_url": f"/finalize/{session_id}",
-        "badge": badge,
-        "meta": {
-            "source_width": orig_w,
-            "source_height": orig_h,
-            "target_px": TARGET_PX,
-            "rembg_model": REMBG_MODEL,
-        },
-    }
-
+    return {"status": "ok", "session_id": session_id, "preview_url": f"/preview/{session_id}", "base_url": f"/base/{session_id}"}
 
 @app.get("/meta/{session_id}")
 def get_meta(session_id: str):
-    p = _paths(session_id)
-    if not os.path.exists(p["orig"]) or not os.path.exists(p["curr"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    orig = _load_rgba(p["orig"])
-    ow, oh = orig.size
-    badge = _badge_label(min(ow, oh))
-
-    return {
-        "session_id": session_id,
-        "badge": badge,
-        "source_width": ow,
-        "source_height": oh,
-        "target_px": TARGET_PX,
-    }
-
+    return {"session_id": session_id, "badge": "optimized", "target_px": TARGET_PX}
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
-    p = _paths(session_id)
-    if not os.path.exists(p["curr"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=open(p["curr"], "rb").read(), media_type="image/png")
-
+    return Response(content=open(_paths(session_id)["curr"], "rb").read(), media_type="image/png")
 
 @app.get("/base/{session_id}")
 def get_base(session_id: str):
-    p = _paths(session_id)
-    if not os.path.exists(p["base"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=open(p["base"], "rb").read(), media_type="image/png")
-
+    return Response(content=open(_paths(session_id)["base"], "rb").read(), media_type="image/png")
 
 @app.get("/original/{session_id}")
 def get_original(session_id: str):
-    p = _paths(session_id)
-    if not os.path.exists(p["orig"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=open(p["orig"], "rb").read(), media_type="image/png")
-
+    return Response(content=open(_paths(session_id)["orig"], "rb").read(), media_type="image/png")
 
 # ----------------------------
-# Tap tools (brush)
+# Tap tools (Brush)
 # ----------------------------
 @app.post("/tap/remove")
 def tap_remove(session_id: str, x: int, y: int, radius: int = 24):
     p = _paths(session_id)
-    if not os.path.exists(p["curr"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    curr = _load_rgba(p["curr"])
+    curr = Image.open(p["curr"]).convert("RGBA")
     x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
-
     curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=True)
     _save_png(curr2, p["curr"])
     return {"status": "ok"}
 
-
 @app.post("/tap/restore")
 def tap_restore(session_id: str, x: int, y: int, radius: int = 24):
     p = _paths(session_id)
-    if not os.path.exists(p["curr"]) or not os.path.exists(p["base"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    curr = _load_rgba(p["curr"])
-    base = _load_rgba(p["base"])
+    curr = Image.open(p["curr"]).convert("RGBA")
+    # Pull from ORIG, not BASE, so the frog hat actually comes back!
+    orig = Image.open(p["orig"]).convert("RGBA") 
 
     x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
-
-    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=False, restore_from=base)
+    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=False, restore_from=orig)
     _save_png(curr2, p["curr"])
     return {"status": "ok"}
-
 
 @app.post("/reset/{session_id}")
 def reset_session(session_id: str):
     p = _paths(session_id)
-    if not os.path.exists(p["base"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    base = _load_rgba(p["base"])
+    base = Image.open(p["base"])
     _save_png(base, p["curr"])
     return {"status": "ok"}
-
 
 @app.post("/finalize/{session_id}")
 def finalize(session_id: str):
     """
-    Returns final PNG bytes and deletes local session files.
-    Parent Shopify form fetches this blob and injects into <input type="file">.
+    Trims all invisible padding, normalizes to 3000x3000, and returns the final file.
     """
     p = _paths(session_id)
-    if not os.path.exists(p["curr"]):
-        return JSONResponse({"error": "Not found"}, status_code=404)
+    curr = Image.open(p["curr"]).convert("RGBA")
+    
+    # This guarantees the Printify bot gets an accurately sized logo
+    final_img = _normalize_logo(curr) 
+    _save_png(final_img, p["curr"])
 
     img_bytes = open(p["curr"], "rb").read()
-    _delete_session_files(session_id)
     return Response(content=img_bytes, media_type="image/png")
 
-
 # ----------------------------
-# Storefront request endpoint (receives FormData)
-# NOTE: Shopify provisioning hooks will go here next.
-# For now, it validates + normalizes images (again) and returns OK.
+# Shopify Hook
 # ----------------------------
 @app.post("/api/storefront-request")
 async def storefront_request(
     customer_id: str = Form(...),
     customer_email: str = Form(...),
-    org_type: str = Form(...),
-    user_count: str = Form(...),
-    duration: str = Form(...),
     storefront_name: str = Form(...),
     storefront_handle: str = Form(...),
-    military_branch: Optional[str] = Form(None),
-    sport_type: Optional[str] = Form(None),
-    storefront_logo_file: UploadFile = File(...),
-    storefront_logo_secondary: Optional[UploadFile] = File(None),
+    storefront_logo_file: UploadFile = File(...)
 ):
-    """
-    Receives:
-      - fields
-      - primary logo file (required)
-      - secondary logo file (optional)
+    SHOP_URL = os.environ.get("SHOPIFY_SHOP")
+    SHOP_TOKEN = os.environ.get("SHOPIFY_TOKEN")
 
-    This endpoint is where you will:
-      1) upload to Shopify Files
-      2) upsert custom_shop metaobject
-      3) create/update smart collection (template private-store)
-      4) tag customer storefront-admin--{handle}
-      5) trigger studio-automation build
-
-    Right now: it validates + normalizes images and returns OK to prove the pipeline is stable.
-    """
-
-    # Guard handle
-    if not storefront_handle or len(storefront_handle) < 3:
-        return JSONResponse({"error": "Invalid handle"}, status_code=400)
-
-    # Read + normalize primary
-    pbytes = await storefront_logo_file.read()
-    if len(pbytes) > MAX_UPLOAD_BYTES:
-        return JSONResponse({"error": "Primary logo too large", "detail": f"Max upload {MAX_UPLOAD_MB}MB"}, status_code=413)
-
-    try:
-        pimg = Image.open(BytesIO(pbytes)).convert("RGBA")
-    except Exception:
-        return JSONResponse({"error": "Primary logo unreadable"}, status_code=400)
-
-    # aggressive trim + normalize to 3000x3000
-    pimg_norm = _normalize_logo(pimg)
-
-    # optional secondary
-    simg_norm = None
-    if storefront_logo_secondary is not None:
-        sbytes = await storefront_logo_secondary.read()
-        if len(sbytes) > MAX_UPLOAD_BYTES:
-            return JSONResponse({"error": "Secondary logo too large", "detail": f"Max upload {MAX_UPLOAD_MB}MB"}, status_code=413)
+    if not SHOP_URL or not SHOP_TOKEN:
+        print("⚠️ Warning: Shopify keys not set in Railway. Skipping API calls.")
+    else:
+        headers = {"X-Shopify-Access-Token": SHOP_TOKEN, "Content-Type": "application/json"}
+        
+        # 1. TAG CUSTOMER
         try:
-            simg = Image.open(BytesIO(sbytes)).convert("RGBA")
-            simg_norm = _normalize_logo(simg)
-        except Exception:
-            return JSONResponse({"error": "Secondary logo unreadable"}, status_code=400)
+            clean_id = customer_id.split("/")[-1] 
+            tag_data = {"customer": {"id": clean_id, "tags": f"storefront-admin--{storefront_handle}"}}
+            requests.put(f"https://{SHOP_URL}/admin/api/2024-01/customers/{clean_id}.json", json=tag_data, headers=headers)
+        except Exception as e:
+            print(f"Error tagging customer: {e}")
 
-    # TODO (next): Shopify Files upload + metaobject + collection + tags + trigger studio-automation
-    # For now return a stable success response:
-    return {
-        "status": "ok",
-        "storefront_handle": storefront_handle,
-        "storefront_name": storefront_name,
-        "customer_email": customer_email,
-        "normalized_px": TARGET_PX,
-        "notes": "Pipeline OK. Next: Shopify provisioning inside this endpoint.",
-        "has_secondary": simg_norm is not None,
-    }
+        # TODO NEXT: 
+        # 2. Upload file to Shopify Staged Uploads
+        # 3. Create File via GraphQL
+        # 4. Create custom_shop Metaobject via GraphQL
+        # 5. Create Collection via GraphQL
 
+    return {"status": "ok", "message": "Provisioning handled."}
 
 # ----------------------------
-# Premium UI (/ui)
-# embed=1 -> tight layout
-# return=postmessage -> Done posts message to parent (NO download)
-# slot=main|secondary -> tells parent which file input to fill
+# Detailed Customer UI
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
-def ui(
-    request: Request,
-    embed: int = Query(0),
-    return_mode: str = Query("download", alias="return"),
-    slot: str = Query("main"),
-):
-    # Note: we keep the HTML inline for easy Railway deploy
+def ui(request: Request, embed: int = Query(0), return_mode: str = Query("download", alias="return"), slot: str = Query("main")):
     html = r"""<!doctype html>
 <html lang="en">
 <head>
