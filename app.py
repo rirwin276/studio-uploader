@@ -1,16 +1,15 @@
 # app.py — Studio Uploader (FastAPI)
-# Premium /ui editor + upload/bg-remove/trim/normalize + highlight-edits toggle + reset + finalize cleanup + TTL cleanup
 #
-# Local run:
-#   python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000
+# Fixes:
+# - OOM prevention: rembg u2netp + global session + pre-downscale + upload size guard
+# - /ui embed + return=postmessage (NO download on Done, including mobile)
+# - Brush edits work: fixes coordinate mismatch (1000px canvas vs 3000px image)
+# - Normalize output to 3000x3000 PNG and trim transparent padding aggressively
 #
-# Railway run command:
+# Railway start command (IMPORTANT: single worker on small plan):
 #   uvicorn app:app --host 0.0.0.0 --port $PORT
-#
-# Optional SVG support:
-#   pip install cairosvg
 
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, UploadFile, File, Query, Request, Form
 from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -19,20 +18,18 @@ from io import BytesIO
 import uuid
 import os
 import time
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 
-from rembg import remove
+from rembg import remove, new_session
 
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="0.3.0")
+app = FastAPI(title="Studio Uploader", version="0.4.0")
 
 # ----------------------------
-# CORS (Railway/Shopify ready)
+# CORS
 # ----------------------------
-# In production, set env:
-# ALLOWED_ORIGINS="https://YOURDOMAIN.com,https://YOURSHOP.myshopify.com"
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "http://127.0.0.1:8000,http://localhost:8000",
@@ -58,8 +55,25 @@ TARGET_PX = TARGET_INCHES * TARGET_DPI  # 3000
 
 DEFAULT_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60)))  # 1 hour
 
+# Upload size guard (bytes)
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))  # adjust if needed
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-def _paths(session_id: str):
+# Pre-downscale before rembg (reduces RAM spikes)
+REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1600"))
+
+# Canvas coordinate system used by the UI
+UI_CANVAS_PX = int(os.getenv("UI_CANVAS_PX", "1000"))
+
+# ----------------------------
+# rembg session (GLOBAL, SMALL MODEL)
+# ----------------------------
+# u2netp is smaller + lower RAM than u2net
+REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
+REMBG_SESSION = new_session(REMBG_MODEL)
+
+
+def _paths(session_id: str) -> Dict[str, str]:
     return {
         "orig": os.path.join(UPLOAD_DIR, f"{session_id}_orig.png"),
         "base": os.path.join(UPLOAD_DIR, f"{session_id}_base.png"),
@@ -72,11 +86,10 @@ def _load_rgba(path: str) -> Image.Image:
 
 
 def _save_png(img: Image.Image, path: str):
-    img.save(path, "PNG")
+    img.save(path, "PNG", optimize=True)
 
 
 def _cleanup_old_uploads(max_age_seconds: int = DEFAULT_TTL_SECONDS):
-    """Delete old files in uploads/ so abandoned sessions don’t pile up."""
     now = time.time()
     try:
         for name in os.listdir(UPLOAD_DIR):
@@ -104,27 +117,16 @@ def _delete_session_files(session_id: str):
 
 
 def _svg_bytes_to_png_bytes(svg_bytes: bytes) -> bytes:
-    """
-    Optional: converts SVG bytes to PNG bytes.
-    Requires: pip install cairosvg
-    """
     try:
         import cairosvg  # type: ignore
     except Exception as e:
         raise RuntimeError("SVG support requires 'cairosvg'. Install with: pip install cairosvg") from e
 
-    # 2048 is a good “working size” before we normalize to 3000
     png_bytes = cairosvg.svg2png(bytestring=svg_bytes, output_width=2048, output_height=2048)
     return png_bytes
 
 
 def _badge_label(source_min_dim_px: int) -> str:
-    """
-    User-facing badge:
-      - excellent: already high-res
-      - ready: solid
-      - optimized: improved automatically
-    """
     if source_min_dim_px >= 3000:
         return "excellent"
     if source_min_dim_px >= 1800:
@@ -132,18 +134,27 @@ def _badge_label(source_min_dim_px: int) -> str:
     return "optimized"
 
 
+def _downscale_for_rembg(img: Image.Image, max_dim: int = REMBG_MAX_DIM) -> Image.Image:
+    img = img.convert("RGBA")
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_dim:
+        return img
+    scale = max_dim / float(m)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
 def _rembg_to_pil(img: Image.Image) -> Image.Image:
-    out = remove(img)
+    # IMPORTANT: reuse global session to avoid re-loading model
+    out = remove(img, session=REMBG_SESSION)
     if isinstance(out, (bytes, bytearray)):
         return Image.open(BytesIO(out)).convert("RGBA")
     return out.convert("RGBA")
 
 
 def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
-    """
-    Crop transparent padding from an RGBA image.
-    Perfect for logos after bg-removal.
-    """
     img = img.convert("RGBA")
     a = img.split()[-1]
     bbox = a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
@@ -152,28 +163,30 @@ def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Ima
     return img.crop(bbox)
 
 
-def _normalize_logo(img: Image.Image, pad_ratio: float = 0.08) -> Image.Image:
+def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06) -> Image.Image:
     """
-    Normalize logo to a 3000x3000 square:
-      - trim transparent padding
-      - scale to fit inside square with consistent margin
-      - center it
+    Output: 3000x3000 RGBA
+    - aggressively trims transparent padding
+    - scales logo to fit inside canvas with a consistent margin
+    - centers it
     """
     img = img.convert("RGBA")
     img = _trim_transparent_padding(img)
 
     canvas = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
-    max_dim = int(TARGET_PX * (1.0 - pad_ratio * 2.0))
 
     w, h = img.size
     if w <= 0 or h <= 0:
         return canvas
 
+    max_dim = int(TARGET_PX * (1.0 - pad_ratio * 2.0))
     scale = min(max_dim / w, max_dim / h)
+
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
 
     img2 = img.resize((new_w, new_h), Image.LANCZOS)
+
     x = (TARGET_PX - new_w) // 2
     y = (TARGET_PX - new_h) // 2
     canvas.alpha_composite(img2, (x, y))
@@ -208,8 +221,30 @@ def _apply_circle_alpha(
     return Image.composite(restore_from, img, mask)
 
 
+def _scale_ui_coords_to_image(img: Image.Image, x_ui: int, y_ui: int, r_ui: int) -> Tuple[int, int, int]:
+    """
+    UI uses a 1000x1000 canvas; actual stored image is 3000x3000.
+    Convert UI coordinates -> image coordinates so brush works correctly.
+    """
+    w, h = img.size
+    sx = w / float(UI_CANVAS_PX)
+    sy = h / float(UI_CANVAS_PX)
+
+    x = int(round(x_ui * sx))
+    y = int(round(y_ui * sy))
+
+    # scale radius by average scale
+    s = (sx + sy) / 2.0
+    r = max(1, int(round(r_ui * s)))
+
+    # clamp
+    x = max(0, min(w - 1, x))
+    y = max(0, min(h - 1, y))
+    return x, y, r
+
+
 # ----------------------------
-# API Endpoints
+# Basic endpoints
 # ----------------------------
 @app.get("/", include_in_schema=False)
 def root():
@@ -218,23 +253,33 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "model": REMBG_MODEL, "target_px": TARGET_PX}
 
 
+# ----------------------------
+# Upload pipeline
+# ----------------------------
 @app.post("/upload")
 async def upload_image(
     file: UploadFile = File(...),
     keep_original: bool = Query(False),
 ):
     """
-    Upload PNG/JPG/SVG
-    - If keep_original=False: bg remove
+    Upload PNG/JPG/WEBP/SVG
+    - Guard: blocks extremely large uploads (or you can raise MAX_UPLOAD_MB)
+    - If keep_original=False: bg remove (rembg u2netp)
     - Always: trim transparent padding + normalize to 3000x3000
-    - Creates: orig/base/curr
+    - Saves: orig/base/curr
     """
     _cleanup_old_uploads(DEFAULT_TTL_SECONDS)
 
     data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {"error": "File too large", "detail": f"Max upload is {MAX_UPLOAD_MB}MB. Please choose a smaller file."},
+            status_code=413
+        )
+
     filename = (file.filename or "").lower()
 
     # Load image (support SVG -> PNG if cairosvg installed)
@@ -256,14 +301,12 @@ async def upload_image(
     # Save original (as uploaded)
     _save_png(img, p["orig"])
 
-    # Build base:
-    # - either keep original
-    # - or bg-remove first
     try:
         if keep_original:
             base = img
         else:
-            base = _rembg_to_pil(img)
+            img_for_rembg = _downscale_for_rembg(img, max_dim=REMBG_MAX_DIM)
+            base = _rembg_to_pil(img_for_rembg)
 
         base = _normalize_logo(base)
     except Exception as e:
@@ -289,6 +332,7 @@ async def upload_image(
             "source_width": orig_w,
             "source_height": orig_h,
             "target_px": TARGET_PX,
+            "rembg_model": REMBG_MODEL,
         },
     }
 
@@ -336,6 +380,9 @@ def get_original(session_id: str):
     return Response(content=open(p["orig"], "rb").read(), media_type="image/png")
 
 
+# ----------------------------
+# Tap tools (brush)
+# ----------------------------
 @app.post("/tap/remove")
 def tap_remove(session_id: str, x: int, y: int, radius: int = 24):
     p = _paths(session_id)
@@ -343,7 +390,9 @@ def tap_remove(session_id: str, x: int, y: int, radius: int = 24):
         return JSONResponse({"error": "Not found"}, status_code=404)
 
     curr = _load_rgba(p["curr"])
-    curr2 = _apply_circle_alpha(curr, x, y, radius, make_transparent=True)
+    x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
+
+    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=True)
     _save_png(curr2, p["curr"])
     return {"status": "ok"}
 
@@ -356,14 +405,16 @@ def tap_restore(session_id: str, x: int, y: int, radius: int = 24):
 
     curr = _load_rgba(p["curr"])
     base = _load_rgba(p["base"])
-    curr2 = _apply_circle_alpha(curr, x, y, radius, make_transparent=False, restore_from=base)
+
+    x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
+
+    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=False, restore_from=base)
     _save_png(curr2, p["curr"])
     return {"status": "ok"}
 
 
 @app.post("/reset/{session_id}")
 def reset_session(session_id: str):
-    """True reset: base -> curr"""
     p = _paths(session_id)
     if not os.path.exists(p["base"]):
         return JSONResponse({"error": "Not found"}, status_code=404)
@@ -377,7 +428,7 @@ def reset_session(session_id: str):
 def finalize(session_id: str):
     """
     Returns final PNG bytes and deletes local session files.
-    This is what you call when user hits Done in the popup.
+    Parent Shopify form fetches this blob and injects into <input type="file">.
     """
     p = _paths(session_id)
     if not os.path.exists(p["curr"]):
@@ -389,11 +440,96 @@ def finalize(session_id: str):
 
 
 # ----------------------------
+# Storefront request endpoint (receives FormData)
+# NOTE: Shopify provisioning hooks will go here next.
+# For now, it validates + normalizes images (again) and returns OK.
+# ----------------------------
+@app.post("/api/storefront-request")
+async def storefront_request(
+    customer_id: str = Form(...),
+    customer_email: str = Form(...),
+    org_type: str = Form(...),
+    user_count: str = Form(...),
+    duration: str = Form(...),
+    storefront_name: str = Form(...),
+    storefront_handle: str = Form(...),
+    military_branch: Optional[str] = Form(None),
+    sport_type: Optional[str] = Form(None),
+    storefront_logo_file: UploadFile = File(...),
+    storefront_logo_secondary: Optional[UploadFile] = File(None),
+):
+    """
+    Receives:
+      - fields
+      - primary logo file (required)
+      - secondary logo file (optional)
+
+    This endpoint is where you will:
+      1) upload to Shopify Files
+      2) upsert custom_shop metaobject
+      3) create/update smart collection (template private-store)
+      4) tag customer storefront-admin--{handle}
+      5) trigger studio-automation build
+
+    Right now: it validates + normalizes images and returns OK to prove the pipeline is stable.
+    """
+
+    # Guard handle
+    if not storefront_handle or len(storefront_handle) < 3:
+        return JSONResponse({"error": "Invalid handle"}, status_code=400)
+
+    # Read + normalize primary
+    pbytes = await storefront_logo_file.read()
+    if len(pbytes) > MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": "Primary logo too large", "detail": f"Max upload {MAX_UPLOAD_MB}MB"}, status_code=413)
+
+    try:
+        pimg = Image.open(BytesIO(pbytes)).convert("RGBA")
+    except Exception:
+        return JSONResponse({"error": "Primary logo unreadable"}, status_code=400)
+
+    # aggressive trim + normalize to 3000x3000
+    pimg_norm = _normalize_logo(pimg)
+
+    # optional secondary
+    simg_norm = None
+    if storefront_logo_secondary is not None:
+        sbytes = await storefront_logo_secondary.read()
+        if len(sbytes) > MAX_UPLOAD_BYTES:
+            return JSONResponse({"error": "Secondary logo too large", "detail": f"Max upload {MAX_UPLOAD_MB}MB"}, status_code=413)
+        try:
+            simg = Image.open(BytesIO(sbytes)).convert("RGBA")
+            simg_norm = _normalize_logo(simg)
+        except Exception:
+            return JSONResponse({"error": "Secondary logo unreadable"}, status_code=400)
+
+    # TODO (next): Shopify Files upload + metaobject + collection + tags + trigger studio-automation
+    # For now return a stable success response:
+    return {
+        "status": "ok",
+        "storefront_handle": storefront_handle,
+        "storefront_name": storefront_name,
+        "customer_email": customer_email,
+        "normalized_px": TARGET_PX,
+        "notes": "Pipeline OK. Next: Shopify provisioning inside this endpoint.",
+        "has_secondary": simg_norm is not None,
+    }
+
+
+# ----------------------------
 # Premium UI (/ui)
-# IMPORTANT: raw string (r""" """) so braces don’t break python
+# embed=1 -> tight layout
+# return=postmessage -> Done posts message to parent (NO download)
+# slot=main|secondary -> tells parent which file input to fill
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
-def ui():
+def ui(
+    request: Request,
+    embed: int = Query(0),
+    return_mode: str = Query("download", alias="return"),
+    slot: str = Query("main"),
+):
+    # Note: we keep the HTML inline for easy Railway deploy
     html = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -426,11 +562,11 @@ def ui():
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 22px;
+      padding: 14px;
     }
     .modal {
       width: min(1080px, 100%);
-      border-radius: 22px;
+      border-radius: 18px;
       background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.04));
       border: 1px solid var(--stroke);
       box-shadow: var(--shadow);
@@ -439,13 +575,13 @@ def ui():
     }
     .top {
       display:flex; align-items:center; justify-content:space-between;
-      padding: 14px 18px;
+      padding: 12px 14px;
       border-bottom: 1px solid rgba(255,255,255,0.10);
       background: rgba(0,0,0,0.18);
     }
-    .brand { display:flex; align-items:center; gap:10px; font-weight:800; }
+    .brand { display:flex; align-items:center; gap:10px; font-weight:900; }
     .dot {
-      width: 11px; height: 11px; border-radius: 99px;
+      width: 10px; height: 10px; border-radius: 99px;
       background: linear-gradient(180deg, #ffffff, rgba(255,255,255,0.3));
       opacity: .9;
     }
@@ -458,7 +594,7 @@ def ui():
       padding: 10px 12px;
       border-radius: 12px;
       cursor:pointer;
-      font-weight:700;
+      font-weight:900;
       transition: transform .08s ease, background .2s ease, border-color .2s ease;
       user-select:none;
     }
@@ -475,8 +611,8 @@ def ui():
     .content {
       display:grid;
       grid-template-columns: 1.5fr 1fr;
-      gap: 14px;
-      padding: 14px;
+      gap: 12px;
+      padding: 12px;
     }
     @media (max-width: 980px) { .content { grid-template-columns: 1fr; } }
     .panel {
@@ -529,6 +665,7 @@ def ui():
       height:auto;
       border-radius: 18px;
       z-index: 2;
+      touch-action: none; /* critical for mobile brush */
     }
     .right { display:flex; flex-direction:column; gap: 12px; }
     .card {
@@ -588,7 +725,7 @@ def ui():
     .switch.on { background: rgba(52,199,89,0.22); border-color: rgba(52,199,89,0.38); }
     .switch.on .knob { left: 20px; }
     .footer {
-      padding: 12px 14px;
+      padding: 10px 14px;
       display:flex; justify-content:space-between; align-items:center;
       border-top: 1px solid rgba(255,255,255,0.10);
       background: rgba(0,0,0,0.14);
@@ -603,7 +740,7 @@ def ui():
       background: rgba(0,0,0,0.55);
       border: 1px solid rgba(255,255,255,0.12);
       color: rgba(255,255,255,0.88);
-      font-weight: 800;
+      font-weight: 900;
       display:none;
       z-index: 50;
       backdrop-filter: blur(10px);
@@ -651,7 +788,7 @@ def ui():
           </div>
 
           <div class="sliderRow">
-            <div class="tiny" style="min-width:72px;">Brush Size</div>
+            <div class="tiny" style="min-width:72px;">Brush</div>
             <input id="radius" type="range" min="8" max="80" value="28" />
             <div class="tiny" id="radiusVal" style="min-width:36px;text-align:right;">28</div>
           </div>
@@ -674,7 +811,7 @@ def ui():
 
     <div class="footer">
       <div class="tiny">Simple • Fast • Done</div>
-      <div class="tiny">/docs for API • /ui for editor</div>
+      <div class="tiny">No downloads in embed mode</div>
     </div>
   </div>
 
@@ -704,6 +841,10 @@ def ui():
   let highlightEdits = true;
 
   const toast = document.getElementById('toast');
+
+  const params = new URLSearchParams(window.location.search);
+  const RETURN_MODE = (params.get('return') || 'download').toLowerCase(); // postmessage | download
+  const SLOT = (params.get('slot') || 'main').toLowerCase();
 
   let sessionId = null;
   let mode = 'remove';
@@ -790,7 +931,15 @@ def ui():
 
     const keep = keepOriginalEl.checked ? 'true' : 'false';
     const r = await fetch(`/upload?keep_original=${keep}`, { method: 'POST', body: fd });
-    const j = await r.json();
+
+    if (r.status === 413) {
+      const j = await r.json().catch(() => ({}));
+      statusLine.textContent = j.detail || 'File too large. Try a smaller image.';
+      showToast('Too large');
+      return;
+    }
+
+    const j = await r.json().catch(() => ({}));
 
     if (!r.ok) {
       statusLine.textContent = 'Something went wrong. Try again.';
@@ -812,8 +961,10 @@ def ui():
 
   function canvasToImageCoords(evt) {
     const rect = cv.getBoundingClientRect();
-    const x = Math.round((evt.clientX - rect.left) * (cv.width / rect.width));
-    const y = Math.round((evt.clientY - rect.top) * (cv.height / rect.height));
+    const cx = (evt.clientX - rect.left);
+    const cy = (evt.clientY - rect.top);
+    const x = Math.round(cx * (cv.width / rect.width));
+    const y = Math.round(cy * (cv.height / rect.height));
     return { x, y };
   }
 
@@ -870,6 +1021,28 @@ def ui():
   btnDone.addEventListener('click', async () => {
     if (!sessionId) { showToast('No file'); return; }
 
+    // EMBED MODE: do NOT download. Tell parent to fetch finalize_url and inject blob.
+    if (RETURN_MODE === 'postmessage') {
+      const finalizeUrl = `${window.location.origin}/finalize/${sessionId}`;
+      window.parent.postMessage({
+        type: "studio-uploader:done",
+        slot: (SLOT === "secondary" ? "secondary" : "main"),
+        session_id: sessionId,
+        finalize_url: finalizeUrl,
+        filename: "logo_ready.png",
+        mime: "image/png"
+      }, "*");
+
+      showToast('Sent ✓');
+      // Parent will call finalize; we can reset our UI immediately
+      sessionId = null;
+      statusLine.textContent = 'Upload a logo to begin.';
+      setBadge('optimized');
+      await drawComposite();
+      return;
+    }
+
+    // fallback (non-embed) download mode for local testing
     statusLine.textContent = 'Saving…';
     const r = await fetch(`/finalize/${sessionId}`, { method: 'POST' });
     if (!r.ok) {
@@ -879,8 +1052,6 @@ def ui():
     }
 
     const blob = await r.blob();
-
-    // fallback local download for testing
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
