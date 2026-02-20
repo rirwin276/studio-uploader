@@ -15,16 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 # Import the provisioning script we built
 from shopify_provision import run_provisioning
 
-app = FastAPI(title="Studio Uploader", version="0.8.0")
+app = FastAPI(title="Studio Uploader", version="1.0.0")
 
 # ----------------------------
 # CORS
 # ----------------------------
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=True,
+    allow_origins=["*"], 
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,11 +35,9 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 TARGET_PX = 3000
-DEFAULT_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60)))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1600"))
-UI_CANVAS_PX = int(os.getenv("UI_CANVAS_PX", "1000"))
 
 # ----------------------------
 # MEMORY FIX: Lazy Load AI
@@ -62,7 +59,6 @@ def get_rembg_session():
 def _paths(session_id: str) -> Dict[str, str]:
     return {
         "orig": os.path.join(UPLOAD_DIR, f"{session_id}_orig.png"),
-        "base": os.path.join(UPLOAD_DIR, f"{session_id}_base.png"),
         "curr": os.path.join(UPLOAD_DIR, f"{session_id}_curr.png"),
     }
 
@@ -107,31 +103,6 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06) -> Image.Image:
     canvas.alpha_composite(img2, (x, y))
     return canvas
 
-def _apply_circle_alpha(img: Image.Image, x: int, y: int, radius: int, make_transparent: bool, restore_from: Optional[Image.Image] = None) -> Image.Image:
-    img = img.copy()
-    mask = Image.new("L", img.size, 0)
-    draw = ImageDraw.Draw(mask)
-    draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-
-    if make_transparent:
-        r, g, b, a = img.split()
-        a = Image.composite(Image.new("L", img.size, 0), a, mask)
-        return Image.merge("RGBA", (r, g, b, a))
-
-    if restore_from is None: return img
-    restore_from = restore_from.convert("RGBA")
-    return Image.composite(restore_from, img, mask)
-
-def _scale_ui_coords_to_image(img: Image.Image, x_ui: int, y_ui: int, r_ui: int) -> Tuple[int, int, int]:
-    w, h = img.size
-    sx = w / float(UI_CANVAS_PX)
-    sy = h / float(UI_CANVAS_PX)
-    x = int(round(x_ui * sx))
-    y = int(round(y_ui * sy))
-    s = (sx + sy) / 2.0
-    r = max(1, int(round(r_ui * s)))
-    return max(0, min(w - 1, x)), max(0, min(h - 1, y)), r
-
 # ----------------------------
 # Image Endpoints
 # ----------------------------
@@ -149,8 +120,10 @@ async def upload_image(file: UploadFile = File(...), keep_original: bool = Query
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    img_scaled = _scale_to_fit(img, TARGET_PX)
+    # 1. Scale raw image
+    img_scaled = _scale_to_fit(img, 1500) # Smaller resolution for the browser editor
 
+    # 2. Process background
     if keep_original:
         curr = img_scaled
     else:
@@ -158,72 +131,36 @@ async def upload_image(file: UploadFile = File(...), keep_original: bool = Query
         curr = _rembg_to_pil(img_for_rembg)
         curr = curr.resize(img_scaled.size, Image.LANCZOS)
 
-    canvas_orig = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
-    canvas_curr = Image.new("RGBA", (TARGET_PX, TARGET_PX), (0, 0, 0, 0))
-    
-    x = (TARGET_PX - img_scaled.width) // 2
-    y = (TARGET_PX - img_scaled.height) // 2
-    
-    canvas_orig.alpha_composite(img_scaled, (x, y))
-    canvas_curr.alpha_composite(curr, (x, y))
+    _save_png(img_scaled, p["orig"]) # Used by the browser for restoring
+    _save_png(curr, p["curr"])       # Used by the browser for initial canvas
 
-    _save_png(canvas_orig, p["orig"])
-    _save_png(canvas_curr, p["base"])
-    _save_png(canvas_curr, p["curr"])
-
-    return {"status": "ok", "session_id": session_id, "preview_url": f"/preview/{session_id}", "base_url": f"/base/{session_id}"}
-
-@app.get("/meta/{session_id}")
-def get_meta(session_id: str):
-    return {"session_id": session_id, "badge": "optimized", "target_px": TARGET_PX}
+    return {"status": "ok", "session_id": session_id, "preview_url": f"/preview/{session_id}", "original_url": f"/original/{session_id}"}
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
     return Response(content=open(_paths(session_id)["curr"], "rb").read(), media_type="image/png")
 
-@app.get("/base/{session_id}")
-def get_base(session_id: str):
-    return Response(content=open(_paths(session_id)["base"], "rb").read(), media_type="image/png")
-
 @app.get("/original/{session_id}")
 def get_original(session_id: str):
     return Response(content=open(_paths(session_id)["orig"], "rb").read(), media_type="image/png")
 
-# ----------------------------
-# Tap tools (Brush)
-# ----------------------------
-@app.post("/tap/remove")
-def tap_remove(session_id: str, x: int, y: int, radius: int = 24):
+# --- THE NEW SAVE ENDPOINT (Receives the edited browser canvas) ---
+@app.post("/save-edit/{session_id}")
+async def save_edit(session_id: str, file: UploadFile = File(...)):
     p = _paths(session_id)
-    curr = Image.open(p["curr"]).convert("RGBA")
-    x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
-    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=True)
-    _save_png(curr2, p["curr"])
-    return {"status": "ok"}
-
-@app.post("/tap/restore")
-def tap_restore(session_id: str, x: int, y: int, radius: int = 24):
-    p = _paths(session_id)
-    curr = Image.open(p["curr"]).convert("RGBA")
-    orig = Image.open(p["orig"]).convert("RGBA") 
-    x2, y2, r2 = _scale_ui_coords_to_image(curr, x, y, radius)
-    curr2 = _apply_circle_alpha(curr, x2, y2, r2, make_transparent=False, restore_from=orig)
-    _save_png(curr2, p["curr"])
-    return {"status": "ok"}
-
-@app.post("/reset/{session_id}")
-def reset_session(session_id: str):
-    p = _paths(session_id)
-    base = Image.open(p["base"])
-    _save_png(base, p["curr"])
-    return {"status": "ok"}
-
-@app.post("/finalize/{session_id}")
-def finalize(session_id: str):
-    p = _paths(session_id)
-    curr = Image.open(p["curr"]).convert("RGBA")
-    final_img = _normalize_logo(curr) 
+    data = await file.read()
+    
+    # Take the browser's final edit, trim the padding, and scale to 3000x3000
+    browser_img = Image.open(BytesIO(data)).convert("RGBA")
+    final_img = _normalize_logo(browser_img)
+    
     _save_png(final_img, p["curr"])
+    return {"status": "ok"}
+
+@app.get("/finalize/{session_id}")
+def finalize(session_id: str):
+    # Just returns the final saved image to Shopify
+    p = _paths(session_id)
     img_bytes = open(p["curr"], "rb").read()
     return Response(content=img_bytes, media_type="image/png")
 
@@ -244,7 +181,6 @@ async def storefront_request(
     storefront_logo_file: UploadFile = File(...),
     storefront_logo_secondary: Optional[UploadFile] = File(None)
 ):
-    # 1. TAG CUSTOMER INSTANTLY
     SHOP_URL = os.environ.get("SHOPIFY_SHOP") or os.environ.get("SHOP")
     SHOP_TOKEN = os.environ.get("SHOPIFY_TOKEN") or os.environ.get("CLIENT_SECRET")
 
@@ -258,24 +194,21 @@ async def storefront_request(
         except Exception as e:
             print(f"⚠️ Error tagging customer: {e}")
 
-    # 2. READ FILES
     main_bytes = await storefront_logo_file.read()
     sec_bytes = None
     if storefront_logo_secondary:
         sec_bytes = await storefront_logo_secondary.read()
 
-    # 3. RUN PROVISIONING IN BACKGROUND
     thread = threading.Thread(
         target=run_provisioning, 
         args=(storefront_name, storefront_handle, customer_id, main_bytes, sec_bytes)
     )
     thread.start()
 
-    # 4. INSTANT REPLY TO SHOPIFY
     return {"status": "ok", "message": "Provisioning started in background."}
 
 # ----------------------------
-# Customer UI
+# The New Fast Client-Side UI
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
 def ui(request: Request, embed: int = Query(0), return_mode: str = Query("download", alias="return"), slot: str = Query("main")):
@@ -283,25 +216,43 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0" />
   <title>Logo Prep</title>
   <style>
-    body { font-family: system-ui, sans-serif; background: #0b0c10; color: white; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .modal { width: 100%; max-width: 600px; background: #1f232a; border-radius: 16px; padding: 24px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+    body { font-family: system-ui, sans-serif; background: #0b0c10; color: white; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; overscroll-behavior: none; }
+    .modal { width: 100%; max-width: 600px; background: #1f232a; border-radius: 16px; padding: 20px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
     h2 { margin: 0 0 8px; font-size: 24px; }
     p { color: #aaa; font-size: 14px; margin-bottom: 20px; }
     input[type="file"] { padding: 40px 20px; border: 2px dashed #444; border-radius: 12px; width: calc(100% - 44px); margin-bottom: 20px; cursor: pointer; background: #111; color: #888; }
-    .canvas-wrap { background: #111; border-radius: 12px; margin: 0 auto 20px; position: relative; max-width: 400px; overflow: hidden; border: 1px solid #333; }
     
-    /* Checkerboard background so they can see what is transparent */
-    .checker { position:absolute; inset:0; background: linear-gradient(45deg, rgba(255,255,255,0.06) 25%, transparent 25%), linear-gradient(-45deg, rgba(255,255,255,0.06) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, rgba(255,255,255,0.06) 75%), linear-gradient(-45deg, transparent 75%, rgba(255,255,255,0.06) 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; opacity: 0.5; z-index: 1; }
+    .canvas-wrap { 
+        background: #fff; border-radius: 12px; margin: 0 auto 15px; position: relative; max-width: 400px; 
+        overflow: hidden; border: 1px solid #333; touch-action: none; 
+    }
+    .checker { 
+        position:absolute; inset:0; background-color: #e5e5e5;
+        background-image: linear-gradient(45deg, #f0f0f0 25%, transparent 25%), linear-gradient(-45deg, #f0f0f0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #f0f0f0 75%), linear-gradient(-45deg, transparent 75%, #f0f0f0 75%); 
+        background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; z-index: 1; 
+    }
     
-    canvas { width: 100%; display: block; touch-action: none; cursor: crosshair; position: relative; z-index: 2; }
-    .tools { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; padding: 12px; background: #111; border-radius: 12px; border: 1px solid #333; }
-    .tool-btn { background: #333; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; }
+    /* The main visible canvas */
+    canvas { width: 100%; display: block; position: relative; z-index: 2; cursor: crosshair; touch-action: none; }
+    
+    .tools-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .btn-undo { background: #333; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; }
+    .btn-undo:active { background: #555; }
+    
+    .tools { display: flex; justify-content: center; gap: 8px; margin-bottom: 20px; padding: 10px; background: #111; border-radius: 12px; border: 1px solid #333; }
+    .tool-btn { background: #333; color: white; border: none; padding: 12px 16px; border-radius: 8px; cursor: pointer; font-weight: bold; font-size: 13px; flex: 1; }
     .tool-btn.active { background: #34c759; color: black; }
+    
+    .slider-container { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; color: #888; font-size: 13px; }
+    input[type=range] { flex: 1; }
+
     .btn-done { background: #34c759; color: black; border: none; padding: 14px 24px; font-weight: bold; border-radius: 12px; cursor: pointer; font-size: 16px; width: 100%; margin-bottom: 10px; }
     .btn-done:hover { background: #2fae4e; }
+    .btn-done:disabled { background: #222; color: #555; cursor: not-allowed; }
+    
     .advanced-toggle { background: none; border: none; color: #888; cursor: pointer; font-size: 13px; text-decoration: underline; padding: 5px; }
     .advanced-toggle:hover { color: #fff; }
   </style>
@@ -309,23 +260,30 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
 <body>
   <div class="modal">
     <h2>Prepare your Logo</h2>
-    <p id="status-text">Upload a file. We'll automatically remove the background and size it perfectly.</p>
+    <p id="status-text">Upload a file. We'll automatically remove the background.</p>
     
     <input id="file" type="file" accept="image/*,.svg" />
     
     <div id="editor-section" style="display:none;">
-      <h3 style="color: #34c759; margin-top:0;">✨ Background Removed!</h3>
-      <p style="margin-bottom: 15px;">If it looks perfect, click Done.</p>
-      
+      <div class="tools-top" id="tools-top" style="display:none;">
+          <span style="font-size: 13px; color: #aaa;">Swipe to edit</span>
+          <button class="btn-undo" id="btnUndo">↩️ Undo</button>
+      </div>
+
       <div class="canvas-wrap">
         <div class="checker"></div>
         <canvas id="cv" width="1000" height="1000"></canvas>
       </div>
 
-      <div class="tools" id="tools-section" style="display:none;">
-        <button class="tool-btn active" id="btnRestore">🖌️ Bring Back (Restore)</button>
-        <button class="tool-btn" id="btnErase">🪄 Erase Extra</button>
-        <button class="tool-btn" id="btnReset" style="background:#555;">↺ Undo All</button>
+      <div id="tools-section" style="display:none;">
+        <div class="tools">
+          <button class="tool-btn active" id="btnRestore">🖌️ Restore Part</button>
+          <button class="tool-btn" id="btnErase">🪄 Erase Part</button>
+        </div>
+        <div class="slider-container">
+            <span>Brush Size:</span>
+            <input type="range" id="brushSize" min="10" max="100" value="40">
+        </div>
       </div>
 
       <button class="btn-done" id="btnDone">Looks Good — Done</button>
@@ -337,38 +295,57 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
   let sessionId = null;
   let mode = 'restore'; 
   let isDown = false;
+  let lastX = 0, lastY = 0;
   
+  // History array for the Undo function
+  let history = [];
+
   const fileEl = document.getElementById('file');
   const btnDone = document.getElementById('btnDone');
   const editor = document.getElementById('editor-section');
   const status = document.getElementById('status-text');
+  
+  // Main Canvas
   const cv = document.getElementById('cv');
-  const ctx = cv.getContext('2d');
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  
+  // Invisible canvas for drawing buttery smooth brush strokes
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = 1000; offCanvas.height = 1000;
+  const offCtx = offCanvas.getContext('2d');
+
+  const origImg = new Image();
+  const currImg = new Image();
 
   const btnToggleTools = document.getElementById('btnToggleTools');
   const toolsSection = document.getElementById('tools-section');
+  const toolsTop = document.getElementById('tools-top');
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
-  const btnReset = document.getElementById('btnReset');
+  const btnUndo = document.getElementById('btnUndo');
+  const brushSlider = document.getElementById('brushSize');
 
   const params = new URLSearchParams(window.location.search);
   const RETURN_MODE = params.get('return') || 'download';
   const SLOT = params.get('slot') || 'main';
 
-  function refreshCanvas() {
-    const img = new Image();
-    img.onload = () => {
-      ctx.clearRect(0, 0, cv.width, cv.height);
-      ctx.drawImage(img, 0, 0, cv.width, cv.height);
-    };
-    img.src = `/preview/${sessionId}?t=${Date.now()}`;
+  // Save state for undo
+  function saveState() {
+      if(history.length > 15) history.shift(); // keep last 15 edits
+      history.push(ctx.getImageData(0, 0, cv.width, cv.height));
   }
 
-  // File Upload
+  btnUndo.addEventListener('click', () => {
+      if(history.length > 0) {
+          ctx.putImageData(history.pop(), 0, 0);
+      }
+  });
+
+  // Upload Logic
   fileEl.addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (!f) return;
-    status.innerText = "Removing background... please wait.";
+    status.innerText = "AI removing background... please wait.";
     fileEl.style.display = 'none';
     
     const fd = new FormData();
@@ -378,60 +355,121 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
     const j = await r.json();
     sessionId = j.session_id;
 
+    // Load both images into browser memory
+    await Promise.all([
+        new Promise(res => { origImg.onload = res; origImg.src = `/original/${sessionId}?t=${Date.now()}`; }),
+        new Promise(res => { currImg.onload = res; currImg.src = `/preview/${sessionId}?t=${Date.now()}`; })
+    ]);
+
+    // Draw the initial AI result
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
+
     editor.style.display = 'block';
     status.style.display = 'none';
-    refreshCanvas();
   });
 
-  // Tool Selection
+  // Tool UI logic
   btnToggleTools.addEventListener('click', () => {
-    toolsSection.style.display = 'flex';
+    toolsSection.style.display = 'block';
+    toolsTop.style.display = 'flex';
     btnToggleTools.style.display = 'none';
-    document.querySelector('#editor-section p').innerText = "Swipe over the image to restore missing pieces or erase extra background.";
+    document.querySelector('#editor-section h3').style.display = 'none';
   });
 
   btnErase.addEventListener('click', () => { mode = 'remove'; btnErase.classList.add('active'); btnRestore.classList.remove('active'); });
   btnRestore.addEventListener('click', () => { mode = 'restore'; btnRestore.classList.add('active'); btnErase.classList.remove('active'); });
-  
-  btnReset.addEventListener('click', async () => {
-      await fetch(`/reset/${sessionId}`, { method: 'POST' });
-      refreshCanvas();
-  });
 
-  // Brush Logic
+  // Get coordinates that match the actual 1000x1000 canvas size regardless of screen size
   function getCoords(evt) {
     const rect = cv.getBoundingClientRect();
     const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
     const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
     return {
-      x: Math.round((clientX - rect.left) * (cv.width / rect.width)),
-      y: Math.round((clientY - rect.top) * (cv.height / rect.height))
+      x: ((clientX - rect.left) / rect.width) * cv.width,
+      y: ((clientY - rect.top) / rect.height) * cv.height
     };
   }
 
-  async function applyTap(x, y) {
-    if (!sessionId) return;
-    const endpoint = mode === 'remove' ? '/tap/remove' : '/tap/restore';
-    await fetch(`${endpoint}?session_id=${sessionId}&x=${x}&y=${y}&radius=45`, { method: 'POST' });
-    refreshCanvas();
+  // Draw Smooth Line Logic (Client-Side Only)
+  function drawBrush(x, y) {
+    const bSize = parseInt(brushSlider.value);
+    
+    // Draw the thick stroke on the invisible off-screen canvas
+    offCtx.clearRect(0, 0, 1000, 1000);
+    offCtx.lineWidth = bSize * 2;
+    offCtx.lineCap = 'round';
+    offCtx.lineJoin = 'round';
+    offCtx.beginPath();
+    offCtx.moveTo(lastX, lastY);
+    offCtx.lineTo(x, y);
+    offCtx.stroke();
+
+    if(mode === 'remove') {
+        // Erase pixels on the main canvas
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.drawImage(offCanvas, 0, 0);
+    } else {
+        // Mask the original image to the stroke, then draw onto main canvas
+        offCtx.globalCompositeOperation = 'source-in';
+        offCtx.drawImage(origImg, 0, 0, 1000, 1000);
+        
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.drawImage(offCanvas, 0, 0);
+    }
+    
+    lastX = x; lastY = y;
   }
 
-  cv.addEventListener('mousedown', (e) => { isDown = true; const c = getCoords(e); applyTap(c.x, c.y); });
-  cv.addEventListener('mousemove', (e) => { if(!isDown) return; const c = getCoords(e); applyTap(c.x, c.y); });
-  window.addEventListener('mouseup', () => isDown = false);
+  // Mouse & Touch Events
+  const startDraw = (e) => {
+      saveState(); // Save before we change anything
+      isDown = true;
+      const c = getCoords(e);
+      lastX = c.x; lastY = c.y;
+      drawBrush(c.x, c.y); // Draw single dot if just tapped
+      if(e.cancelable) e.preventDefault(); // Stop mobile scroll
+  };
   
-  cv.addEventListener('touchstart', (e) => { isDown = true; const c = getCoords(e); applyTap(c.x, c.y); e.preventDefault(); }, {passive: false});
-  cv.addEventListener('touchmove', (e) => { if(!isDown) return; const c = getCoords(e); applyTap(c.x, c.y); e.preventDefault(); }, {passive: false});
-  window.addEventListener('touchend', () => isDown = false);
+  const moveDraw = (e) => {
+      if(!isDown) return;
+      const c = getCoords(e);
+      drawBrush(c.x, c.y);
+      if(e.cancelable) e.preventDefault(); // Stop mobile scroll
+  };
+  
+  const endDraw = () => { isDown = false; };
 
-  // Finish
+  cv.addEventListener('mousedown', startDraw);
+  cv.addEventListener('mousemove', moveDraw);
+  window.addEventListener('mouseup', endDraw);
+  
+  cv.addEventListener('touchstart', startDraw, {passive: false});
+  cv.addEventListener('touchmove', moveDraw, {passive: false});
+  window.addEventListener('touchend', endDraw);
+
+  // Done Button -> Sends the final edited canvas back to Python
   btnDone.addEventListener('click', () => {
-    if (RETURN_MODE === 'postmessage') {
-      btnDone.innerText = "Saving...";
-      window.parent.postMessage({
-        type: "studio-uploader:done", slot: SLOT, session_id: sessionId, finalize_url: `${window.location.origin}/finalize/${sessionId}`
-      }, "*");
-    }
+    btnDone.innerText = "Saving... please wait";
+    btnDone.disabled = true;
+
+    // Convert the browser canvas to a real image file (Blob)
+    cv.toBlob(async (blob) => {
+        const fd = new FormData();
+        fd.append("file", blob, "edited_logo.png");
+        
+        // Send to server to be scaled perfectly to 3000x3000 for Printify
+        await fetch(`/save-edit/${sessionId}`, { method: 'POST', body: fd });
+        
+        if (RETURN_MODE === 'postmessage') {
+            window.parent.postMessage({
+                type: "studio-uploader:done", 
+                slot: SLOT, 
+                session_id: sessionId, 
+                finalize_url: `${window.location.origin}/finalize/${sessionId}`
+            }, "*");
+        }
+    }, "image/png");
   });
 </script>
 </body>
