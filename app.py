@@ -1,11 +1,11 @@
-# app.py — Studio Uploader (FastAPI) — vNext FULL REPLACEMENT (END-TO-END + FASTER UI)
-# Goals of this replacement:
-# ✅ FIX end-to-end provisioning (uses --collection_handle, not --handle)
-# ✅ Faster perceived load (no “blank minute”): upload returns immediately, UI polls until ready
-# ✅ Better editor visibility (higher-contrast checkerboard + “erase tint” overlay toggle)
-# ✅ Restore no longer brings back white background (restore uses BG-REMOVED baseline, not raw upload)
-# ✅ Faster saves (PNG save optimized for speed, not max compression)
-# ✅ Safer + memory guarded reads (keeps your OOM protection)
+# app.py — Studio Uploader (FastAPI) — FAST + ASYNC + UI IMPROVEMENTS
+# Goals:
+# - /upload returns immediately (no 2-minute blocking request)
+# - rembg runs in background; UI polls /status/{session_id}
+# - Skip rembg if input already has real transparency (editor output)
+# - Faster default rembg settings (alpha matting off)
+# - Clearer editor checkerboard + optional "erase highlight" overlay
+# - Provision endpoint avoids re-rembg when logo already transparent
 
 import os
 import uuid
@@ -27,11 +27,11 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.4.0")
+app = FastAPI(title="Studio Uploader", version="1.4.0-fast-async")
 
 
 # ----------------------------
-# CORS (Railway / Shopify)
+# CORS
 # ----------------------------
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").strip()
 allow_origins_list = ["*"] if ALLOW_ORIGINS == "*" else [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
@@ -52,19 +52,26 @@ ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_PX = int(os.getenv("TARGET_PX", "3000"))          # final normalized output
-EDITOR_PX = int(os.getenv("EDITOR_PX", "1200"))          # browser/editor working size (lower = faster)
+# Output sizes
+TARGET_PX = int(os.getenv("TARGET_PX", "3000"))      # final normalized output used for print
+EDITOR_PX = int(os.getenv("EDITOR_PX", "1000"))      # editor canvas size (smaller = faster in browser)
+
+# Upload limits
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Guard against very large images (pixel bombs)
-MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP default
+# Guard against pixel bombs
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 
-# rembg model + max dim
+# rembg
+# NOTE: for SPEED, keep dims smaller. 768-1024 is a sweet spot on CPU.
 REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
-REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1400"))  # smaller = faster, still good quality
+REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1024"))
 
-# edge refine
+# If you want higher quality (slower), set REMBG_QUALITY=high
+REMBG_QUALITY = os.getenv("REMBG_QUALITY", "fast").strip().lower()  # "fast" | "high"
+
+# edge refine (fast-ish, but optional)
 EDGE_REFINE = os.getenv("EDGE_REFINE", "1").strip() not in ("0", "false", "False", "")
 EDGE_SHRINK_PX = int(os.getenv("EDGE_SHRINK_PX", "2"))
 EDGE_FEATHER_PX = int(os.getenv("EDGE_FEATHER_PX", "2"))
@@ -72,11 +79,31 @@ EDGE_FEATHER_PX = int(os.getenv("EDGE_FEATHER_PX", "2"))
 # provisioning script path
 PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+# Put rembg model cache in /app so it survives within container runtime
+# (won't persist across cold starts unless Railway keeps the instance alive)
+os.environ.setdefault("U2NET_HOME", str(ROOT / ".u2net"))
+Path(os.environ["U2NET_HOME"]).mkdir(parents=True, exist_ok=True)
 
 
 # ----------------------------
-# Job tracking (simple in-memory)
+# Session Status Tracking
+# ----------------------------
+_STATUS: Dict[str, Dict[str, Any]] = {}
+_STATUS_LOCK = threading.Lock()
+
+def _status_set(session_id: str, **kwargs):
+    with _STATUS_LOCK:
+        s = _STATUS.get(session_id, {})
+        s.update(kwargs)
+        _STATUS[session_id] = s
+
+def _status_get(session_id: str) -> Dict[str, Any]:
+    with _STATUS_LOCK:
+        return dict(_STATUS.get(session_id, {}))
+
+
+# ----------------------------
+# Jobs (provisioning)
 # ----------------------------
 _JOBS: Dict[str, Dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -93,44 +120,38 @@ def _job_get(job_id: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Editor session tracking (in-memory)
-# ----------------------------
-_SESS: Dict[str, Dict[str, Any]] = {}
-_SESS_LOCK = threading.Lock()
-
-def _sess_set(session_id: str, **kwargs):
-    with _SESS_LOCK:
-        s = _SESS.get(session_id, {})
-        s.update(kwargs)
-        _SESS[session_id] = s
-
-def _sess_get(session_id: str) -> Dict[str, Any]:
-    with _SESS_LOCK:
-        return dict(_SESS.get(session_id, {}))
-
-
-# ----------------------------
 # rembg session (lazy load)
 # ----------------------------
 _SESSION = None
+_SESSION_LOCK = threading.Lock()
 
 def get_rembg_session():
     global _SESSION
     if _SESSION is None:
-        print("🧠 Loading rembg model into memory:", REMBG_MODEL)
-        from rembg import new_session
-        _SESSION = new_session(REMBG_MODEL)
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                print("🧠 Loading rembg model into memory:", REMBG_MODEL)
+                from rembg import new_session
+                _SESSION = new_session(REMBG_MODEL)
     return _SESSION
+
+
+@app.on_event("startup")
+def _warm_start():
+    # Warm model in background so first user upload isn't waiting on model init
+    def _warm():
+        try:
+            get_rembg_session()
+            print("✅ rembg session warmed")
+        except Exception as e:
+            print("⚠️ rembg warm failed:", str(e))
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 # ----------------------------
 # Helpers: file read (stream + cap)
 # ----------------------------
 async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
-    """
-    Reads an UploadFile in chunks and hard-stops at limit_bytes.
-    Prevents memory spikes / OOM from large unexpected uploads.
-    """
     buf = bytearray()
     chunk_size = 1024 * 1024  # 1MB
     while True:
@@ -147,19 +168,14 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # Helpers: image IO + scaling
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
-    # raw = uploaded image (as placed into square editor canvas)
-    # base = baseline for RESTORE (bg removed version so restore won't re-add white background)
-    # curr = current editable image
     return {
-        "raw": UPLOAD_DIR / f"{session_id}_raw.png",
-        "base": UPLOAD_DIR / f"{session_id}_base.png",
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",
     }
 
 def _save_png(img: Image.Image, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Speed-first PNG write (optimize=True can be slow and make UI feel “stuck”)
-    img.save(str(path), "PNG", optimize=False, compress_level=6)
+    img.save(str(path), "PNG", optimize=True)
 
 def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     w, h = img.size
@@ -168,15 +184,7 @@ def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     scale = min(max_dim / w, max_dim / h)
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
-def _downscale_for_rembg(img: Image.Image, max_dim: int = REMBG_MAX_DIM) -> Image.Image:
-    return _scale_to_fit(img, max_dim)
-
 def _pil_open_safe(data: bytes) -> Image.Image:
-    """
-    Safe PIL open:
-    - Blocks pixel bombs
-    - Applies EXIF transpose (fixes iPhone rotation)
-    """
     img = Image.open(BytesIO(data))
     w, h = img.size
     if (w * h) > MAX_IMAGE_PIXELS:
@@ -186,24 +194,52 @@ def _pil_open_safe(data: bytes) -> Image.Image:
 
 
 # ----------------------------
-# Better background removal
+# Transparency heuristics (skip rembg if already transparent)
 # ----------------------------
-def _rembg_to_pil_better(img: Image.Image) -> Image.Image:
+def _has_real_transparency(img: Image.Image, sample_step: int = 8, alpha_cut: int = 245) -> bool:
     """
-    Higher quality than basic rembg:
-    - alpha matting to reduce jagged edges
-    - optional edge refine pass to reduce halos / fringe
+    Detect if image already has meaningful transparency.
+    We sample pixels; if enough have alpha < alpha_cut, treat as already-processed.
     """
+    if img.mode != "RGBA":
+        return False
+    a = img.split()[-1]
+    w, h = a.size
+    # Sample grid
+    count = 0
+    trans = 0
+    px = a.load()
+    for y in range(0, h, sample_step):
+        for x in range(0, w, sample_step):
+            count += 1
+            if px[x, y] < alpha_cut:
+                trans += 1
+    if count == 0:
+        return False
+    return (trans / count) > 0.03  # >3% sampled pixels transparent-ish
+
+
+# ----------------------------
+# rembg pipeline (fast vs high)
+# ----------------------------
+def _rembg_remove(img: Image.Image) -> Image.Image:
     from rembg import remove
 
-    out = remove(
-        img,
-        session=get_rembg_session(),
-        alpha_matting=True,
-        alpha_matting_foreground_threshold=240,
-        alpha_matting_background_threshold=10,
-        alpha_matting_erode_size=10,
-    )
+    # Downscale for speed/stability
+    img_small = _scale_to_fit(img, REMBG_MAX_DIM)
+
+    if REMBG_QUALITY == "high":
+        out = remove(
+            img_small,
+            session=get_rembg_session(),
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+        )
+    else:
+        # FAST path: no alpha matting
+        out = remove(img_small, session=get_rembg_session())
 
     if isinstance(out, (bytes, bytearray)):
         out_img = Image.open(BytesIO(out)).convert("RGBA")
@@ -215,11 +251,8 @@ def _rembg_to_pil_better(img: Image.Image) -> Image.Image:
 
     return out_img
 
+
 def _refine_alpha_edges(img: Image.Image, shrink_px: int = 2, feather_px: int = 2) -> Image.Image:
-    """
-    Refines transparency edges to reduce halos/fringing.
-    Uses OpenCV if available; gracefully falls back if not.
-    """
     try:
         import cv2
         import numpy as np
@@ -241,12 +274,12 @@ def _refine_alpha_edges(img: Image.Image, shrink_px: int = 2, feather_px: int = 
         k = max(1, int(feather_px) * 2 + 1)
         a = cv2.GaussianBlur(a, (k, k), 0)
 
-    rgba[:, :, 3] = a.clip(0, 255).astype("uint8")
+    rgba[:, :, 3] = np.clip(a, 0, 255).astype(np.uint8)
     return Image.fromarray(rgba, mode="RGBA")
 
 
 # ----------------------------
-# Padding trim + normalize to 3000x3000
+# Trim + normalize (print)
 # ----------------------------
 def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
     img = img.convert("RGBA")
@@ -257,9 +290,6 @@ def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Ima
     return img.crop(bbox)
 
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
-    """
-    Trim padding -> scale to fit within square -> center -> output exact target_size x target_size RGBA.
-    """
     img = _trim_transparent_padding(img.convert("RGBA"))
 
     canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
@@ -280,49 +310,43 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
 
 
 # ----------------------------
-# Square-canvas placement
+# Async worker for /upload
 # ----------------------------
-def _place_into_square(img: Image.Image, square: int) -> Image.Image:
-    canvas = Image.new("RGBA", (square, square), (0, 0, 0, 0))
-    x = (square - img.width) // 2
-    y = (square - img.height) // 2
-    canvas.alpha_composite(img, (x, y))
-    return canvas
-
-
-# ----------------------------
-# Async bg-removal worker for faster UI
-# ----------------------------
-def _bg_remove_worker(session_id: str):
-    """
-    Runs rembg in background and writes:
-      - base (bg-removed baseline used for RESTORE)
-      - curr (starts as base)
-    """
+def _process_upload_background(session_id: str, keep_original: bool):
+    start = time.time()
     try:
+        _status_set(session_id, status="processing", stage="remove_bg", started_at=start)
+
         p = _paths(session_id)
-        raw_path = p["raw"]
-        if not raw_path.exists():
-            _sess_set(session_id, status="failed", error="raw_not_found")
-            return
+        orig = Image.open(p["orig"]).convert("RGBA")
 
-        _sess_set(session_id, status="processing")
+        # If keep_original, no bg removal
+        if keep_original or _has_real_transparency(orig):
+            curr = orig.copy()
+        else:
+            curr = _rembg_remove(orig)
 
-        raw_img = Image.open(str(raw_path)).convert("RGBA")
+        # Resize to editor size for the UI (exact square canvas)
+        orig_fit = _scale_to_fit(orig, EDITOR_PX)
+        curr_fit = _scale_to_fit(curr, EDITOR_PX)
 
-        # downscale for model stability/speed
-        img_for_model = _downscale_for_rembg(raw_img, max_dim=REMBG_MAX_DIM)
-        removed_small = _rembg_to_pil_better(img_for_model)
+        canvas_orig = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
+        canvas_curr = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
 
-        # scale back to raw canvas size so brush coords align
-        removed = removed_small.resize(raw_img.size, Image.LANCZOS)
+        x = (EDITOR_PX - orig_fit.width) // 2
+        y = (EDITOR_PX - orig_fit.height) // 2
+        canvas_orig.alpha_composite(orig_fit, (x, y))
 
-        _save_png(removed, p["base"])
-        _save_png(removed, p["curr"])
+        x2 = (EDITOR_PX - curr_fit.width) // 2
+        y2 = (EDITOR_PX - curr_fit.height) // 2
+        canvas_curr.alpha_composite(curr_fit, (x2, y2))
 
-        _sess_set(session_id, status="ready")
+        _save_png(canvas_orig, p["orig"])
+        _save_png(canvas_curr, p["curr"])
+
+        _status_set(session_id, status="ready", stage="done", finished_at=time.time(), elapsed=time.time() - start)
     except Exception as e:
-        _sess_set(session_id, status="failed", error=str(e)[:500])
+        _status_set(session_id, status="failed", stage="error", error=str(e), finished_at=time.time(), elapsed=time.time() - start)
 
 
 # ----------------------------
@@ -336,25 +360,24 @@ def root():
 def healthz():
     return {"ok": True, "version": app.version}
 
+@app.get("/status/{session_id}")
+def status(session_id: str):
+    s = _status_get(session_id)
+    if not s:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return s
+
 
 # --------
-# Editor upload pipeline
+# Upload: immediate response + background processing
 # --------
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...), keep_original: bool = Query(False)):
-    """
-    Uploads an image and returns session_id immediately.
-    If keep_original=false, bg removal happens in background for faster perceived UI.
-    """
-    # Stream read w/ hard cap
     try:
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
-    except ValueError as e:
-        if str(e) == "too_large":
-            return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
-        return JSONResponse({"error": "Upload read failed"}, status_code=400)
+    except ValueError:
+        return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
 
-    # Convert input to RGBA safely
     try:
         img = _pil_open_safe(data)
     except ValueError as e:
@@ -367,82 +390,37 @@ async def upload_image(file: UploadFile = File(...), keep_original: bool = Query
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    # Scale uploaded image into editor working size
-    img_scaled = _scale_to_fit(img, EDITOR_PX)
-    raw_square = _place_into_square(img_scaled, EDITOR_PX)
+    # Save original immediately (fast)
+    _save_png(img, p["orig"])
 
-    _save_png(raw_square, p["raw"])
-
-    if keep_original:
-        # baseline == raw (restore will restore raw)
-        _save_png(raw_square, p["base"])
-        _save_png(raw_square, p["curr"])
-        _sess_set(session_id, status="ready")
-    else:
-        # placeholder curr/base while processing (shows something immediately)
-        _save_png(raw_square, p["base"])
-        _save_png(raw_square, p["curr"])
-        _sess_set(session_id, status="queued")
-        t = threading.Thread(target=_bg_remove_worker, args=(session_id,), daemon=True)
-        t.start()
+    # Mark status and process in background
+    _status_set(session_id, status="queued", stage="queued", created_at=time.time())
+    threading.Thread(target=_process_upload_background, args=(session_id, keep_original), daemon=True).start()
 
     return {
         "status": "ok",
         "session_id": session_id,
-        "status_url": f"/status/{session_id}",
         "preview_url": f"/preview/{session_id}",
-        "original_url": f"/original/{session_id}",  # NOTE: original = BASELINE (bg-removed) for restore safety
-        "raw_url": f"/raw/{session_id}",
+        "original_url": f"/original/{session_id}",
+        "status_url": f"/status/{session_id}",
     }
-
-@app.get("/status/{session_id}")
-def status(session_id: str):
-    s = _sess_get(session_id)
-    if not s:
-        # If files exist but no in-memory state (server restarted), infer readiness
-        p = _paths(session_id)
-        if p["curr"].exists():
-            return {"status": "ready"}
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return s
-
-
-# Images: add cache headers (we add ?t=Date.now() anyway, but this helps)
-def _png_response(path: Path) -> Response:
-    return Response(
-        content=path.read_bytes(),
-        media_type="image/png",
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
     path = _paths(session_id)["curr"]
     if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return _png_response(path)
+        return JSONResponse({"error": "Not ready"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
 
 @app.get("/original/{session_id}")
 def get_original(session_id: str):
-    # original = BASELINE used for RESTORE (bg removed)
-    path = _paths(session_id)["base"]
+    path = _paths(session_id)["orig"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return _png_response(path)
-
-@app.get("/raw/{session_id}")
-def get_raw(session_id: str):
-    path = _paths(session_id)["raw"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return _png_response(path)
-
+    return Response(content=path.read_bytes(), media_type="image/png")
 
 @app.post("/save-edit/{session_id}")
 async def save_edit(session_id: str, file: UploadFile = File(...)):
-    """
-    Receives browser canvas PNG (1000x1000) and saves normalized 3000x3000 in session_curr.
-    """
     p = _paths(session_id)
     try:
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
@@ -458,24 +436,16 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
     _save_png(final_img, p["curr"])
     return {"status": "ok"}
 
-
 @app.post("/finalize/{session_id}")
 def finalize(session_id: str):
-    """
-    Returns the final normalized PNG bytes for Shopify form consumption.
-    """
     path = _paths(session_id)["curr"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(
-        content=path.read_bytes(),
-        media_type="image/png",
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
+    return Response(content=path.read_bytes(), media_type="image/png")
 
 
 # ----------------------------
-# Provisioning runner (subprocess)
+# Provisioning runner
 # ----------------------------
 def _run_shopify_provision_job(
     job_id: str,
@@ -486,10 +456,6 @@ def _run_shopify_provision_job(
     main_session_id: str,
     secondary_session_id: Optional[str],
 ):
-    """
-    Runs shopify_provision.py as a subprocess.
-    IMPORTANT: uses --collection_handle (matches your shopify_provision.py).
-    """
     _job_set(job_id, status="running", started_at=time.time())
 
     if not PROVISION_SCRIPT.exists():
@@ -500,7 +466,7 @@ def _run_shopify_provision_job(
         "python",
         str(PROVISION_SCRIPT),
         "--name", storefront_name,
-        "--collection_handle", storefront_handle,   # ✅ FIXED
+        "--handle", storefront_handle,
         "--owner_customer_id", owner_customer_id,
         "--main_session_id", main_session_id,
         "--uploads_dir", str(UPLOAD_DIR),
@@ -526,23 +492,10 @@ def _run_shopify_provision_job(
         stderr = (proc.stderr or "")[-12000:]
 
         if proc.returncode != 0:
-            _job_set(
-                job_id,
-                status="failed",
-                finished_at=time.time(),
-                error=f"Provision failed (exit {proc.returncode})",
-                stdout=stdout,
-                stderr=stderr,
-            )
+            _job_set(job_id, status="failed", finished_at=time.time(), error=f"Provision failed (exit {proc.returncode})", stdout=stdout, stderr=stderr)
             return
 
-        _job_set(
-            job_id,
-            status="succeeded",
-            finished_at=time.time(),
-            stdout=stdout,
-            stderr=stderr,
-        )
+        _job_set(job_id, status="succeeded", finished_at=time.time(), stdout=stdout, stderr=stderr)
 
     except subprocess.TimeoutExpired:
         _job_set(job_id, status="failed", finished_at=time.time(), error="Provision timed out")
@@ -551,7 +504,9 @@ def _run_shopify_provision_job(
 
 
 # ----------------------------
-# Shopify Provisioning Endpoint (called by your Shopify form)
+# Shopify Provisioning Endpoint
+# IMPORTANT SPEED CHANGE:
+# - If logo file already has transparency => skip rembg and just normalize
 # ----------------------------
 @app.post("/api/storefront-request")
 async def storefront_request(
@@ -567,10 +522,6 @@ async def storefront_request(
     storefront_logo_file: UploadFile = File(...),
     storefront_logo_secondary: Optional[UploadFile] = File(None),
 ):
-    """
-    - Produces normalized main/secondary logos in uploads/ as session_curr.png files.
-    - Launches shopify_provision.py in a background thread and returns a job_id.
-    """
     if not storefront_name.strip():
         return JSONResponse({"error": "storefront_name is required"}, status_code=400)
     if not storefront_handle.strip():
@@ -580,13 +531,10 @@ async def storefront_request(
 
     owner_customer_id = customer_id.split("/")[-1].strip()
 
-    # Read main logo
     try:
         main_bytes = await _read_upload_limited(storefront_logo_file, MAX_UPLOAD_BYTES)
     except ValueError:
         return JSONResponse({"error": f"Main logo too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
-    if not main_bytes:
-        return JSONResponse({"error": "storefront_logo_file is required"}, status_code=400)
 
     sec_bytes = None
     if storefront_logo_secondary:
@@ -595,7 +543,7 @@ async def storefront_request(
         except ValueError:
             return JSONResponse({"error": f"Secondary logo too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
 
-    # Process main logo -> session files
+    # ---- MAIN ----
     main_session_id = str(uuid.uuid4())
     main_paths = _paths(main_session_id)
 
@@ -608,16 +556,17 @@ async def storefront_request(
     except Exception:
         return JSONResponse({"error": "Main logo is not a supported image."}, status_code=400)
 
-    img_main_scaled = _scale_to_fit(img_main, EDITOR_PX)
-    img_main_removed = _rembg_to_pil_better(_downscale_for_rembg(img_main_scaled, REMBG_MAX_DIM))
-    main_final = _normalize_logo(img_main_removed, target_size=TARGET_PX)
+    # If already transparent, skip rembg (FAST)
+    if _has_real_transparency(img_main):
+        main_processed = img_main
+    else:
+        main_processed = _rembg_remove(img_main)
 
-    # Save raw/base/curr (for consistency)
-    _save_png(_place_into_square(img_main_scaled, EDITOR_PX), main_paths["raw"])
-    _save_png(_place_into_square(img_main_removed.resize(img_main_scaled.size, Image.LANCZOS), EDITOR_PX), main_paths["base"])
+    main_final = _normalize_logo(main_processed, target_size=TARGET_PX)
+    _save_png(_scale_to_fit(img_main, EDITOR_PX), main_paths["orig"])
     _save_png(main_final, main_paths["curr"])
 
-    # Secondary
+    # ---- SECONDARY ----
     secondary_session_id = None
     if sec_bytes:
         secondary_session_id = str(uuid.uuid4())
@@ -625,13 +574,6 @@ async def storefront_request(
 
         try:
             img_sec = _pil_open_safe(sec_bytes)
-            img_sec_scaled = _scale_to_fit(img_sec, EDITOR_PX)
-            img_sec_removed = _rembg_to_pil_better(_downscale_for_rembg(img_sec_scaled, REMBG_MAX_DIM))
-            sec_final = _normalize_logo(img_sec_removed, target_size=TARGET_PX)
-
-            _save_png(_place_into_square(img_sec_scaled, EDITOR_PX), sec_paths["raw"])
-            _save_png(_place_into_square(img_sec_removed.resize(img_sec_scaled.size, Image.LANCZOS), EDITOR_PX), sec_paths["base"])
-            _save_png(sec_final, sec_paths["curr"])
         except ValueError as e:
             if str(e) == "too_many_pixels":
                 return JSONResponse({"error": "Secondary logo resolution too large. Please upload a smaller image."}, status_code=413)
@@ -639,8 +581,19 @@ async def storefront_request(
         except Exception:
             return JSONResponse({"error": "Secondary logo is not a supported image."}, status_code=400)
 
-    # Launch provisioning job
+        if _has_real_transparency(img_sec):
+            sec_processed = img_sec
+        else:
+            sec_processed = _rembg_remove(img_sec)
+
+        sec_final = _normalize_logo(sec_processed, target_size=TARGET_PX)
+        _save_png(_scale_to_fit(img_sec, EDITOR_PX), sec_paths["orig"])
+        _save_png(sec_final, sec_paths["curr"])
+
+    # Launch provisioning job (background)
     job_id = str(uuid.uuid4())
+    type_of_store = (org_type or military_branch or sport_type or "").strip() or None
+
     _job_set(
         job_id,
         status="queued",
@@ -650,31 +603,22 @@ async def storefront_request(
         main_session_id=main_session_id,
         secondary_session_id=secondary_session_id,
         customer_email=customer_email,
+        type_of_store=type_of_store,
+        created_at=time.time(),
     )
 
-    type_of_store = (org_type or military_branch or sport_type or "").strip() or None
-
-    t = threading.Thread(
+    threading.Thread(
         target=_run_shopify_provision_job,
         args=(job_id, storefront_name, storefront_handle, owner_customer_id, type_of_store, main_session_id, secondary_session_id),
         daemon=True,
-    )
-    t.start()
+    ).start()
 
+    # IMPORTANT: return fast so Shopify doesn't spin forever
     return {
         "status": "ok",
         "job_id": job_id,
         "message": "Provisioning started.",
-        "debug": {
-            "storefront_name": storefront_name,
-            "storefront_handle": storefront_handle,
-            "owner_customer_id": owner_customer_id,
-            "main_session_id": main_session_id,
-            "secondary_session_id": secondary_session_id,
-            "type_of_store": type_of_store,
-        },
     }
-
 
 @app.get("/api/job/{job_id}")
 def job_status(job_id: str):
@@ -685,7 +629,7 @@ def job_status(job_id: str):
 
 
 # ----------------------------
-# Premium HTML5 UI
+# UI (Editor) — faster load + better visibility
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
@@ -705,57 +649,47 @@ def ui(
     :root {
         --bg: #0b0f19;
         --surface: #1e293b;
-        --surface-hover: #334155;
         --primary: #10b981;
         --primary-hover: #059669;
-        --danger: #ef4444;
         --text: #f8fafc;
         --muted: #94a3b8;
         --radius: 16px;
     }
     body { font-family: ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; min-height: 100vh; overscroll-behavior: none; }
-
-    .header { padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; background: rgba(30, 41, 59, 0.8); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(255,255,255,0.05); z-index: 10; position: relative; }
-    .header h2 { margin: 0; font-size: 18px; font-weight: 800; letter-spacing: .2px; }
+    .header { padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; background: rgba(30, 41, 59, 0.85); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(255,255,255,0.06); z-index: 10; position: relative; }
+    .header h2 { margin: 0; font-size: 18px; font-weight: 800; letter-spacing: 0.2px; }
     .btn-done { background: var(--primary); color: white; border: none; padding: 8px 16px; border-radius: 99px; font-weight: 700; font-size: 14px; cursor: pointer; transition: background 0.2s; }
     .btn-done:hover { background: var(--primary-hover); }
     .btn-done:disabled { opacity: 0.5; cursor: not-allowed; }
 
     .main-container { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; position: relative; }
 
-    .step-upload { text-align: center; width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 16px; }
-    .upload-box { border: 2px dashed rgba(255,255,255,0.22); border-radius: var(--radius); padding: 54px 20px; background: rgba(255,255,255,0.03); cursor: pointer; transition: all 0.2s; position: relative; }
+    .step-upload { text-align: center; width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
+    .upload-box { border: 2px dashed rgba(255,255,255,0.22); border-radius: var(--radius); padding: 56px 20px; background: rgba(255,255,255,0.03); cursor: pointer; transition: all 0.2s; position: relative; }
     .upload-box:hover { background: rgba(255,255,255,0.06); border-color: var(--primary); }
     .upload-box input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
-    .upload-icon { font-size: 40px; margin-bottom: 10px; display: block; }
+    .upload-icon { font-size: 40px; margin-bottom: 12px; display: block; }
     .upload-title { font-size: 18px; font-weight: 800; margin-bottom: 6px; }
-    .upload-sub { color: var(--muted); font-size: 14px; }
+    .upload-sub { color: var(--muted); font-size: 14px; line-height: 1.35; }
 
     .step-loading { display: none; text-align: center; flex-direction: column; align-items: center; gap: 16px; }
-    .spinner { width: 50px; height: 50px; border: 4px solid rgba(255,255,255,0.1); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
+    .spinner { width: 46px; height: 46px; border: 4px solid rgba(255,255,255,0.12); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .loading-sub { color: var(--muted); font-size: 14px; max-width: 360px; line-height: 1.4; }
+    .progress { width: 260px; height: 10px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+    .bar { height: 100%; width: 20%; background: var(--primary); border-radius: 99px; animation: pulse 1.1s ease-in-out infinite; }
+    @keyframes pulse { 0%{ transform: translateX(-40%);} 100%{ transform: translateX(360%);} }
 
-    .step-editor { display: none; width: 100%; max-width: 520px; flex-direction: column; gap: 16px; }
-    .top-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 2px; }
-    .btn-text { background: none; border: none; color: var(--muted); font-size: 13px; cursor: pointer; font-weight: 700; }
-    .btn-text:hover { color: var(--text); }
+    .step-editor { display: none; width: 100%; max-width: 540px; flex-direction: column; gap: 18px; }
 
     .canvas-wrap {
-        border-radius: var(--radius);
-        position: relative;
-        width: 100%;
-        aspect-ratio: 1/1;
-        overflow: hidden;
-        border: 1px solid rgba(255,255,255,0.12);
-        box-shadow: 0 20px 40px rgba(0,0,0,0.35);
-        background: #0f172a;
+        background: #111827; border-radius: var(--radius); position: relative; width: 100%; aspect-ratio: 1/1;
+        overflow: hidden; border: 1px solid rgba(255,255,255,0.10); touch-action: none; box-shadow: 0 20px 40px rgba(0,0,0,0.35);
     }
 
-    /* HIGH CONTRAST CHECKERBOARD */
+    /* DARK checkerboard so white/halo areas pop */
     .checker {
         position:absolute; inset:0;
-        background-color: #0b1220;
+        background-color: #0f172a;
         background-image:
           linear-gradient(45deg, rgba(255,255,255,0.08) 25%, transparent 25%),
           linear-gradient(-45deg, rgba(255,255,255,0.08) 25%, transparent 25%),
@@ -766,70 +700,57 @@ def ui(
         z-index: 1;
     }
 
-    /* ERASE VISIBILITY OVERLAY (tint) */
-    .erase-tint {
-        position:absolute; inset:0;
-        background: rgba(239, 68, 68, 0.10);
-        mix-blend-mode: multiply;
-        opacity: 0;
-        transition: opacity .15s ease;
-        z-index: 1;
-        pointer-events:none;
+    /* Optional overlay to highlight erased (transparent) pixels */
+    .erase-overlay {
+        position:absolute; inset:0; z-index: 3; pointer-events: none; opacity: 0; mix-blend-mode: screen;
+        background: radial-gradient(circle at center, rgba(255,0,0,0.0) 0%, rgba(255,0,0,0.0) 55%, rgba(255,0,0,0.08) 100%);
     }
-    .erase-tint.on { opacity: 1; }
 
     canvas { width: 100%; height: 100%; display: block; position: relative; z-index: 2; touch-action: none; cursor: none; }
 
-    #cursor { position: fixed; border: 2px solid rgba(255,255,255,0.92); box-shadow: 0 0 6px rgba(0,0,0,0.85); border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); z-index: 9999; display: none; }
+    #cursor { position: fixed; border: 2px solid rgba(255,255,255,0.95); box-shadow: 0 0 6px rgba(0,0,0,0.8); border-radius: 50%; pointer-events: none; transform: translate(-50%, -50%); z-index: 9999; display: none; }
 
-    .toolbar { background: rgba(30, 41, 59, 0.95); border: 1px solid rgba(255,255,255,0.12); border-radius: 999px; padding: 6px; display: flex; gap: 6px; margin: 0 auto; box-shadow: 0 10px 25px rgba(0,0,0,0.55); flex-wrap: wrap; justify-content: center; }
-    .tool-btn { background: transparent; color: var(--muted); border: none; padding: 10px 14px; border-radius: 999px; cursor: pointer; font-weight: 800; font-size: 14px; display: flex; align-items: center; gap: 6px; transition: all 0.2s; }
-    .tool-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+    .toolbar { background: rgba(30,41,59,0.95); border: 1px solid rgba(255,255,255,0.10); border-radius: 999px; padding: 6px; display: flex; gap: 6px; margin: 0 auto; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+    .tool-btn { background: transparent; color: var(--muted); border: none; padding: 10px 14px; border-radius: 999px; cursor: pointer; font-weight: 800; font-size: 13px; display: flex; align-items: center; gap: 6px; transition: all 0.2s; }
+    .tool-btn:hover { color: var(--text); background: rgba(255,255,255,0.06); }
     .tool-btn.active { background: rgba(255,255,255,0.10); color: var(--primary); }
 
-    .brush-controls { display: flex; align-items: center; gap: 12px; background: rgba(30, 41, 59, 0.95); padding: 12px 18px; border-radius: 999px; margin: 0 auto; border: 1px solid rgba(255,255,255,0.12); width: 100%; max-width: 520px; }
+    .brush-controls { display: flex; align-items: center; gap: 12px; background: rgba(30,41,59,0.95); padding: 12px 18px; border-radius: 999px; margin-top: 8px; border: 1px solid rgba(255,255,255,0.10); }
     .brush-controls span { font-size: 13px; color: var(--muted); font-weight: 800; }
     input[type=range] { flex: 1; accent-color: var(--primary); }
 
-    .pill { display:flex; gap:8px; align-items:center; justify-content:center; margin-top: 2px; }
-    .toggle {
-      display:flex; align-items:center; gap:10px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      padding: 10px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      color: var(--muted);
-      font-weight: 800;
-      cursor: pointer;
-      user-select:none;
-    }
-    .toggle b { color: var(--text); }
+    .top-actions { display: flex; justify-content: space-between; margin-bottom: 6px; }
+    .btn-text { background: none; border: none; color: var(--muted); font-size: 13px; cursor: pointer; font-weight: 800; }
+    .btn-text:hover { color: var(--text); }
+
+    .hint { color: rgba(255,255,255,0.75); font-size: 12px; text-align: center; margin-top: 4px; }
   </style>
 </head>
 <body>
   <div id="cursor"></div>
 
   <div class="header">
-      <h2>Logo Studio</h2>
+      <h2>Studio Uploader</h2>
       <button class="btn-done" id="btnDone" style="display:none;">Save & Done</button>
   </div>
 
   <div class="main-container">
-
     <div class="step-upload" id="step1">
       <div class="upload-box">
           <input id="file" type="file" accept="image/*" />
           <span class="upload-icon">🪄</span>
-          <div class="upload-title">Tap to Upload Logo</div>
-          <div class="upload-sub">We’ll auto-remove the background (fast)</div>
+          <div class="upload-title">Tap to Upload</div>
+          <div class="upload-sub">We’ll prep your logo fast. You can erase/restore if needed.</div>
       </div>
+      <div class="hint">Tip: If your logo already has a transparent background, it loads almost instantly.</div>
     </div>
 
     <div class="step-loading" id="step2">
       <div class="spinner"></div>
       <div style="font-weight: 800; font-size: 18px;">Processing…</div>
-      <div class="loading-sub" id="loadingSub">Uploading your image…</div>
+      <div style="color: var(--muted); font-size: 14px;" id="statusLine">Preparing image</div>
+      <div class="progress"><div class="bar"></div></div>
+      <div class="hint" id="timeHint"></div>
     </div>
 
     <div class="step-editor" id="step3">
@@ -840,7 +761,7 @@ def ui(
 
       <div class="canvas-wrap" id="canvas-container">
         <div class="checker"></div>
-        <div class="erase-tint" id="eraseTint"></div>
+        <div class="erase-overlay" id="eraseOverlay"></div>
         <canvas id="cv" width="1000" height="1000"></canvas>
       </div>
 
@@ -848,18 +769,16 @@ def ui(
         <button class="tool-btn active" id="btnRestore">🖌️ Restore</button>
         <button class="tool-btn" id="btnErase">🧹 Erase</button>
         <button class="tool-btn" id="btnMagic">✨ Magic</button>
-      </div>
-
-      <div class="pill">
-        <div class="toggle" id="toggleTint"><b>Visibility:</b> Show erase tint</div>
+        <button class="tool-btn" id="btnShowErase">👁️ Show Erased</button>
       </div>
 
       <div class="brush-controls" id="brush-controls">
           <span>Size</span>
-          <input type="range" id="brushSize" min="10" max="160" value="55">
+          <input type="range" id="brushSize" min="10" max="150" value="50">
       </div>
-    </div>
 
+      <div class="hint">Magic removes similar colors where you click (great for leftover white halos).</div>
+    </div>
   </div>
 
 <script>
@@ -875,7 +794,6 @@ def ui(
   const step1 = document.getElementById('step1');
   const step2 = document.getElementById('step2');
   const step3 = document.getElementById('step3');
-  const loadingSub = document.getElementById('loadingSub');
 
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', { willReadFrequently: true });
@@ -884,22 +802,26 @@ def ui(
   offCanvas.width = 1000; offCanvas.height = 1000;
   const offCtx = offCanvas.getContext('2d');
 
-  const origImg = new Image(); // NOTE: this now points to BASELINE (bg removed) so Restore won't re-add white bg
+  const origImg = new Image();
   const currImg = new Image();
 
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
   const btnMagic = document.getElementById('btnMagic');
-
+  const btnShowErase = document.getElementById('btnShowErase');
   const brushSlider = document.getElementById('brushSize');
   const brushControls = document.getElementById('brush-controls');
   const cursor = document.getElementById('cursor');
   const canvasContainer = document.getElementById('canvas-container');
-  const eraseTint = document.getElementById('eraseTint');
+  const statusLine = document.getElementById('statusLine');
+  const timeHint = document.getElementById('timeHint');
+  const eraseOverlay = document.getElementById('eraseOverlay');
 
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
   const RETURN_TO = params.get('return_to') || '';
+
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
   function saveState() {
       if(history.length > 12) history.shift();
@@ -922,11 +844,7 @@ def ui(
           cursor.style.height = visualSize + 'px';
           cv.style.cursor = 'none';
       }
-      // Tint helps you see erased areas better when erasing
-      if (mode === 'remove') eraseTint.classList.add('on');
-      else eraseTint.classList.remove('on');
   }
-
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
@@ -938,24 +856,23 @@ def ui(
   });
   canvasContainer.addEventListener('mouseleave', () => cursor.style.display = 'none');
 
-  // Toggle erase tint visibility
-  document.getElementById('toggleTint').addEventListener('click', () => {
-      eraseTint.classList.toggle('on');
-  });
-
-  async function waitForReady(sessionId) {
-      // Poll /status until ready (fast perceived UX; avoids 60s “dead wait” on /upload)
+  async function waitUntilReady(sessionId) {
       const start = Date.now();
-      const timeoutMs = 120000; // 2 min max
-      while (true) {
+      while(true){
           const r = await fetch(`/status/${sessionId}?t=${Date.now()}`);
-          if (r.ok) {
-              const j = await r.json();
-              if (j.status === "ready") return;
-              if (j.status === "failed") throw new Error("Background removal failed. Try Keep Original or re-upload.");
+          const j = await r.json();
+          if(r.ok){
+              if(j.status === "ready"){
+                  return { ok:true, elapsed: j.elapsed || ((Date.now()-start)/1000) };
+              }
+              if(j.status === "failed"){
+                  return { ok:false, error: j.error || "processing failed" };
+              }
+              statusLine.textContent = (j.stage === "remove_bg") ? "Removing background…" : "Preparing…";
+              const sec = Math.floor((Date.now()-start)/1000);
+              timeHint.textContent = sec > 2 ? `Time: ${sec}s` : "";
           }
-          if (Date.now() - start > timeoutMs) throw new Error("Processing timed out. Try again.");
-          await new Promise(res => setTimeout(res, 650));
+          await sleep(450);
       }
   }
 
@@ -965,22 +882,25 @@ def ui(
 
     step1.style.display = 'none';
     step2.style.display = 'flex';
-    loadingSub.innerText = "Uploading your image…";
+    statusLine.textContent = "Uploading…";
+    timeHint.textContent = "";
 
     const fd = new FormData();
     fd.append('file', f);
 
     try {
-        // returns quickly, processing continues in background
+        // keep_original=false means "try background removal"
         const r = await fetch(`/upload?keep_original=false`, { method: 'POST', body: fd });
         const j = await r.json();
         if(!r.ok) throw new Error(j.error || "Upload failed");
         sessionId = j.session_id;
 
-        loadingSub.innerText = "Removing background… (usually a few seconds)";
-        await waitForReady(sessionId);
+        // Poll until /preview exists
+        const ready = await waitUntilReady(sessionId);
+        if(!ready.ok) throw new Error(ready.error || "Processing failed");
 
-        // Load baseline + current
+        statusLine.textContent = "Loading editor…";
+
         await Promise.all([
             new Promise(res => { origImg.onload = res; origImg.src = `/original/${sessionId}?t=${Date.now()}`; }),
             new Promise(res => { currImg.onload = res; currImg.src = `/preview/${sessionId}?t=${Date.now()}`; })
@@ -1005,7 +925,7 @@ def ui(
       btnRestore.classList.remove('active');
       btnMagic.classList.remove('active');
       activeBtn.classList.add('active');
-      brushControls.style.opacity = (m === 'magic') ? '0.3' : '1';
+      brushControls.style.opacity = (m === 'magic') ? '0.35' : '1';
       brushControls.style.pointerEvents = (m === 'magic') ? 'none' : 'auto';
       updateCursorSize();
   };
@@ -1013,6 +933,13 @@ def ui(
   btnErase.addEventListener('click', () => setMode('remove', btnErase));
   btnRestore.addEventListener('click', () => setMode('restore', btnRestore));
   btnMagic.addEventListener('click', () => setMode('magic', btnMagic));
+
+  let showErase = false;
+  btnShowErase.addEventListener('click', () => {
+      showErase = !showErase;
+      eraseOverlay.style.opacity = showErase ? '1' : '0';
+      btnShowErase.classList.toggle('active', showErase);
+  });
 
   function getCoords(evt) {
     const rect = cv.getBoundingClientRect();
@@ -1035,13 +962,12 @@ def ui(
       if (sa === 0) return;
 
       const sr = data[startPos], sg = data[startPos+1], sb = data[startPos+2];
-
       const stack = [startX, startY];
       const seen = new Uint8Array(w * h);
       seen[startY * w + startX] = 1;
 
-      // slightly tighter tolerance = less accidental deletion
-      const tolerance = 52;
+      // Lower tolerance prevents deleting nearby art; adjust if needed
+      const tolerance = 50;
 
       while (stack.length > 0) {
           const y = stack.pop();
@@ -1074,9 +1000,8 @@ def ui(
     offCtx.globalCompositeOperation = 'source-over';
     offCtx.clearRect(0, 0, 1000, 1000);
 
-    // Shadow helps users see brush edge on complex logos
-    offCtx.shadowBlur = bSize / 5;
-    offCtx.shadowColor = 'rgba(0,0,0,0.55)';
+    offCtx.shadowBlur = bSize / 4;
+    offCtx.shadowColor = 'rgba(0,0,0,0.65)';
     offCtx.lineWidth = bSize;
     offCtx.lineCap = 'round';
     offCtx.lineJoin = 'round';
@@ -1090,8 +1015,8 @@ def ui(
     if(mode === 'remove') {
         ctx.globalCompositeOperation = 'destination-out';
         ctx.drawImage(offCanvas, 0, 0);
+        ctx.globalCompositeOperation = 'source-over';
     } else if (mode === 'restore') {
-        // Restore uses BASELINE image (bg removed), so it won't re-add white backgrounds.
         offCtx.globalCompositeOperation = 'source-in';
         offCtx.shadowBlur = 0;
         offCtx.drawImage(origImg, 0, 0, 1000, 1000);
@@ -1120,7 +1045,6 @@ def ui(
       if(!isDown || mode === 'magic') return;
       const c = getCoords(e);
       drawBrush(c.x, c.y);
-
       if(e.touches) {
           cursor.style.display = 'block';
           cursor.style.left = e.touches[0].clientX + 'px';
@@ -1140,7 +1064,6 @@ def ui(
   window.addEventListener('touchend', endDraw);
 
   function notifyDone(payload) {
-      // Prefer parent (iframe), then opener (popup), else redirect.
       try {
           if (window.parent && window.parent !== window) {
               window.parent.postMessage(payload, "*");
@@ -1161,57 +1084,35 @@ def ui(
   btnDone.addEventListener('click', () => {
     btnDone.innerText = "Saving…";
     btnDone.disabled = true;
-    cv.style.opacity = '0.6';
+    cv.style.opacity = '0.65';
 
     cv.toBlob(async (blob) => {
-        try {
-          const fd = new FormData();
-          fd.append("file", blob, "edited_logo.png");
-          const resp = await fetch(`/save-edit/${sessionId}`, { method: 'POST', body: fd });
-          if (!resp.ok) {
-            const j = await resp.json().catch(()=>({}));
-            throw new Error(j.error || "Save failed");
-          }
+        const fd = new FormData();
+        fd.append("file", blob, "edited_logo.png");
+        await fetch(`/save-edit/${sessionId}`, { method: 'POST', body: fd });
 
-          const payload = {
-              type: "studio-uploader:done",
-              slot: SLOT,
-              session_id: sessionId,
-              finalize_url: `${window.location.origin}/finalize/${sessionId}`
-          };
+        const payload = {
+            type: "studio-uploader:done",
+            slot: SLOT,
+            session_id: sessionId,
+            finalize_url: `${window.location.origin}/finalize/${sessionId}`
+        };
 
-          const sent = notifyDone(payload);
-
-          // If not embedded/popup, redirect back to form if provided.
-          if (!sent) {
-              if (RETURN_TO) {
-                  const url = new URL(RETURN_TO, window.location.origin);
-                  url.searchParams.set("slot", SLOT);
-                  url.searchParams.set("session_id", sessionId);
-                  url.searchParams.set("finalize_url", payload.finalize_url);
-                  window.location.href = url.toString();
-              } else {
-                  btnDone.innerText = "Saved ✓";
-              }
-          } else {
-              // Give postMessage a moment then show success state
-              btnDone.innerText = "Saved ✓";
-          }
-        } catch (err) {
-          alert(err.message || "Save failed");
-          btnDone.innerText = "Save & Done";
-          btnDone.disabled = false;
-          cv.style.opacity = '1';
+        const sent = notifyDone(payload);
+        if (!sent) {
+            if (RETURN_TO) {
+                const url = new URL(RETURN_TO, window.location.origin);
+                url.searchParams.set("slot", SLOT);
+                url.searchParams.set("session_id", sessionId);
+                url.searchParams.set("finalize_url", payload.finalize_url);
+                window.location.href = url.toString();
+            } else {
+                btnDone.innerText = "Saved ✓";
+            }
         }
     }, "image/png");
   });
 </script>
 </body>
 </html>"""
-    return HTMLResponse(content=html, headers={"Cache-Control": "no-store, max-age=0"})
-
-
-if __name__ == "__main__":
-    # local dev only
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    return HTMLResponse(content=html)
