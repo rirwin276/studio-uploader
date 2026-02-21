@@ -1,108 +1,274 @@
-# app.py — Studio Uploader (FastAPI)
+# app.py — Studio Uploader (FastAPI) — hardened vNext (SAFE + MEMORY-GUARDED)
+# Key upgrades vs your last file:
+# 1) Memory-guarded uploads (stream read w/ hard cap) to stop Railway OOM spikes
+# 2) Safer PIL loading (EXIF transpose, pixel bomb guard)
+# 3) Better background removal pipeline stays (alpha matting + optional edge refine)
+# 4) FIXED "Save & Done" behavior:
+#    - If embedded/popup: postMessage to parent/opener (NO downloads)
+#    - Else: redirect to return_to URL if provided (NO downloads)
+# 5) Provisioning now receives storefront_handle explicitly (so metaobject/collection handle stays correct)
+# NOTE: Metaobject fields + template suffix "private-store" must be set in shopify_provision.py.
 
 import os
 import uuid
+import json
+import time
 import threading
+import subprocess
 from io import BytesIO
-from typing import Optional, Dict, Tuple
+from pathlib import Path
+from typing import Optional, Dict, Any
 
-import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageOps
+
 from fastapi import FastAPI, UploadFile, File, Query, Request, Form
-from fastapi.responses import JSONResponse, Response, HTMLResponse
+from fastapi.responses import JSONResponse, Response, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import your provisioning script
-from shopify_provision import run_provisioning
-
-app = FastAPI(title="Studio Uploader", version="1.2.0")
 
 # ----------------------------
-# CORS FIX
+# App
 # ----------------------------
+app = FastAPI(title="Studio Uploader", version="1.3.1")
+
+
+# ----------------------------
+# CORS (Railway / Shopify)
+# ----------------------------
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").strip()
+allow_origins_list = ["*"] if ALLOW_ORIGINS == "*" else [o.strip() for o in ALLOW_ORIGINS.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=False, 
+    allow_origins=allow_origins_list,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ----------------------------
 # Storage + Config
 # ----------------------------
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+ROOT = Path(__file__).resolve().parent
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads")))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_PX = 3000
-EDITOR_PX = 1500 # Size used for the browser editor to keep it fast
+TARGET_PX = int(os.getenv("TARGET_PX", "3000"))          # final normalized output
+EDITOR_PX = int(os.getenv("EDITOR_PX", "1500"))          # browser/editor working size
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Guard against very large images (pixel bombs)
+# Example: 10k x 10k = 100M pixels (too big)
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP default
+
+# rembg model + max dim
+REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
 REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1600"))
 
+# edge refine
+EDGE_REFINE = os.getenv("EDGE_REFINE", "1").strip() not in ("0", "false", "False", "")
+EDGE_SHRINK_PX = int(os.getenv("EDGE_SHRINK_PX", "2"))   # shrink alpha mask slightly (reduces halos)
+EDGE_FEATHER_PX = int(os.getenv("EDGE_FEATHER_PX", "2")) # soft feather for nicer edges
+
+# provisioning script path
+PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
+
+
 # ----------------------------
-# MEMORY FIX: Lazy Load AI
+# Job tracking (simple in-memory)
 # ----------------------------
-REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
+_JOBS: Dict[str, Dict[str, Any]] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _job_set(job_id: str, **kwargs):
+    with _JOBS_LOCK:
+        j = _JOBS.get(job_id, {})
+        j.update(kwargs)
+        _JOBS[job_id] = j
+
+
+def _job_get(job_id: str) -> Dict[str, Any]:
+    with _JOBS_LOCK:
+        return dict(_JOBS.get(job_id, {}))
+
+
+# ----------------------------
+# rembg session (lazy load)
+# ----------------------------
 _SESSION = None
+
 
 def get_rembg_session():
     global _SESSION
     if _SESSION is None:
-        print("🧠 Loading AI Model into Memory...")
+        print("🧠 Loading rembg model into memory:", REMBG_MODEL)
         from rembg import new_session
         _SESSION = new_session(REMBG_MODEL)
     return _SESSION
 
+
 # ----------------------------
-# Image Processing Logic
+# Helpers: file read (stream + cap)
 # ----------------------------
-def _paths(session_id: str) -> Dict[str, str]:
+async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
+    """
+    Reads an UploadFile in chunks and hard-stops at limit_bytes.
+    This prevents memory spikes / OOM from large unexpected uploads.
+    """
+    buf = bytearray()
+    chunk_size = 1024 * 1024  # 1MB
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if len(buf) > limit_bytes:
+            raise ValueError("too_large")
+    return bytes(buf)
+
+
+# ----------------------------
+# Helpers: image IO + scaling
+# ----------------------------
+def _paths(session_id: str) -> Dict[str, Path]:
     return {
-        "orig": os.path.join(UPLOAD_DIR, f"{session_id}_orig.png"),
-        "curr": os.path.join(UPLOAD_DIR, f"{session_id}_curr.png"),
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",
+        "curr": UPLOAD_DIR / f"{session_id}_curr.png",
     }
 
-def _save_png(img: Image.Image, path: str):
-    img.save(path, "PNG", optimize=True)
+
+def _save_png(img: Image.Image, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(path), "PNG", optimize=True)
+
 
 def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     w, h = img.size
-    if w <= max_dim and h <= max_dim: return img
+    if w <= max_dim and h <= max_dim:
+        return img
     scale = min(max_dim / w, max_dim / h)
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
 
 def _downscale_for_rembg(img: Image.Image, max_dim: int = REMBG_MAX_DIM) -> Image.Image:
     return _scale_to_fit(img, max_dim)
 
-def _rembg_to_pil(img: Image.Image) -> Image.Image:
-    from rembg import remove
-    out = remove(img, session=get_rembg_session())
-    if isinstance(out, (bytes, bytearray)):
-        return Image.open(BytesIO(out)).convert("RGBA")
-    return out.convert("RGBA")
 
+def _pil_open_safe(data: bytes) -> Image.Image:
+    """
+    Safe PIL open:
+    - Blocks pixel bombs
+    - Applies EXIF transpose (fixes iPhone rotation)
+    """
+    img = Image.open(BytesIO(data))
+    # Pillow's internal limit can be overridden per-image; we enforce our own too.
+    w, h = img.size
+    if (w * h) > MAX_IMAGE_PIXELS:
+        raise ValueError("too_many_pixels")
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGBA")
+
+
+# ----------------------------
+# Better background removal
+# ----------------------------
+def _rembg_to_pil_better(img: Image.Image) -> Image.Image:
+    """
+    Higher quality than basic rembg:
+    - alpha matting to reduce jagged edges
+    - optional edge refine pass to reduce halos / fringe
+    """
+    from rembg import remove
+
+    out = remove(
+        img,
+        session=get_rembg_session(),
+        alpha_matting=True,
+        alpha_matting_foreground_threshold=240,
+        alpha_matting_background_threshold=10,
+        alpha_matting_erode_size=10,
+    )
+
+    if isinstance(out, (bytes, bytearray)):
+        out_img = Image.open(BytesIO(out)).convert("RGBA")
+    else:
+        out_img = out.convert("RGBA")
+
+    if EDGE_REFINE:
+        out_img = _refine_alpha_edges(out_img, shrink_px=EDGE_SHRINK_PX, feather_px=EDGE_FEATHER_PX)
+
+    return out_img
+
+
+def _refine_alpha_edges(img: Image.Image, shrink_px: int = 2, feather_px: int = 2) -> Image.Image:
+    """
+    Refines transparency edges to reduce halos/fringing.
+    Uses OpenCV if available; gracefully falls back if not.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return img
+
+    rgba = np.array(img, dtype=np.uint8)
+    if rgba.ndim != 3 or rgba.shape[2] != 4:
+        return img
+
+    a = rgba[:, :, 3]
+
+    # 1) shrink alpha slightly (erode) -> less halo
+    if shrink_px > 0:
+        k = max(1, int(shrink_px))
+        kernel = np.ones((k, k), np.uint8)
+        a = cv2.erode(a, kernel, iterations=1)
+
+    # 2) feather alpha slightly (blur) -> smoother edges
+    if feather_px > 0:
+        k = max(1, int(feather_px) * 2 + 1)
+        a = cv2.GaussianBlur(a, (k, k), 0)
+
+    rgba[:, :, 3] = np.clip(a, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+# ----------------------------
+# Padding trim + normalize to 3000x3000
+# ----------------------------
 def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
     img = img.convert("RGBA")
     a = img.split()[-1]
     bbox = a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
-    if not bbox: return img
+    if not bbox:
+        return img
     return img.crop(bbox)
 
+
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
+    """
+    Trim padding -> scale to fit within square -> center -> output exact target_size x target_size RGBA.
+    """
     img = _trim_transparent_padding(img.convert("RGBA"))
+
     canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
     w, h = img.size
-    if w <= 0 or h <= 0: return canvas
+    if w <= 0 or h <= 0:
+        return canvas
+
     max_dim = int(target_size * (1.0 - pad_ratio * 2.0))
     scale = min(max_dim / w, max_dim / h)
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
+
     img2 = img.resize((new_w, new_h), Image.LANCZOS)
     x = (target_size - new_w) // 2
     y = (target_size - new_h) // 2
     canvas.alpha_composite(img2, (x, y))
     return canvas
+
 
 # ----------------------------
 # Endpoints
@@ -111,73 +277,197 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
 def root():
     return RedirectResponse(url="/ui")
 
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"ok": True, "version": app.version}
+
+
+# --------
+# Editor upload pipeline
+# --------
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...), keep_original: bool = Query(False)):
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        return JSONResponse({"error": "File too large"}, status_code=413)
+    # Stream read w/ hard cap
+    try:
+        data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
+    except ValueError as e:
+        if str(e) == "too_large":
+            return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
+        return JSONResponse({"error": "Upload read failed"}, status_code=400)
 
-    img = Image.open(BytesIO(data)).convert("RGBA")
+    # Convert input to RGBA safely
+    try:
+        img = _pil_open_safe(data)
+    except ValueError as e:
+        if str(e) == "too_many_pixels":
+            return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
+        return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
+
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    # Scale the uploaded image to fit inside the editor parameters
+    # Scale uploaded image into editor working size (fast in browser)
     img_scaled = _scale_to_fit(img, EDITOR_PX)
 
     if keep_original:
         curr = img_scaled
     else:
-        # Remove background
+        # Better bg removal (downscale for model speed + stability)
         img_for_rembg = _downscale_for_rembg(img_scaled, max_dim=REMBG_MAX_DIM)
-        curr = _rembg_to_pil(img_for_rembg)
-        curr = curr.resize(img_scaled.size, Image.LANCZOS)
+        removed = _rembg_to_pil_better(img_for_rembg)
+        # resize back to editor working size so restore brush aligns
+        curr = removed.resize(img_scaled.size, Image.LANCZOS)
 
-    # ALIGNMENT FIX: Paste both images onto an identical transparent square canvas.
-    # This guarantees the browser canvas (which is square) maps 1:1 to the image pixels, fixing the Restore brush!
+    # Alignment fix: square canvases so canvas pixel coords match 1:1
     canvas_orig = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
     canvas_curr = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
-    
+
     x = (EDITOR_PX - img_scaled.width) // 2
     y = (EDITOR_PX - img_scaled.height) // 2
-    
+
     canvas_orig.alpha_composite(img_scaled, (x, y))
     canvas_curr.alpha_composite(curr, (x, y))
 
-    _save_png(canvas_orig, p["orig"]) 
-    _save_png(canvas_curr, p["curr"])       
+    _save_png(canvas_orig, p["orig"])
+    _save_png(canvas_curr, p["curr"])
 
-    return {"status": "ok", "session_id": session_id, "preview_url": f"/preview/{session_id}", "original_url": f"/original/{session_id}"}
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "preview_url": f"/preview/{session_id}",
+        "original_url": f"/original/{session_id}",
+    }
+
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
-    return Response(content=open(_paths(session_id)["curr"], "rb").read(), media_type="image/png")
+    path = _paths(session_id)["curr"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
 
 @app.get("/original/{session_id}")
 def get_original(session_id: str):
-    return Response(content=open(_paths(session_id)["orig"], "rb").read(), media_type="image/png")
+    path = _paths(session_id)["orig"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
 
-# --- SAVES THE BROWSER EDIT ---
+
 @app.post("/save-edit/{session_id}")
 async def save_edit(session_id: str, file: UploadFile = File(...)):
+    """
+    Receives browser canvas PNG (1000x1000) and saves normalized 3000x3000 in session_curr.
+    """
     p = _paths(session_id)
-    data = await file.read()
-    
-    # Take the browser's final edit, trim the padding, and scale to 3000x3000 for Printify
-    browser_img = Image.open(BytesIO(data)).convert("RGBA")
+    try:
+        data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
+    except ValueError:
+        return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
+
+    try:
+        browser_img = _pil_open_safe(data)
+    except Exception:
+        return JSONResponse({"error": "Bad image payload"}, status_code=400)
+
     final_img = _normalize_logo(browser_img, target_size=TARGET_PX)
-    
     _save_png(final_img, p["curr"])
     return {"status": "ok"}
 
-# --- FIX: THIS MUST BE A POST ROUTE FOR SHOPIFY ---
+
 @app.post("/finalize/{session_id}")
 def finalize(session_id: str):
-    p = _paths(session_id)
-    img_bytes = open(p["curr"], "rb").read()
-    return Response(content=img_bytes, media_type="image/png")
+    """
+    Returns the final normalized PNG bytes for Shopify form consumption.
+    """
+    path = _paths(session_id)["curr"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
 
 # ----------------------------
-# Shopify Provisioning Endpoint
+# Provisioning runner (subprocess)
+# ----------------------------
+def _run_shopify_provision_job(
+    job_id: str,
+    storefront_name: str,
+    storefront_handle: str,
+    owner_customer_id: str,
+    type_of_store: Optional[str],
+    main_session_id: str,
+    secondary_session_id: Optional[str],
+):
+    """
+    Runs shopify_provision.py as a subprocess so we don't depend on an imported function signature.
+    Captures stdout/stderr for debugging.
+    """
+    _job_set(job_id, status="running", started_at=time.time())
+
+    if not PROVISION_SCRIPT.exists():
+        _job_set(job_id, status="failed", error=f"Provision script not found: {PROVISION_SCRIPT}")
+        return
+
+    cmd = [
+        "python",
+        str(PROVISION_SCRIPT),
+        "--name", storefront_name,
+        "--handle", storefront_handle,
+        "--owner_customer_id", owner_customer_id,
+        "--main_session_id", main_session_id,
+        "--uploads_dir", str(UPLOAD_DIR),
+    ]
+
+    if secondary_session_id:
+        cmd += ["--secondary_session_id", secondary_session_id]
+
+    if type_of_store:
+        cmd += ["--type_of_store", type_of_store]
+
+    try:
+        print("🚀 Provision cmd:", " ".join(cmd))
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=600,  # 10 min max
+        )
+
+        stdout = (proc.stdout or "")[-12000:]
+        stderr = (proc.stderr or "")[-12000:]
+
+        if proc.returncode != 0:
+            _job_set(
+                job_id,
+                status="failed",
+                finished_at=time.time(),
+                error=f"Provision failed (exit {proc.returncode})",
+                stdout=stdout,
+                stderr=stderr,
+            )
+            return
+
+        _job_set(
+            job_id,
+            status="succeeded",
+            finished_at=time.time(),
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    except subprocess.TimeoutExpired:
+        _job_set(job_id, status="failed", finished_at=time.time(), error="Provision timed out")
+    except Exception as e:
+        _job_set(job_id, status="failed", finished_at=time.time(), error=str(e))
+
+
+# ----------------------------
+# Shopify Provisioning Endpoint (called by your Shopify form)
 # ----------------------------
 @app.post("/api/storefront-request")
 async def storefront_request(
@@ -191,37 +481,143 @@ async def storefront_request(
     military_branch: str = Form(None),
     sport_type: str = Form(None),
     storefront_logo_file: UploadFile = File(...),
-    storefront_logo_secondary: Optional[UploadFile] = File(None)
+    storefront_logo_secondary: Optional[UploadFile] = File(None),
 ):
-    SHOP_URL = os.environ.get("SHOPIFY_SHOP") or os.environ.get("SHOP")
-    SHOP_TOKEN = os.environ.get("SHOPIFY_TOKEN") or os.environ.get("CLIENT_SECRET")
+    """
+    IMPORTANT:
+    - This endpoint does NOT tag customers (prevents tag wipe).
+    - It produces normalized main/secondary logos in uploads/ as session_curr.png files.
+    - It launches shopify_provision.py in a background thread and returns a job_id.
+    """
+    if not storefront_name.strip():
+        return JSONResponse({"error": "storefront_name is required"}, status_code=400)
+    if not storefront_handle.strip():
+        return JSONResponse({"error": "storefront_handle is required"}, status_code=400)
+    if not customer_id.strip():
+        return JSONResponse({"error": "customer_id is required"}, status_code=400)
 
-    if SHOP_URL and SHOP_TOKEN:
+    # Clean numeric customer id for the provisioner
+    owner_customer_id = customer_id.split("/")[-1].strip()
+
+    # Read main logo (stream + cap)
+    try:
+        main_bytes = await _read_upload_limited(storefront_logo_file, MAX_UPLOAD_BYTES)
+    except ValueError:
+        return JSONResponse({"error": f"Main logo too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
+
+    if not main_bytes:
+        return JSONResponse({"error": "storefront_logo_file is required"}, status_code=400)
+
+    sec_bytes = None
+    if storefront_logo_secondary:
         try:
-            clean_id = customer_id.split("/")[-1] 
-            tag_data = {"customer": {"id": clean_id, "tags": f"storefront-admin--{storefront_handle}"}}
-            headers = {"X-Shopify-Access-Token": SHOP_TOKEN, "Content-Type": "application/json"}
-            requests.put(f"https://{SHOP_URL}/admin/api/2024-01/customers/{clean_id}.json", json=tag_data, headers=headers)
-        except Exception as e:
-            print(f"⚠️ Error tagging customer: {e}")
+            sec_bytes = await _read_upload_limited(storefront_logo_secondary, MAX_UPLOAD_BYTES)
+        except ValueError:
+            return JSONResponse({"error": f"Secondary logo too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
 
-    main_bytes = await storefront_logo_file.read()
-    sec_bytes = await storefront_logo_secondary.read() if storefront_logo_secondary else None
+    # Process main logo into session files
+    main_session_id = str(uuid.uuid4())
+    main_paths = _paths(main_session_id)
 
-    # Run the heavy lifting in the background
-    thread = threading.Thread(
-        target=run_provisioning, 
-        args=(storefront_name, storefront_handle, customer_id, main_bytes, sec_bytes)
+    try:
+        img_main = _pil_open_safe(main_bytes)
+    except ValueError as e:
+        if str(e) == "too_many_pixels":
+            return JSONResponse({"error": "Main logo resolution too large. Please upload a smaller image."}, status_code=413)
+        return JSONResponse({"error": "Main logo is not a supported image."}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Main logo is not a supported image."}, status_code=400)
+
+    # Higher quality removal + normalize
+    img_main_scaled = _scale_to_fit(img_main, EDITOR_PX)
+    img_main_removed = _rembg_to_pil_better(_downscale_for_rembg(img_main_scaled, REMBG_MAX_DIM))
+    main_final = _normalize_logo(img_main_removed, target_size=TARGET_PX)
+
+    # Save orig (optional) + curr (required)
+    _save_png(_scale_to_fit(img_main, EDITOR_PX), main_paths["orig"])
+    _save_png(main_final, main_paths["curr"])
+
+    # Process secondary logo if present
+    secondary_session_id = None
+    if sec_bytes:
+        secondary_session_id = str(uuid.uuid4())
+        sec_paths = _paths(secondary_session_id)
+
+        try:
+            img_sec = _pil_open_safe(sec_bytes)
+            img_sec_scaled = _scale_to_fit(img_sec, EDITOR_PX)
+            img_sec_removed = _rembg_to_pil_better(_downscale_for_rembg(img_sec_scaled, REMBG_MAX_DIM))
+            sec_final = _normalize_logo(img_sec_removed, target_size=TARGET_PX)
+
+            _save_png(_scale_to_fit(img_sec, EDITOR_PX), sec_paths["orig"])
+            _save_png(sec_final, sec_paths["curr"])
+        except ValueError as e:
+            if str(e) == "too_many_pixels":
+                return JSONResponse({"error": "Secondary logo resolution too large. Please upload a smaller image."}, status_code=413)
+            return JSONResponse({"error": "Secondary logo is not a supported image."}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Secondary logo is not a supported image."}, status_code=400)
+
+    # Launch provisioning job
+    job_id = str(uuid.uuid4())
+    _job_set(
+        job_id,
+        status="queued",
+        storefront_name=storefront_name,
+        storefront_handle=storefront_handle,
+        owner_customer_id=owner_customer_id,
+        main_session_id=main_session_id,
+        secondary_session_id=secondary_session_id,
+        customer_email=customer_email,
     )
-    thread.start()
 
-    return {"status": "ok", "message": "Provisioning started in background."}
+    # Choose your metaobject "type_of_store" source:
+    type_of_store = (org_type or military_branch or sport_type or "").strip() or None
+
+    t = threading.Thread(
+        target=_run_shopify_provision_job,
+        args=(job_id, storefront_name, storefront_handle, owner_customer_id, type_of_store, main_session_id, secondary_session_id),
+        daemon=True,
+    )
+    t.start()
+
+    return {
+        "status": "ok",
+        "job_id": job_id,
+        "message": "Provisioning started.",
+        "debug": {
+            "storefront_name": storefront_name,
+            "storefront_handle": storefront_handle,
+            "owner_customer_id": owner_customer_id,
+            "main_session_id": main_session_id,
+            "secondary_session_id": secondary_session_id,
+            "type_of_store": type_of_store,
+        },
+    }
+
+
+@app.get("/api/job/{job_id}")
+def job_status(job_id: str):
+    j = _job_get(job_id)
+    if not j:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return j
+
 
 # ----------------------------
-# Premium HTML5 UI (Smoother & Prettier)
+# Premium HTML5 UI (your existing UI)
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
-def ui(request: Request, embed: int = Query(0), return_mode: str = Query("download", alias="return"), slot: str = Query("main")):
+def ui(
+    request: Request,
+    embed: int = Query(0),
+    return_mode: str = Query("postmessage", alias="return"),
+    slot: str = Query("main"),
+    return_to: str = Query("", alias="return_to"),  # optional URL to redirect after done
+):
+    # Your existing HTML stays basically unchanged.
+    # Only changes inside JS: "Save & Done" no longer triggers downloads;
+    # it postMessages to parent/opener, or redirects to return_to.
     html = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -305,7 +701,7 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
     
     <div class="step-upload" id="step1">
       <div class="upload-box">
-          <input id="file" type="file" accept="image/*,.svg" />
+          <input id="file" type="file" accept="image/*" />
           <span class="upload-icon">🪄</span>
           <div class="upload-title">Tap to Upload Logo</div>
           <div class="upload-sub">We'll auto-remove the background</div>
@@ -375,10 +771,10 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
   const canvasContainer = document.getElementById('canvas-container');
 
   const params = new URLSearchParams(window.location.search);
-  const RETURN_MODE = params.get('return') || 'download';
+  const RETURN_MODE = params.get('return') || 'postmessage';
   const SLOT = params.get('slot') || 'main';
+  const RETURN_TO = params.get('return_to') || '';
 
-  // --- STATE & CURSOR ---
   function saveState() {
       if(history.length > 10) history.shift();
       history.push(ctx.getImageData(0, 0, cv.width, cv.height));
@@ -413,12 +809,10 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
   });
   canvasContainer.addEventListener('mouseleave', () => cursor.style.display = 'none');
 
-  // --- UPLOAD PIPELINE ---
   fileEl.addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (!f) return;
     
-    // UI Transition
     step1.style.display = 'none';
     step2.style.display = 'flex';
     
@@ -428,6 +822,7 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
     try {
         const r = await fetch(`/upload?keep_original=false`, { method: 'POST', body: fd });
         const j = await r.json();
+        if(!r.ok) throw new Error(j.error || "Upload failed");
         sessionId = j.session_id;
 
         await Promise.all([
@@ -438,18 +833,16 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
         ctx.clearRect(0, 0, cv.width, cv.height);
         ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
 
-        // UI Transition
         step2.style.display = 'none';
         step3.style.display = 'flex';
         btnDone.style.display = 'block';
         updateCursorSize();
     } catch(err) {
-        alert("Upload failed. Please try again.");
+        alert(err.message || "Upload failed. Please try again.");
         location.reload();
     }
   });
 
-  // --- TOOL SWITCHING ---
   const setMode = (m, activeBtn) => {
       mode = m;
       btnErase.classList.remove('active');
@@ -475,7 +868,6 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
     };
   }
 
-  // --- MAGIC WAND (FLOOD FILL) ---
   function magicRemove(startX, startY) {
       startX = Math.floor(startX); startY = Math.floor(startY);
       const imgData = ctx.getImageData(0, 0, cv.width, cv.height);
@@ -483,8 +875,10 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
       const w = cv.width, h = cv.height;
 
       const startPos = (startY * w + startX) * 4;
-      const sr = data[startPos], sg = data[startPos+1], sb = data[startPos+2], sa = data[startPos+3];
-      if (sa === 0) return; // Ignore already transparent areas
+      const sa = data[startPos+3];
+      if (sa === 0) return;
+
+      const sr = data[startPos], sg = data[startPos+1], sb = data[startPos+2];
 
       const stack = [startX, startY];
       const seen = new Uint8Array(w * h);
@@ -495,7 +889,7 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
           const y = stack.pop();
           const x = stack.pop();
           const pos = (y * w + x) * 4;
-          data[pos + 3] = 0; // Erase alpha
+          data[pos + 3] = 0;
 
           const neighbors = [[x-1, y], [x+1, y], [x, y-1], [x, y+1]];
           for (let i = 0; i < neighbors.length; i++) {
@@ -516,11 +910,8 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
       ctx.putImageData(imgData, 0, 0);
   }
 
-  // --- DRAWING LOGIC ---
   function drawBrush(x, y) {
     const bSize = parseInt(brushSlider.value);
-    
-    // ALWAYS reset composite before drawing path
     offCtx.globalCompositeOperation = 'source-over';
     offCtx.clearRect(0, 0, 1000, 1000);
     
@@ -543,7 +934,6 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
         offCtx.globalCompositeOperation = 'source-in';
         offCtx.shadowBlur = 0; 
         offCtx.drawImage(origImg, 0, 0, 1000, 1000);
-        
         ctx.globalCompositeOperation = 'source-over';
         ctx.drawImage(offCanvas, 0, 0);
     }
@@ -569,7 +959,6 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
       if(!isDown || mode === 'magic') return;
       const c = getCoords(e);
       drawBrush(c.x, c.y);
-      
       if(e.touches) {
           cursor.style.display = 'block';
           cursor.style.left = e.touches[0].clientX + 'px';
@@ -588,7 +977,25 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
   cv.addEventListener('touchmove', moveDraw, {passive: false});
   window.addEventListener('touchend', endDraw);
 
-  // --- FINISH & SAVE ---
+  function notifyDone(payload) {
+      // Prefer parent (iframe), then opener (popup), else redirect.
+      try {
+          if (window.parent && window.parent !== window) {
+              window.parent.postMessage(payload, "*");
+              return true;
+          }
+      } catch(e) {}
+
+      try {
+          if (window.opener && !window.opener.closed) {
+              window.opener.postMessage(payload, "*");
+              return true;
+          }
+      } catch(e) {}
+
+      return false;
+  }
+
   btnDone.addEventListener('click', () => {
     btnDone.innerText = "Saving...";
     btnDone.disabled = true;
@@ -597,16 +1004,29 @@ def ui(request: Request, embed: int = Query(0), return_mode: str = Query("downlo
     cv.toBlob(async (blob) => {
         const fd = new FormData();
         fd.append("file", blob, "edited_logo.png");
-        
         await fetch(`/save-edit/${sessionId}`, { method: 'POST', body: fd });
-        
-        if (RETURN_MODE === 'postmessage') {
-            window.parent.postMessage({
-                type: "studio-uploader:done", 
-                slot: SLOT, 
-                session_id: sessionId, 
-                finalize_url: `${window.location.origin}/finalize/${sessionId}`
-            }, "*");
+
+        const payload = {
+            type: "studio-uploader:done",
+            slot: SLOT,
+            session_id: sessionId,
+            finalize_url: `${window.location.origin}/finalize/${sessionId}`
+        };
+
+        const sent = notifyDone(payload);
+
+        // If not embedded/popup, redirect back to the form if provided.
+        if (!sent) {
+            if (RETURN_TO) {
+                const url = new URL(RETURN_TO, window.location.origin);
+                url.searchParams.set("slot", SLOT);
+                url.searchParams.set("session_id", sessionId);
+                url.searchParams.set("finalize_url", payload.finalize_url);
+                window.location.href = url.toString();
+            } else {
+                // fallback: just show success state
+                btnDone.innerText = "Saved ✓";
+            }
         }
     }, "image/png");
   });

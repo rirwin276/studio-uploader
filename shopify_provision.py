@@ -1,274 +1,601 @@
-# shopify_provision.py
+# shopify_provision.py — Shopify provisioning for Studio Uploader (vNext, handle-safe)
+# - Creates/updates Smart Collection (template suffix = private-store)
+# - Uploads main/secondary logos to Shopify Files (as IMAGE when possible)
+# - Upserts custom_shop metaobject with required fields
+# - Publishes collection to all publications
+# - Triggers Studio Automation ALWAYS (required)
+#
+# IMPORTANT: This file matches the NEW app.py subprocess contract:
+#   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
+# (app.py now passes --handle, not --collection_handle)
 
 import os
 import re
 import json
-import requests
+import time
+import argparse
+from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
-# ----------------------------
-# Metaobject config
-# ----------------------------
-METAOBJECT_TYPE = "custom_shop"
-COLLECTION_TEMPLATE_SUFFIX = "private-store"
+import requests
 
-# ----------------------------
-# Env / Shopify helpers
-# ----------------------------
-def env_get(key: str, fallback_key: str = None, default: str = "") -> str:
-    val = os.getenv(key) or (os.getenv(fallback_key) if fallback_key else None)
-    return val or default
+
+# -----------------------------
+# ENV REQUIRED
+# -----------------------------
+def env_get(name: str, required: bool = True, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    if required and (v is None or str(v).strip() == ""):
+        raise RuntimeError(f"Missing required env var: {name}")
+    return str(v).strip()
+
+
+SHOP = env_get("SHOP", required=True)  # e.g. stellaandsage.myshopify.com
+API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2025-01
+ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
+
+# REQUIRED: always called (your whole point)
+STUDIO_AUTOMATION_URL = env_get("STUDIO_AUTOMATION_URL", required=True)
+STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # optional bearer token
+
+METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
+
+# Smart collection rule config
+COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "tag").strip()       # "tag"
+COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "equals").strip()  # "equals"
+
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+FILE_READY_MAX_WAIT_S = int(os.getenv("FILE_READY_MAX_WAIT_S", "120"))
+PUBLISH_RETRY_S = float(os.getenv("PUBLISH_RETRY_S", "1.5"))
+PUBLISH_RETRY_MAX = int(os.getenv("PUBLISH_RETRY_MAX", "5"))
+
 
 def shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-    shop = env_get("SHOP", "SHOPIFY_SHOP")
-    api_version = env_get("API_VERSION", default="2024-01")
-    token = env_get("CLIENT_SECRET", "SHOPIFY_TOKEN")
-    
-    if not shop or not token:
-        raise RuntimeError("Missing Shopify credentials in Railway variables.")
-
-    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
-    r = requests.post(
-        url,
-        headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
-        json={"query": query, "variables": variables},
-        timeout=90,
-    )
+    url = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN,
+    }
+    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    data = r.json()
+    payload = r.json()
 
-    if data.get("errors"):
-        raise RuntimeError(f"Shopify GraphQL errors:\n{json.dumps(data['errors'], indent=2)}")
+    if payload.get("errors"):
+        raise RuntimeError(f"Shopify GraphQL errors:\n{json.dumps(payload['errors'], indent=2)}")
 
-    return data["data"]
+    data = payload.get("data")
+    if data is None:
+        raise RuntimeError(f"Shopify GraphQL returned no data:\n{json.dumps(payload, indent=2)}")
 
-def slugify(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"['’]", "", s)
+    return data
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def slugify_handle(name: str) -> str:
+    s = name.lower().strip()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-")
     return s or "store"
 
-def build_handle(store_name: str, owner_customer_id: str) -> str:
-    last4 = re.sub(r"\D+", "", str(owner_customer_id))[-4:] or "0000"
-    return f"{slugify(store_name)}-{last4}"
 
-def customer_gid(customer_id: str) -> str:
-    numeric = re.sub(r"\D+", "", str(customer_id))
-    return f"gid://shopify/Customer/{numeric}"
+def ensure_gid_customer(customer_id: str) -> str:
+    cid = customer_id.strip()
+    if cid.startswith("gid://"):
+        return cid
+    cid_num = cid.split("/")[-1]
+    return f"gid://shopify/Customer/{cid_num}"
+
+
+def read_session_png(uploads_dir: Path, session_id: str) -> bytes:
+    # app.py writes uploads/<session>_curr.png
+    p = uploads_dir / f"{session_id}_curr.png"
+    if not p.exists():
+        raise RuntimeError(f"Missing session image: {p}")
+    return p.read_bytes()
+
 
 # -----------------------------
-# SHOPIFY: SAFE CUSTOMER TAGGING
+# Shopify Files upload (staged uploads)
 # -----------------------------
-def get_customer_tags(customer_id: str) -> List[str]:
+def staged_upload_create(filename: str, mime_type: str) -> Dict[str, Any]:
     q = """
-    query($id: ID!) {
-      customer(id: $id) { id tags }
-    }
-    """
-    gid = customer_gid(customer_id)
-    data = shopify_graphql(q, {"id": gid})
-    cust = data.get("customer")
-    if not cust:
-        raise RuntimeError(f"Customer not found for id: {customer_id}")
-    return cust.get("tags") or []
-
-def set_customer_tags(customer_id: str, tags: List[str]) -> None:
-    q = """
-    mutation customerUpdate($input: CustomerInput!) {
-      customerUpdate(input: $input) {
-        customer { id tags }
-        userErrors { field message }
-      }
-    }
-    """
-    gid = customer_gid(customer_id)
-    res = shopify_graphql(q, {"input": {"id": gid, "tags": tags}})["customerUpdate"]
-    if res.get("userErrors"):
-        raise RuntimeError(f"customerUpdate userErrors: {res['userErrors']}")
-
-def ensure_customer_storefront_tags(owner_customer_id: str, store_handle: str) -> None:
-    required = {
-        f"storefront-member--{store_handle}",
-        f"storefront-admin--{store_handle}",
-    }
-    current = set(get_customer_tags(owner_customer_id))
-    merged = sorted(current.union(required))
-
-    if merged == sorted(current):
-        print("   ℹ️ Customer already has required tags.")
-        return
-
-    set_customer_tags(owner_customer_id, merged)
-    print(f"   ✅ Customer securely tagged with {store_handle} tags.")
-
-# ----------------------------
-# Shopify Files upload
-# ----------------------------
-def upload_png_to_shopify_files(filename: str, png_bytes: bytes) -> Tuple[str, str]:
-    q1 = """
     mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
-        stagedTargets { url resourceUrl parameters { name value } }
+        stagedTargets {
+          url
+          resourceUrl
+          parameters { name value }
+        }
         userErrors { field message }
       }
     }
     """
-    variables1 = {"input": [{"resource": "FILE", "filename": filename, "mimeType": "image/png", "httpMethod": "POST"}]}
-    d1 = shopify_graphql(q1, variables1)
-    target = d1["stagedUploadsCreate"]["stagedTargets"][0]
-    
-    upload_url = target["url"]
-    params = {p["name"]: p["value"] for p in target["parameters"]}
-    resource_url = target["resourceUrl"]
+    variables = {
+        "input": [{
+            "resource": "FILE",
+            "filename": filename,
+            "mimeType": mime_type,
+            "httpMethod": "POST",
+        }]
+    }
+    data = shopify_graphql(q, variables)
+    res = data["stagedUploadsCreate"]
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"stagedUploadsCreate userErrors: {json.dumps(errs, indent=2)}")
+    targets = res.get("stagedTargets") or []
+    if not targets:
+        raise RuntimeError("stagedUploadsCreate returned no stagedTargets")
+    return targets[0]
 
-    files = {"file": (filename, png_bytes, "image/png")}
-    requests.post(upload_url, data=params, files=files, timeout=120).raise_for_status()
 
-    q2 = """
+def staged_upload_post(target: Dict[str, Any], file_bytes: bytes, mime_type: str) -> str:
+    url = target["url"]
+    params = {p["name"]: p["value"] for p in target.get("parameters", [])}
+    files = {"file": ("upload", file_bytes, mime_type)}
+    r = requests.post(url, data=params, files=files, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return target["resourceUrl"]
+
+
+def file_create_from_resource_url(resource_url: str, alt: str = "", prefer_image: bool = True) -> str:
+    """
+    Tries to create as IMAGE first (best for storefront + file references),
+    falls back to FILE if Shopify rejects IMAGE for any reason.
+    Returns file/media GID.
+    """
+    q = """
     mutation fileCreate($files: [FileCreateInput!]!) {
       fileCreate(files: $files) {
-        files { ... on MediaImage { id image { url } } ... on GenericFile { id url } }
+        files {
+          __typename
+          ... on MediaImage { id image { url } }
+          ... on GenericFile { id url }
+        }
         userErrors { field message }
       }
     }
     """
-    d2 = shopify_graphql(q2, {"files": [{"originalSource": resource_url, "contentType": "IMAGE"}]})
-    created = d2["fileCreate"]["files"][0]
-    return created["id"], created.get("image", {}).get("url") or created.get("url", "")
 
-# ----------------------------
-# Collection create/update
-# ----------------------------
-def ensure_smart_collection(handle: str, title: str) -> str:
-    q_find = """
-    query getCollectionByHandle($handle: String!) {
-      collectionByHandle(handle: $handle) { id handle title }
+    def _try(content_type: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        variables = {
+            "files": [{
+                "originalSource": resource_url,
+                "alt": alt,
+                "contentType": content_type,
+            }]
+        }
+        data = shopify_graphql(q, variables)
+        res = data["fileCreate"]
+        errs = res.get("userErrors") or []
+        files = res.get("files") or []
+        if files:
+            return files[0]["id"], errs
+        return None, errs
+
+    if prefer_image:
+        file_id, errs = _try("IMAGE")
+        if file_id and not errs:
+            return file_id
+        # If IMAGE attempt produced only errors, fall back to FILE
+        file_id2, errs2 = _try("FILE")
+        if errs2:
+            raise RuntimeError(f"fileCreate userErrors: {json.dumps(errs2, indent=2)}")
+        if not file_id2:
+            raise RuntimeError("fileCreate returned no files")
+        return file_id2
+
+    # direct FILE
+    file_id, errs = _try("FILE")
+    if errs:
+        raise RuntimeError(f"fileCreate userErrors: {json.dumps(errs, indent=2)}")
+    if not file_id:
+        raise RuntimeError("fileCreate returned no files")
+    return file_id
+
+
+def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Dict[str, Any]:
+    """
+    Works for either MediaImage or GenericFile.
+    Returns node with best-effort URL.
+    """
+    q = """
+    query fileNode($id: ID!) {
+      node(id: $id) {
+        __typename
+        ... on MediaImage {
+          id
+          image { url }
+          createdAt
+        }
+        ... on GenericFile {
+          id
+          url
+          createdAt
+        }
+      }
     }
     """
-    existing = shopify_graphql(q_find, {"handle": handle}).get("collectionByHandle")
+    start = time.time()
+    last_node = None
+    while True:
+        data = shopify_graphql(q, {"id": file_id})
+        node = data.get("node")
+        last_node = node
 
-    if existing and existing.get("id"):
-        q_upd = """
-        mutation collectionUpdate($input: CollectionInput!) {
-          collectionUpdate(input: $input) { collection { id } userErrors { field message } }
+        if node:
+            if node.get("__typename") == "MediaImage":
+                img = node.get("image") or {}
+                if img.get("url"):
+                    return node
+            if node.get("__typename") == "GenericFile":
+                if node.get("url"):
+                    return node
+
+        if time.time() - start > max_wait_s:
+            raise RuntimeError(f"Timed out waiting for file to be ready: {file_id}\nLast node: {json.dumps(last_node, indent=2)}")
+        time.sleep(2)
+
+
+def upload_png_to_shopify_files(png_bytes: bytes, filename: str, alt: str) -> Tuple[str, str]:
+    # returns (file_gid, file_url)
+    target = staged_upload_create(filename=filename, mime_type="image/png")
+    resource_url = staged_upload_post(target, png_bytes, mime_type="image/png")
+    file_id = file_create_from_resource_url(resource_url, alt=alt, prefer_image=True)
+    node = file_wait_ready(file_id)
+
+    if node.get("__typename") == "MediaImage":
+        return file_id, (node.get("image") or {}).get("url") or ""
+    return file_id, node.get("url") or ""
+
+
+# -----------------------------
+# Collection create/update + publish
+# -----------------------------
+def collection_by_handle(handle: str) -> Optional[Dict[str, Any]]:
+    q = """
+    query collectionByHandle($handle: String!) {
+      collectionByHandle(handle: $handle) {
+        id
+        handle
+        title
+        templateSuffix
+        ruleSet {
+          appliedDisjunctively
+          rules { column relation condition }
         }
-        """
-        d = shopify_graphql(q_upd, {"input": {"id": existing["id"], "title": title, "templateSuffix": COLLECTION_TEMPLATE_SUFFIX}})
-        return d["collectionUpdate"]["collection"]["id"]
+      }
+    }
+    """
+    data = shopify_graphql(q, {"handle": handle})
+    return data.get("collectionByHandle")
 
-    q_create = """
+
+def smart_collection_rule_set(tag_value: str) -> Dict[str, Any]:
+    return {
+        "appliedDisjunctively": False,
+        "rules": [{
+            "column": COLLECTION_RULE_FIELD,
+            "relation": COLLECTION_RULE_RELATION,
+            "condition": tag_value,
+        }]
+    }
+
+
+def collection_create_smart(title: str, handle: str, tag_value: str) -> str:
+    q = """
     mutation collectionCreate($input: CollectionInput!) {
-      collectionCreate(input: $input) { collection { id } userErrors { field message } }
+      collectionCreate(input: $input) {
+        collection { id handle title templateSuffix }
+        userErrors { field message }
+      }
     }
     """
     variables = {
         "input": {
             "title": title,
             "handle": handle,
-            "ruleSet": {
-                "appliedDisjunctively": False,
-                "rules": [{"column": "TAG", "relation": "EQUALS", "condition": handle}]
-            },
             "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
+            "ruleSet": smart_collection_rule_set(tag_value),
         }
     }
-    d = shopify_graphql(q_create, variables)
-    return d["collectionCreate"]["collection"]["id"]
+    data = shopify_graphql(q, variables)
+    res = data["collectionCreate"]
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"collectionCreate userErrors: {json.dumps(errs, indent=2)}")
+    col = res.get("collection")
+    if not col:
+        raise RuntimeError("collectionCreate returned no collection")
+    return col["id"]
 
-def publish_collection_to_online_store(collection_gid: str) -> Optional[str]:
-    pub_id = env_get("ONLINE_STORE_PUBLICATION_ID")
-    if not pub_id:
-        return "ONLINE_STORE_PUBLICATION_ID not set in Railway — collection created but hidden."
 
+def collection_update_smart(collection_id: str, title: str, handle: str, tag_value: str) -> None:
     q = """
-    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
-      publishablePublish(id: $id, input: $input) { userErrors { field message } }
-    }
-    """
-    resp = shopify_graphql(q, {"id": collection_gid, "input": [{"publicationId": pub_id}]})
-    return None
-
-# ----------------------------
-# Metaobject upsert
-# ----------------------------
-def upsert_custom_shop_metaobject(
-    store_handle: str, store_name: str, owner_customer_id: str,
-    collection_gid: str, collection_handle: str,
-    main_logo_file_id: str, secondary_logo_file_id: Optional[str] = None, type_of_store: str = None
-) -> str:
-    fields = [
-        {"key": "name", "value": store_name},
-        {"key": "owner_customer_id", "value": str(owner_customer_id)},
-        {"key": "collection_gid", "value": collection_gid},
-        {"key": "collection_handle", "value": collection_handle},
-        {"key": "logo", "value": main_logo_file_id},
-        {"key": "handle", "value": store_handle}
-    ]
-
-    if secondary_logo_file_id:
-        fields.append({"key": "secondary_logo", "value": secondary_logo_file_id})
-    if type_of_store:
-        fields.append({"key": "type_of_store", "value": type_of_store})
-
-    q_upsert = """
-    mutation metaobjectUpsert($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
-      metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
-        metaobject { id } userErrors { field message }
+    mutation collectionUpdate($id: ID!, $input: CollectionInput!) {
+      collectionUpdate(id: $id, input: $input) {
+        collection { id handle title templateSuffix }
+        userErrors { field message }
       }
     }
     """
-    d = shopify_graphql(q_upsert, {"handle": {"type": METAOBJECT_TYPE, "handle": store_handle}, "metaobject": {"fields": fields}})
-    return d["metaobjectUpsert"]["metaobject"]["id"]
+    variables = {
+        "id": collection_id,
+        "input": {
+            "title": title,
+            "handle": handle,
+            "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
+            "ruleSet": smart_collection_rule_set(tag_value),
+        }
+    }
+    data = shopify_graphql(q, variables)
+    res = data["collectionUpdate"]
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"collectionUpdate userErrors: {json.dumps(errs, indent=2)}")
 
-# ----------------------------
-# Trigger Automation
-# ----------------------------
-def trigger_studio_automation(handle: str, logo_url: str, store_name: str) -> None:
-    url = env_get("STUDIO_AUTOMATION_URL")
-    if not url:
+
+def get_all_publications() -> List[str]:
+    q = """
+    query pubs($first: Int!) {
+      publications(first: $first) {
+        edges { node { id name } }
+      }
+    }
+    """
+    data = shopify_graphql(q, {"first": 50})
+    edges = data.get("publications", {}).get("edges") or []
+    return [e["node"]["id"] for e in edges if e.get("node", {}).get("id")]
+
+
+def publish_to_all_publications(publishable_id: str) -> None:
+    pubs = get_all_publications()
+    if not pubs:
+        print("⚠️ No publications found; skipping publishablePublish.")
         return
-    try:
-        requests.post(url, json={"store_handle": handle, "logo_url": logo_url, "unit_name": store_name}, timeout=10)
-    except Exception:
-        pass
 
-# ----------------------------
-# MAIN BACKGROUND TASK
-# ----------------------------
-def run_provisioning(store_name: str, customer_id: str, main_png: bytes, sec_png: bytes = None, type_of_store: str = None):
-    handle = build_handle(store_name, customer_id)
-    print(f"\n=== PROVISION START: {handle} ===")
-    
-    try:
-        print("1) Uploading MAIN logo to Shopify Files…")
-        main_file_id, main_url = upload_png_to_shopify_files(f"{handle}_logo.png", main_png)
-        
-        sec_file_id = None
-        if sec_png:
-            print("1b) Uploading SECONDARY logo…")
-            sec_file_id, _ = upload_png_to_shopify_files(f"{handle}_secondary.png", sec_png)
+    q = """
+    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        userErrors { field message }
+      }
+    }
+    """
+    variables = {"id": publishable_id, "input": [{"publicationId": pid} for pid in pubs]}
 
-        print("2) Ensuring smart collection exists…")
-        collection_gid = ensure_smart_collection(handle=handle, title=f"{store_name} Storefront")
-        
-        print("2b) Publishing collection…")
-        warn = publish_collection_to_online_store(collection_gid)
-        if warn: print(f" ⚠️ {warn}")
+    # Retry because Shopify sometimes lags right after create/update
+    last_err = None
+    for attempt in range(1, PUBLISH_RETRY_MAX + 1):
+        try:
+            data = shopify_graphql(q, variables)
+            errs = data["publishablePublish"].get("userErrors") or []
+            if errs:
+                raise RuntimeError(f"publishablePublish userErrors: {json.dumps(errs, indent=2)}")
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < PUBLISH_RETRY_MAX:
+                time.sleep(PUBLISH_RETRY_S * attempt)
+                continue
+            raise last_err
 
-        print("3) Upserting custom_shop metaobject…")
-        meta_id = upsert_custom_shop_metaobject(
-            store_handle=handle, store_name=store_name, owner_customer_id=customer_id,
-            collection_gid=collection_gid, collection_handle=handle,
-            main_logo_file_id=main_file_id, secondary_logo_file_id=sec_file_id, type_of_store=type_of_store
+
+# -----------------------------
+# Metaobject upsert
+# -----------------------------
+def metaobject_upsert_custom_shop(
+    handle: str,
+    name: str,
+    logo_file_gid: str,
+    owner_customer_gid: str,
+    collection_gid: str,
+    collection_handle: str,
+    secondary_logo_file_gid: Optional[str],
+    type_of_store: Optional[str],
+    is_fully_ready: bool,
+) -> str:
+    q = """
+    mutation metaobjectUpsert($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
+      metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
+        metaobject { id handle type }
+        userErrors { field message }
+      }
+    }
+    """
+
+    fields = [
+        {"key": "name", "value": name},
+        {"key": "logo", "value": logo_file_gid},
+        {"key": "owner_customer_id", "value": owner_customer_gid},
+        {"key": "collection_gid", "value": collection_gid},
+        {"key": "collection_handle", "value": collection_handle},
+        {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
+    ]
+
+    if secondary_logo_file_gid:
+        fields.append({"key": "secondary_logo", "value": secondary_logo_file_gid})
+
+    if type_of_store:
+        fields.append({"key": "type_of_store", "value": type_of_store})
+
+    variables = {
+        "handle": {"type": METAOBJECT_TYPE, "handle": handle},
+        "metaobject": {
+            "type": METAOBJECT_TYPE,
+            "fields": fields,
+        }
+    }
+
+    data = shopify_graphql(q, variables)
+    res = data["metaobjectUpsert"]
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"metaobjectUpsert userErrors: {json.dumps(errs, indent=2)}")
+
+    mo = res.get("metaobject")
+    if not mo:
+        raise RuntimeError("metaobjectUpsert returned no metaobject")
+    return mo["id"]
+
+
+# -----------------------------
+# Studio Automation trigger (REQUIRED)
+# -----------------------------
+def trigger_studio_automation(payload: Dict[str, Any]) -> None:
+    headers = {"Content-Type": "application/json"}
+    if STUDIO_AUTOMATION_TOKEN:
+        headers["Authorization"] = f"Bearer {STUDIO_AUTOMATION_TOKEN}"
+
+    r = requests.post(STUDIO_AUTOMATION_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+    if r.status_code >= 300:
+        raise RuntimeError(
+            f"Studio Automation trigger failed: HTTP {r.status_code}\n"
+            f"Response: {r.text[:2000]}"
         )
 
-        print("4) Tagging customer safely…")
-        ensure_customer_storefront_tags(customer_id, handle)
 
-        print("5) Triggering studio automation…")
-        trigger_studio_automation(handle, main_url, store_name)
+# -----------------------------
+# Main provisioning flow
+# -----------------------------
+def provision(
+    storefront_name: str,
+    storefront_handle: str,
+    owner_customer_id: str,
+    main_session_id: str,
+    uploads_dir: Path,
+    secondary_session_id: Optional[str] = None,
+    type_of_store: Optional[str] = None,
+) -> Dict[str, Any]:
+    # Handle is REQUIRED from caller (app.py passes --handle).
+    handle = (storefront_handle or "").strip()
+    if not handle:
+        # still safe fallback
+        handle = slugify_handle(storefront_name)
 
-        print("=== PROVISION COMPLETE ===\n")
-    except Exception as e:
-        print(f"❌ PROVISIONING FAILED: {str(e)}")
+    # This is the tag value products must match
+    tag_value = handle
+
+    print(f"🧩 Provisioning handle: {handle}")
+    print(f"🏷️ Collection tag rule: tag equals {tag_value}")
+    print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
+
+    # 1) Upload main logo
+    main_png = read_session_png(uploads_dir, main_session_id)
+    main_file_gid, main_file_url = upload_png_to_shopify_files(
+        main_png,
+        filename=f"{handle}_logo.png",
+        alt=f"{storefront_name} logo",
+    )
+    print("✅ Main logo uploaded:", main_file_gid, main_file_url)
+
+    # 2) Upload secondary logo (optional)
+    secondary_file_gid = None
+    secondary_file_url = None
+    if secondary_session_id:
+        sec_png = read_session_png(uploads_dir, secondary_session_id)
+        secondary_file_gid, secondary_file_url = upload_png_to_shopify_files(
+            sec_png,
+            filename=f"{handle}_secondary_logo.png",
+            alt=f"{storefront_name} secondary logo",
+        )
+        print("✅ Secondary logo uploaded:", secondary_file_gid, secondary_file_url)
+
+    # 3) Create or update collection (smart collection via ruleSet)
+    existing = collection_by_handle(handle)
+    if existing:
+        collection_gid = existing["id"]
+        print("♻️ Collection exists — updating:", collection_gid)
+        collection_update_smart(collection_gid, storefront_name, handle, tag_value)
+    else:
+        print("🆕 Creating collection…")
+        collection_gid = collection_create_smart(storefront_name, handle, tag_value)
+
+    print("✅ Collection ready:", collection_gid)
+
+    # 4) Publish to all publications
+    publish_to_all_publications(collection_gid)
+    print("✅ Collection published to all publications")
+
+    # 5) Upsert metaobject custom_shop (fills ALL required fields)
+    owner_customer_gid = ensure_gid_customer(owner_customer_id)
+
+    metaobject_id = metaobject_upsert_custom_shop(
+        handle=handle,
+        name=storefront_name,
+        logo_file_gid=main_file_gid,
+        owner_customer_gid=owner_customer_gid,
+        collection_gid=collection_gid,
+        collection_handle=handle,
+        secondary_logo_file_gid=secondary_file_gid,
+        type_of_store=type_of_store,
+        is_fully_ready=True,
+    )
+    print("✅ Metaobject upserted:", metaobject_id)
+
+    # 6) Trigger Studio Automation ALWAYS (required)
+    automation_payload = {
+        "store_handle": handle,
+        "collection_handle": handle,
+        "collection_gid": collection_gid,
+        "metaobject_type": METAOBJECT_TYPE,
+        "storefront_name": storefront_name,
+        "owner_customer_gid": owner_customer_gid,
+        "logo_file_gid": main_file_gid,
+        "logo_url": main_file_url,
+        "secondary_logo_file_gid": secondary_file_gid,
+        "secondary_logo_url": secondary_file_url,
+        "type_of_store": type_of_store,
+    }
+    trigger_studio_automation(automation_payload)
+    print("🚀 Studio Automation triggered successfully")
+
+    return {
+        "handle": handle,
+        "collection_gid": collection_gid,
+        "metaobject_id": metaobject_id,
+        "logo_file_gid": main_file_gid,
+        "logo_url": main_file_url,
+        "secondary_logo_file_gid": secondary_file_gid,
+        "secondary_logo_url": secondary_file_url,
+        "type_of_store": type_of_store,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True, help="Storefront display name")
+    ap.add_argument("--handle", required=True, help="Storefront handle (REQUIRED, passed from app.py)")
+    ap.add_argument("--owner_customer_id", required=True, help="Customer gid or numeric id")
+    ap.add_argument("--main_session_id", required=True, help="Session id for main logo (uploads/<id>_curr.png)")
+    ap.add_argument("--uploads_dir", required=True, help="Uploads directory path")
+    ap.add_argument("--secondary_session_id", default="", help="Optional session id for secondary logo")
+    ap.add_argument("--type_of_store", default="", help="Optional type_of_store field")
+
+    args = ap.parse_args()
+
+    uploads_dir = Path(args.uploads_dir).resolve()
+    if not uploads_dir.exists():
+        raise RuntimeError(f"uploads_dir not found: {uploads_dir}")
+
+    secondary_session_id = args.secondary_session_id.strip() or None
+    type_of_store = args.type_of_store.strip() or None
+
+    result = provision(
+        storefront_name=args.name.strip(),
+        storefront_handle=args.handle.strip(),
+        owner_customer_id=args.owner_customer_id.strip(),
+        main_session_id=args.main_session_id.strip(),
+        uploads_dir=uploads_dir,
+        secondary_session_id=secondary_session_id,
+        type_of_store=type_of_store,
+    )
+
+    print("========== PROVISION RESULT ==========")
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
