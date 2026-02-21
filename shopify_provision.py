@@ -1,6 +1,7 @@
 # shopify_provision.py — Shopify provisioning for Studio Uploader (vNext, handle-safe)
 # - Creates/updates Smart Collection (template suffix = private-store)
 # - Uploads main/secondary logos to Shopify Files (as IMAGE when possible)
+# - Tags customer with store handle (MERGE-SAFE; never deletes old tags)
 # - Upserts custom_shop metaobject with required fields
 # - Publishes collection to all publications
 # - Triggers Studio Automation ALWAYS (required)
@@ -97,6 +98,53 @@ def read_session_png(uploads_dir: Path, session_id: str) -> bytes:
     return p.read_bytes()
 
 
+def customer_add_tag(customer_gid: str, new_tag: str) -> None:
+    """
+    Merge-safe customer tag add:
+    - Fetches existing tags
+    - Adds new_tag if missing
+    - Updates customer with merged tags (never deletes old tags)
+    """
+    new_tag = (new_tag or "").strip()
+    if not new_tag:
+        return
+
+    q_get = """
+    query getCustomer($id: ID!) {
+      customer(id: $id) {
+        id
+        tags
+      }
+    }
+    """
+    data = shopify_graphql(q_get, {"id": customer_gid})
+    cust = data.get("customer")
+    if not cust:
+        raise RuntimeError(f"Customer not found: {customer_gid}")
+
+    existing = cust.get("tags") or []
+    if new_tag in existing:
+        print(f"🏷️ Customer already has tag: {new_tag}")
+        return
+
+    merged = existing + [new_tag]
+
+    q_update = """
+    mutation customerUpdate($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id tags }
+        userErrors { field message }
+      }
+    }
+    """
+    res = shopify_graphql(q_update, {"input": {"id": customer_gid, "tags": merged}})["customerUpdate"]
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs, indent=2)}")
+
+    print(f"✅ Customer tagged: {new_tag}")
+
+
 # -----------------------------
 # Shopify Files upload (staged uploads)
 # -----------------------------
@@ -180,7 +228,6 @@ def file_create_from_resource_url(resource_url: str, alt: str = "", prefer_image
         file_id, errs = _try("IMAGE")
         if file_id and not errs:
             return file_id
-        # If IMAGE attempt produced only errors, fall back to FILE
         file_id2, errs2 = _try("FILE")
         if errs2:
             raise RuntimeError(f"fileCreate userErrors: {json.dumps(errs2, indent=2)}")
@@ -188,7 +235,6 @@ def file_create_from_resource_url(resource_url: str, alt: str = "", prefer_image
             raise RuntimeError("fileCreate returned no files")
         return file_id2
 
-    # direct FILE
     file_id, errs = _try("FILE")
     if errs:
         raise RuntimeError(f"fileCreate userErrors: {json.dumps(errs, indent=2)}")
@@ -236,7 +282,9 @@ def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Di
                     return node
 
         if time.time() - start > max_wait_s:
-            raise RuntimeError(f"Timed out waiting for file to be ready: {file_id}\nLast node: {json.dumps(last_node, indent=2)}")
+            raise RuntimeError(
+                f"Timed out waiting for file to be ready: {file_id}\nLast node: {json.dumps(last_node, indent=2)}"
+            )
         time.sleep(2)
 
 
@@ -366,7 +414,6 @@ def publish_to_all_publications(publishable_id: str) -> None:
     """
     variables = {"id": publishable_id, "input": [{"publicationId": pid} for pid in pubs]}
 
-    # Retry because Shopify sometimes lags right after create/update
     last_err = None
     for attempt in range(1, PUBLISH_RETRY_MAX + 1):
         try:
@@ -472,10 +519,8 @@ def provision(
     # Handle is REQUIRED from caller (app.py passes --handle).
     handle = (storefront_handle or "").strip()
     if not handle:
-        # still safe fallback
         handle = slugify_handle(storefront_name)
 
-    # This is the tag value products must match
     tag_value = handle
 
     print(f"🧩 Provisioning handle: {handle}")
@@ -491,17 +536,23 @@ def provision(
     )
     print("✅ Main logo uploaded:", main_file_gid, main_file_url)
 
-    # 2) Upload secondary logo (optional)
+    # 2) Upload secondary logo (optional) — SAFE (won’t crash provisioning)
     secondary_file_gid = None
     secondary_file_url = None
     if secondary_session_id:
-        sec_png = read_session_png(uploads_dir, secondary_session_id)
-        secondary_file_gid, secondary_file_url = upload_png_to_shopify_files(
-            sec_png,
-            filename=f"{handle}_secondary_logo.png",
-            alt=f"{storefront_name} secondary logo",
-        )
-        print("✅ Secondary logo uploaded:", secondary_file_gid, secondary_file_url)
+        try:
+            sec_png = read_session_png(uploads_dir, secondary_session_id)
+            if sec_png and len(sec_png) > 100:
+                secondary_file_gid, secondary_file_url = upload_png_to_shopify_files(
+                    sec_png,
+                    filename=f"{handle}_secondary_logo.png",
+                    alt=f"{storefront_name} secondary logo",
+                )
+                print("✅ Secondary logo uploaded:", secondary_file_gid, secondary_file_url)
+            else:
+                print("⚠️ Secondary logo empty — skipping")
+        except Exception as e:
+            print("⚠️ Secondary logo failed — skipping:", str(e))
 
     # 3) Create or update collection (smart collection via ruleSet)
     existing = collection_by_handle(handle)
@@ -519,9 +570,11 @@ def provision(
     publish_to_all_publications(collection_gid)
     print("✅ Collection published to all publications")
 
-    # 5) Upsert metaobject custom_shop (fills ALL required fields)
+    # 5) Customer GID + MERGE-SAFE tagging (DOES NOT delete old tags)
     owner_customer_gid = ensure_gid_customer(owner_customer_id)
+    customer_add_tag(owner_customer_gid, handle)
 
+    # 6) Upsert metaobject custom_shop (fills ALL required fields)
     metaobject_id = metaobject_upsert_custom_shop(
         handle=handle,
         name=storefront_name,
@@ -535,7 +588,7 @@ def provision(
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
-    # 6) Trigger Studio Automation ALWAYS (required)
+    # 7) Trigger Studio Automation ALWAYS (required)
     automation_payload = {
         "store_handle": handle,
         "collection_handle": handle,
