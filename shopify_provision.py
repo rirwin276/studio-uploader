@@ -42,9 +42,11 @@ STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # op
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
 COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
 
-# Smart collection rule config
-COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "tag").strip()       # "tag"
-COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "equals").strip()  # "equals"
+# Shopify GraphQL expects ENUMS, not lowercase strings.
+# We allow env overrides but normalize to correct enums.
+# Defaults are TAG + EQUALS for your "tag equals handle" smart collection rule.
+COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()
+COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "EQUALS").strip()
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 FILE_READY_MAX_WAIT_S = int(os.getenv("FILE_READY_MAX_WAIT_S", "120"))
@@ -96,6 +98,44 @@ def read_session_png(uploads_dir: Path, session_id: str) -> bytes:
     if not p.exists():
         raise RuntimeError(f"Missing session image: {p}")
     return p.read_bytes()
+
+
+def _normalize_collection_rule_enums(column: str, relation: str) -> Tuple[str, str]:
+    """
+    Shopify GraphQL expects enums like TAG / EQUALS (uppercase).
+    Your prior env defaults were 'tag'/'equals' which Shopify rejects.
+    """
+    col = (column or "").strip()
+    rel = (relation or "").strip()
+
+    # Common user-provided forms → correct enums
+    col_map = {
+        "tag": "TAG",
+        "tags": "TAG",
+        "TAG": "TAG",
+        "title": "TITLE",
+        "TITLE": "TITLE",
+        "type": "TYPE",
+        "TYPE": "TYPE",
+        "vendor": "VENDOR",
+        "VENDOR": "VENDOR",
+    }
+    rel_map = {
+        "equals": "EQUALS",
+        "EQUALS": "EQUALS",
+        "contains": "CONTAINS",
+        "CONTAINS": "CONTAINS",
+        "not_equals": "NOT_EQUALS",
+        "NOT_EQUALS": "NOT_EQUALS",
+        "starts_with": "STARTS_WITH",
+        "STARTS_WITH": "STARTS_WITH",
+        "ends_with": "ENDS_WITH",
+        "ENDS_WITH": "ENDS_WITH",
+    }
+
+    col_norm = col_map.get(col, col.upper())
+    rel_norm = rel_map.get(rel, rel.upper())
+    return col_norm, rel_norm
 
 
 def customer_add_tag(customer_gid: str, new_tag: str) -> None:
@@ -323,11 +363,12 @@ def collection_by_handle(handle: str) -> Optional[Dict[str, Any]]:
 
 
 def smart_collection_rule_set(tag_value: str) -> Dict[str, Any]:
+    col_enum, rel_enum = _normalize_collection_rule_enums(COLLECTION_RULE_FIELD, COLLECTION_RULE_RELATION)
     return {
         "appliedDisjunctively": False,
         "rules": [{
-            "column": COLLECTION_RULE_FIELD,
-            "relation": COLLECTION_RULE_RELATION,
+            "column": col_enum,
+            "relation": rel_enum,
             "condition": tag_value,
         }]
     }
@@ -523,8 +564,10 @@ def provision(
 
     tag_value = handle
 
+    col_enum, rel_enum = _normalize_collection_rule_enums(COLLECTION_RULE_FIELD, COLLECTION_RULE_RELATION)
+
     print(f"🧩 Provisioning handle: {handle}")
-    print(f"🏷️ Collection tag rule: tag equals {tag_value}")
+    print(f"🏷️ Collection tag rule: {col_enum} {rel_enum} {tag_value}")
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
 
     # 1) Upload main logo
