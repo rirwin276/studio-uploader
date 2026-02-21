@@ -2,13 +2,21 @@
 # - Creates/updates Smart Collection (template suffix = private-store)
 # - Uploads main/secondary logos to Shopify Files (as IMAGE when possible)
 # - Tags customer with store handle (MERGE-SAFE; never deletes old tags)
+#   REQUIRED tags:
+#     storefront-admin--{handle}
+#     storefront-member--{handle}
 # - Upserts custom_shop metaobject with required fields
 # - Publishes collection to all publications
 # - Triggers Studio Automation ALWAYS (required)
 #
 # IMPORTANT: This file matches the NEW app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
-# (app.py now passes --handle, not --collection_handle)
+#
+# Key FIXES:
+# 1) metaobjectUpsert: MetaobjectUpsertInput DOES NOT accept "type" field -> remove it.
+#    Type is only provided in MetaobjectHandleInput ("handle" variable).
+# 2) customer tagging now adds BOTH admin+member tags.
+# 3) smart collection rule enums forced to TAG/EQUALS etc.
 
 import os
 import re
@@ -42,11 +50,9 @@ STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # op
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
 COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
 
-# Shopify GraphQL expects ENUMS, not lowercase strings.
-# We allow env overrides but normalize to correct enums.
-# Defaults are TAG + EQUALS for your "tag equals handle" smart collection rule.
-COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()
-COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "EQUALS").strip()
+# Smart collection rule config (Shopify expects ENUMS, not lowercase strings)
+COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()       # TAG / TITLE / ...
+COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "EQUALS").strip()  # EQUALS / CONTAINS / ...
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 FILE_READY_MAX_WAIT_S = int(os.getenv("FILE_READY_MAX_WAIT_S", "120"))
@@ -92,6 +98,17 @@ def ensure_gid_customer(customer_id: str) -> str:
     return f"gid://shopify/Customer/{cid_num}"
 
 
+def normalize_customer_id_value(customer_id: str) -> str:
+    """
+    Your metaobject field 'owner_customer_id' is a Single line text field.
+    Store the numeric ID as text (clean + consistent).
+    """
+    cid = (customer_id or "").strip()
+    if cid.startswith("gid://"):
+        return cid.split("/")[-1]
+    return cid.split("/")[-1]
+
+
 def read_session_png(uploads_dir: Path, session_id: str) -> bytes:
     # app.py writes uploads/<session>_curr.png
     p = uploads_dir / f"{session_id}_curr.png"
@@ -100,53 +117,65 @@ def read_session_png(uploads_dir: Path, session_id: str) -> bytes:
     return p.read_bytes()
 
 
-def _normalize_collection_rule_enums(column: str, relation: str) -> Tuple[str, str]:
+def _normalize_rule_enum(val: str, kind: str) -> str:
     """
-    Shopify GraphQL expects enums like TAG / EQUALS (uppercase).
-    Your prior env defaults were 'tag'/'equals' which Shopify rejects.
+    Shopify Collection ruleSet expects ENUMS (TAG, EQUALS, etc).
+    We accept lowercase env values and normalize them safely.
     """
-    col = (column or "").strip()
-    rel = (relation or "").strip()
+    v = (val or "").strip()
+    if not v:
+        return "TAG" if kind == "column" else "EQUALS"
+    v_up = v.upper()
 
-    # Common user-provided forms → correct enums
-    col_map = {
-        "tag": "TAG",
-        "tags": "TAG",
-        "TAG": "TAG",
-        "title": "TITLE",
-        "TITLE": "TITLE",
-        "type": "TYPE",
-        "TYPE": "TYPE",
-        "vendor": "VENDOR",
-        "VENDOR": "VENDOR",
-    }
-    rel_map = {
-        "equals": "EQUALS",
-        "EQUALS": "EQUALS",
-        "contains": "CONTAINS",
-        "CONTAINS": "CONTAINS",
-        "not_equals": "NOT_EQUALS",
-        "NOT_EQUALS": "NOT_EQUALS",
-        "starts_with": "STARTS_WITH",
-        "STARTS_WITH": "STARTS_WITH",
-        "ends_with": "ENDS_WITH",
-        "ENDS_WITH": "ENDS_WITH",
-    }
+    # Common user mistakes: "tag" -> "TAG", "equals" -> "EQUALS"
+    if kind == "column":
+        mapping = {
+            "TAG": "TAG",
+            "TITLE": "TITLE",
+            "TYPE": "TYPE",
+            "VENDOR": "VENDOR",
+            "VARIANT_PRICE": "VARIANT_PRICE",
+        }
+        # If someone set "tag" or "Tag"
+        if v_up in mapping:
+            return mapping[v_up]
+        # last resort: return upper
+        return v_up
 
-    col_norm = col_map.get(col, col.upper())
-    rel_norm = rel_map.get(rel, rel.upper())
-    return col_norm, rel_norm
+    if kind == "relation":
+        mapping = {
+            "EQUALS": "EQUALS",
+            "CONTAINS": "CONTAINS",
+            "NOT_EQUALS": "NOT_EQUALS",
+            "NOT_CONTAINS": "NOT_CONTAINS",
+            "STARTS_WITH": "STARTS_WITH",
+            "ENDS_WITH": "ENDS_WITH",
+            "IS_SET": "IS_SET",
+            "IS_NOT_SET": "IS_NOT_SET",
+            "GREATER_THAN": "GREATER_THAN",
+            "LESS_THAN": "LESS_THAN",
+        }
+        if v_up in mapping:
+            return mapping[v_up]
+        return v_up
+
+    return v_up
 
 
-def customer_add_tag(customer_gid: str, new_tag: str) -> None:
+def customer_add_tags(customer_gid: str, new_tags: List[str]) -> None:
     """
     Merge-safe customer tag add:
     - Fetches existing tags
-    - Adds new_tag if missing
+    - Adds new tags if missing
     - Updates customer with merged tags (never deletes old tags)
     """
-    new_tag = (new_tag or "").strip()
-    if not new_tag:
+    cleaned = []
+    for t in (new_tags or []):
+        t2 = (t or "").strip()
+        if t2:
+            cleaned.append(t2)
+
+    if not cleaned:
         return
 
     q_get = """
@@ -163,11 +192,17 @@ def customer_add_tag(customer_gid: str, new_tag: str) -> None:
         raise RuntimeError(f"Customer not found: {customer_gid}")
 
     existing = cust.get("tags") or []
-    if new_tag in existing:
-        print(f"🏷️ Customer already has tag: {new_tag}")
-        return
+    merged = list(existing)
 
-    merged = existing + [new_tag]
+    added_any = False
+    for t in cleaned:
+        if t not in merged:
+            merged.append(t)
+            added_any = True
+
+    if not added_any:
+        print(f"🏷️ Customer already has tags: {', '.join(cleaned)}")
+        return
 
     q_update = """
     mutation customerUpdate($input: CustomerInput!) {
@@ -182,7 +217,7 @@ def customer_add_tag(customer_gid: str, new_tag: str) -> None:
     if errs:
         raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs, indent=2)}")
 
-    print(f"✅ Customer tagged: {new_tag}")
+    print(f"✅ Customer tagged: {', '.join(cleaned)}")
 
 
 # -----------------------------
@@ -231,8 +266,7 @@ def staged_upload_post(target: Dict[str, Any], file_bytes: bytes, mime_type: str
 
 def file_create_from_resource_url(resource_url: str, alt: str = "", prefer_image: bool = True) -> str:
     """
-    Tries to create as IMAGE first (best for storefront + file references),
-    falls back to FILE if Shopify rejects IMAGE for any reason.
+    Tries to create as IMAGE first, falls back to FILE.
     Returns file/media GID.
     """
     q = """
@@ -284,10 +318,6 @@ def file_create_from_resource_url(resource_url: str, alt: str = "", prefer_image
 
 
 def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Dict[str, Any]:
-    """
-    Works for either MediaImage or GenericFile.
-    Returns node with best-effort URL.
-    """
     q = """
     query fileNode($id: ID!) {
       node(id: $id) {
@@ -329,7 +359,6 @@ def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Di
 
 
 def upload_png_to_shopify_files(png_bytes: bytes, filename: str, alt: str) -> Tuple[str, str]:
-    # returns (file_gid, file_url)
     target = staged_upload_create(filename=filename, mime_type="image/png")
     resource_url = staged_upload_post(target, png_bytes, mime_type="image/png")
     file_id = file_create_from_resource_url(resource_url, alt=alt, prefer_image=True)
@@ -363,12 +392,13 @@ def collection_by_handle(handle: str) -> Optional[Dict[str, Any]]:
 
 
 def smart_collection_rule_set(tag_value: str) -> Dict[str, Any]:
-    col_enum, rel_enum = _normalize_collection_rule_enums(COLLECTION_RULE_FIELD, COLLECTION_RULE_RELATION)
+    col = _normalize_rule_enum(COLLECTION_RULE_FIELD, "column")
+    rel = _normalize_rule_enum(COLLECTION_RULE_RELATION, "relation")
     return {
         "appliedDisjunctively": False,
         "rules": [{
-            "column": col_enum,
-            "relation": rel_enum,
+            "column": col,
+            "relation": rel,
             "condition": tag_value,
         }]
     }
@@ -478,7 +508,7 @@ def metaobject_upsert_custom_shop(
     handle: str,
     name: str,
     logo_file_gid: str,
-    owner_customer_gid: str,
+    owner_customer_id_text: str,
     collection_gid: str,
     collection_handle: str,
     secondary_logo_file_gid: Optional[str],
@@ -494,10 +524,13 @@ def metaobject_upsert_custom_shop(
     }
     """
 
+    # IMPORTANT:
+    # - Do NOT include "type" inside the MetaobjectUpsertInput (Shopify rejects it).
+    # - Type is defined by the $handle argument below: { type: "custom_shop", handle: "..." }
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
-        {"key": "owner_customer_id", "value": owner_customer_gid},
+        {"key": "owner_customer_id", "value": owner_customer_id_text},
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
@@ -512,7 +545,7 @@ def metaobject_upsert_custom_shop(
     variables = {
         "handle": {"type": METAOBJECT_TYPE, "handle": handle},
         "metaobject": {
-            "type": METAOBJECT_TYPE,
+            # NOTE: no "type" here
             "fields": fields,
         }
     }
@@ -557,17 +590,14 @@ def provision(
     secondary_session_id: Optional[str] = None,
     type_of_store: Optional[str] = None,
 ) -> Dict[str, Any]:
-    # Handle is REQUIRED from caller (app.py passes --handle).
     handle = (storefront_handle or "").strip()
     if not handle:
         handle = slugify_handle(storefront_name)
 
     tag_value = handle
 
-    col_enum, rel_enum = _normalize_collection_rule_enums(COLLECTION_RULE_FIELD, COLLECTION_RULE_RELATION)
-
     print(f"🧩 Provisioning handle: {handle}")
-    print(f"🏷️ Collection tag rule: {col_enum} {rel_enum} {tag_value}")
+    print(f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} {_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}")
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
 
     # 1) Upload main logo
@@ -579,7 +609,7 @@ def provision(
     )
     print("✅ Main logo uploaded:", main_file_gid, main_file_url)
 
-    # 2) Upload secondary logo (optional) — SAFE (won’t crash provisioning)
+    # 2) Upload secondary logo (optional) — SAFE
     secondary_file_gid = None
     secondary_file_url = None
     if secondary_session_id:
@@ -613,16 +643,19 @@ def provision(
     publish_to_all_publications(collection_gid)
     print("✅ Collection published to all publications")
 
-    # 5) Customer GID + MERGE-SAFE tagging (DOES NOT delete old tags)
+    # 5) Customer GID + MERGE-SAFE tagging
     owner_customer_gid = ensure_gid_customer(owner_customer_id)
-    customer_add_tag(owner_customer_gid, handle)
+    admin_tag = f"storefront-admin--{handle}"
+    member_tag = f"storefront-member--{handle}"
+    customer_add_tags(owner_customer_gid, [admin_tag, member_tag])
 
     # 6) Upsert metaobject custom_shop (fills ALL required fields)
+    owner_customer_id_text = normalize_customer_id_value(owner_customer_id)
     metaobject_id = metaobject_upsert_custom_shop(
         handle=handle,
         name=storefront_name,
         logo_file_gid=main_file_gid,
-        owner_customer_gid=owner_customer_gid,
+        owner_customer_id_text=owner_customer_id_text,
         collection_gid=collection_gid,
         collection_handle=handle,
         secondary_logo_file_gid=secondary_file_gid,
@@ -639,6 +672,7 @@ def provision(
         "metaobject_type": METAOBJECT_TYPE,
         "storefront_name": storefront_name,
         "owner_customer_gid": owner_customer_gid,
+        "owner_customer_id": owner_customer_id_text,
         "logo_file_gid": main_file_gid,
         "logo_url": main_file_url,
         "secondary_logo_file_gid": secondary_file_gid,
@@ -657,6 +691,7 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
+        "customer_tags_added": [admin_tag, member_tag],
     }
 
 
