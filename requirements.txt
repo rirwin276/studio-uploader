@@ -1,19 +1,9 @@
-# requirements.txt — Studio Uploader (Railway) — Python 3.14.3 friendly
-# Goal: stable installs, good rembg quality, lower RAM pressure than full OpenCV.
-
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-multipart==0.0.9
-pillow==12.1.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pillow==11.1.0
 requests==2.32.3
-python-dotenv==1.0.1
-
-# Background removal
-rembg==2.0.72
+rembg==2.0.61
 onnxruntime==1.20.1
-
-# Optional: edge refine uses OpenCV if present; if you want better edges WITHOUT OpenCV,
-# our app.py already "gracefully falls back" when cv2 isn't installed.
-# Keeping OpenCV out reduces build size + RAM spikes on Railway.
-# If you *do* want OpenCV refine, uncomment the line below.
-# opencv-python-headless==4.10.0.84
+opencv-python-headless==4.11.0.86
+numpy==2.1.3

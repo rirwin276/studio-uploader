@@ -5,17 +5,17 @@
 #   REQUIRED tags:
 #     storefront-admin--{handle}
 #     storefront-member--{handle}
-# - Upserts custom_shop metaobject with required fields
+# - Upserts custom_shop metaobject with required fields (+ optional primary_color)
 # - Publishes collection to all publications
 # - Triggers Studio Automation ALWAYS (required)
 #
-# IMPORTANT: This file matches the NEW app.py subprocess contract:
+# IMPORTANT: This file matches the app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
 #
 # Key FIXES:
 # 1) metaobjectUpsert: MetaobjectUpsertInput DOES NOT accept "type" field -> remove it.
 #    Type is only provided in MetaobjectHandleInput ("handle" variable).
-# 2) customer tagging now adds BOTH admin+member tags.
+# 2) customer tagging adds BOTH admin+member tags.
 # 3) smart collection rule enums forced to TAG/EQUALS etc.
 
 import os
@@ -51,7 +51,7 @@ METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
 COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
 
 # Smart collection rule config (Shopify expects ENUMS, not lowercase strings)
-COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()       # TAG / TITLE / ...
+COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()           # TAG / TITLE / ...
 COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "EQUALS").strip()  # EQUALS / CONTAINS / ...
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
@@ -127,7 +127,6 @@ def _normalize_rule_enum(val: str, kind: str) -> str:
         return "TAG" if kind == "column" else "EQUALS"
     v_up = v.upper()
 
-    # Common user mistakes: "tag" -> "TAG", "equals" -> "EQUALS"
     if kind == "column":
         mapping = {
             "TAG": "TAG",
@@ -136,10 +135,8 @@ def _normalize_rule_enum(val: str, kind: str) -> str:
             "VENDOR": "VENDOR",
             "VARIANT_PRICE": "VARIANT_PRICE",
         }
-        # If someone set "tag" or "Tag"
         if v_up in mapping:
             return mapping[v_up]
-        # last resort: return upper
         return v_up
 
     if kind == "relation":
@@ -514,6 +511,7 @@ def metaobject_upsert_custom_shop(
     secondary_logo_file_gid: Optional[str],
     type_of_store: Optional[str],
     is_fully_ready: bool,
+    primary_color: Optional[str],
 ) -> str:
     q = """
     mutation metaobjectUpsert($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
@@ -524,9 +522,6 @@ def metaobject_upsert_custom_shop(
     }
     """
 
-    # IMPORTANT:
-    # - Do NOT include "type" inside the MetaobjectUpsertInput (Shopify rejects it).
-    # - Type is defined by the $handle argument below: { type: "custom_shop", handle: "..." }
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
@@ -542,10 +537,15 @@ def metaobject_upsert_custom_shop(
     if type_of_store:
         fields.append({"key": "type_of_store", "value": type_of_store})
 
+    # Optional: single-line-text field in the metaobject definition
+    if primary_color:
+        pc = (primary_color or "").strip()
+        if pc:
+            fields.append({"key": "primary_color", "value": pc})
+
     variables = {
         "handle": {"type": METAOBJECT_TYPE, "handle": handle},
         "metaobject": {
-            # NOTE: no "type" here
             "fields": fields,
         }
     }
@@ -589,6 +589,7 @@ def provision(
     uploads_dir: Path,
     secondary_session_id: Optional[str] = None,
     type_of_store: Optional[str] = None,
+    primary_color: Optional[str] = None,
 ) -> Dict[str, Any]:
     handle = (storefront_handle or "").strip()
     if not handle:
@@ -661,6 +662,7 @@ def provision(
         secondary_logo_file_gid=secondary_file_gid,
         type_of_store=type_of_store,
         is_fully_ready=True,
+        primary_color=primary_color,
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
@@ -678,6 +680,7 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
+        "primary_color": (primary_color or "").strip() or None,
     }
     trigger_studio_automation(automation_payload)
     print("🚀 Studio Automation triggered successfully")
@@ -691,6 +694,7 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
+        "primary_color": (primary_color or "").strip() or None,
         "customer_tags_added": [admin_tag, member_tag],
     }
 
@@ -704,6 +708,7 @@ def main():
     ap.add_argument("--uploads_dir", required=True, help="Uploads directory path")
     ap.add_argument("--secondary_session_id", default="", help="Optional session id for secondary logo")
     ap.add_argument("--type_of_store", default="", help="Optional type_of_store field")
+    ap.add_argument("--primary_color", default="", help="Optional primary color (single-line text)")
 
     args = ap.parse_args()
 
@@ -713,6 +718,7 @@ def main():
 
     secondary_session_id = args.secondary_session_id.strip() or None
     type_of_store = args.type_of_store.strip() or None
+    primary_color = args.primary_color.strip() or None
 
     result = provision(
         storefront_name=args.name.strip(),
@@ -722,6 +728,7 @@ def main():
         uploads_dir=uploads_dir,
         secondary_session_id=secondary_session_id,
         type_of_store=type_of_store,
+        primary_color=primary_color,
     )
 
     print("========== PROVISION RESULT ==========")

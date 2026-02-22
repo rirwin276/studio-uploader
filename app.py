@@ -1,14 +1,14 @@
-# app.py — Studio Uploader (FastAPI) — async-rembg + visible provisioning logs
+# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + visible provisioning logs
 import os
 import uuid
 import time
-import json
 import threading
 import subprocess
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from fastapi import FastAPI, UploadFile, File, Query, Request, Form
@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.4.0")
+app = FastAPI(title="Studio Uploader", version="1.5.0")  # bumped
 
 
 # ----------------------------
@@ -51,14 +51,21 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 
-REMBG_MODEL = os.getenv("REMBG_MODEL", "u2netp")
-REMBG_MAX_DIM = int(os.getenv("REMBG_MAX_DIM", "1024"))  # smaller = faster
-REMBG_DETAIL_SAFE = os.getenv("REMBG_DETAIL_SAFE", "1").strip() not in ("0", "false", "False", "")
-EDGE_REFINE = os.getenv("EDGE_REFINE", "0").strip() not in ("0", "false", "False", "")  # default OFF for speed
-EDGE_SHRINK_PX = int(os.getenv("EDGE_SHRINK_PX", "1"))
-EDGE_FEATHER_PX = int(os.getenv("EDGE_FEATHER_PX", "1"))
+# PhotoRoom (Remove BG API)
+PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
+PHOTOROOM_ENDPOINT = (os.getenv("PHOTOROOM_ENDPOINT") or "https://sdk.photoroom.com/v1/segment").strip()
+PHOTOROOM_TIMEOUT = int(os.getenv("PHOTOROOM_TIMEOUT", "60"))
+# For remove.bg compatibility endpoint, these are supported inputs (docs show crop/bg_color/format/size)
+PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "preview").strip()  # preview | hd
+PHOTOROOM_CROP = os.getenv("PHOTOROOM_CROP", "false").strip().lower() in ("1", "true", "yes", "y")
+PHOTOROOM_FORMAT = (os.getenv("PHOTOROOM_FORMAT") or "png").strip()  # png/jpg
+
+# When calling PhotoRoom, we can downscale for speed (editor only).
+# Final output still becomes 3000x3000 after user edits / normalize.
+PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "1024"))
 
 PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
+
 
 # ----------------------------
 # Job + session status tracking
@@ -95,24 +102,6 @@ def _sess_get(session_id: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# rembg session (lazy load)
-# ----------------------------
-_SESSION = None
-_SESSION_LOCK = threading.Lock()
-
-
-def get_rembg_session():
-    global _SESSION
-    with _SESSION_LOCK:
-        if _SESSION is None:
-            print("🧠 Loading rembg model into memory:", REMBG_MODEL)
-            from rembg import new_session
-
-            _SESSION = new_session(REMBG_MODEL)
-    return _SESSION
-
-
-# ----------------------------
 # Helpers: file read (stream + cap)
 # ----------------------------
 async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
@@ -133,7 +122,7 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
-        "orig": UPLOAD_DIR / f"{session_id}_orig.png",  # always original (square canvas)
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",  # original square canvas (editor)
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",  # current working (after AI or edits)
     }
 
@@ -165,58 +154,56 @@ def _pil_open_safe(data: bytes) -> Image.Image:
         raise ValueError("bad_image")
 
 
+def _pil_to_png_bytes(img: Image.Image) -> bytes:
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
 # ----------------------------
-# Background removal + refine
+# PhotoRoom BG removal
 # ----------------------------
-def _refine_alpha_edges(img: Image.Image, shrink_px: int = 1, feather_px: int = 1) -> Image.Image:
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return img
+def _photoroom_remove_bg(img: Image.Image) -> Image.Image:
+    """
+    Uses PhotoRoom Remove Background API (remove.bg compatible endpoint).
+    Returns RGBA image with transparency.
+    """
+    if not PHOTOROOM_API_KEY:
+        raise RuntimeError("PHOTOROOM_API_KEY not set")
 
-    rgba = np.array(img, dtype=np.uint8)
-    if rgba.ndim != 3 or rgba.shape[2] != 4:
-        return img
+    # Work on a smaller version for the editor to keep it fast
+    work = _scale_to_fit(img.convert("RGBA"), PHOTOROOM_MAX_DIM)
 
-    a = rgba[:, :, 3]
-    if shrink_px > 0:
-        k = max(1, int(shrink_px))
-        kernel = np.ones((k, k), np.uint8)
-        a = cv2.erode(a, kernel, iterations=1)
+    png_bytes = _pil_to_png_bytes(work)
 
-    if feather_px > 0:
-        k = max(1, int(feather_px) * 2 + 1)
-        a = cv2.GaussianBlur(a, (k, k), 0)
+    headers = {"x-api-key": PHOTOROOM_API_KEY}
 
-    rgba[:, :, 3] = a.clip(0, 255).astype("uint8")
-    return Image.fromarray(rgba, mode="RGBA")
+    # remove.bg-compatible multipart fields:
+    # image_file=@file, plus crop/bg_color/format/size
+    files = {"image_file": ("image.png", png_bytes, "image/png")}
+    data = {
+        "crop": "true" if PHOTOROOM_CROP else "false",
+        "format": PHOTOROOM_FORMAT,
+        "size": PHOTOROOM_SIZE,
+        # bg_color omitted on purpose (we want transparency PNG)
+    }
 
+    r = requests.post(
+        PHOTOROOM_ENDPOINT,
+        headers=headers,
+        files=files,
+        data=data,
+        timeout=PHOTOROOM_TIMEOUT,
+    )
 
-def _rembg_remove(img: Image.Image, detail_safe: bool = True) -> Image.Image:
-    from rembg import remove
+    if r.status_code != 200:
+        # include small snippet for debugging (don’t explode logs)
+        snippet = (r.text or "")[:500]
+        raise RuntimeError(f"PhotoRoom failed ({r.status_code}): {snippet}")
 
-    if detail_safe:
-        out = remove(img, session=get_rembg_session(), alpha_matting=False)
-    else:
-        out = remove(
-            img,
-            session=get_rembg_session(),
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=10,
-        )
-
-    if isinstance(out, (bytes, bytearray)):
-        out_img = Image.open(BytesIO(out)).convert("RGBA")
-    else:
-        out_img = out.convert("RGBA")
-
-    if EDGE_REFINE:
-        out_img = _refine_alpha_edges(out_img, EDGE_SHRINK_PX, EDGE_FEATHER_PX)
-
-    return out_img
+    # Response is the binary image
+    out = Image.open(BytesIO(r.content)).convert("RGBA")
+    return out
 
 
 # ----------------------------
@@ -254,7 +241,7 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
 # ----------------------------
 # Async “upload then process” worker
 # ----------------------------
-def _bg_process_session(session_id: str, detail_safe: bool):
+def _bg_process_session(session_id: str):
     try:
         _sess_set(session_id, status="processing", started_at=time.time())
         p = _paths(session_id)
@@ -265,13 +252,20 @@ def _bg_process_session(session_id: str, detail_safe: bool):
 
         orig_sq = Image.open(p["orig"]).convert("RGBA")
 
-        work = _scale_to_fit(orig_sq, REMBG_MAX_DIM)
-        removed = _rembg_remove(work, detail_safe=detail_safe)
+        # PhotoRoom returns the cutout; then we upscale into editor canvas size
+        removed = _photoroom_remove_bg(orig_sq)
         removed_sq = removed.resize((EDITOR_PX, EDITOR_PX), Image.LANCZOS)
 
         _save_png(removed_sq, p["curr"])
         _sess_set(session_id, status="ready", finished_at=time.time())
     except Exception as e:
+        # If PhotoRoom fails, do NOT brick the session — user can still edit original
+        try:
+            p = _paths(session_id)
+            if p["orig"].exists():
+                _save_png(Image.open(p["orig"]).convert("RGBA"), p["curr"])
+        except Exception:
+            pass
         _sess_set(session_id, status="failed", error=str(e), finished_at=time.time())
 
 
@@ -303,7 +297,6 @@ def session_status(session_id: str):
 async def upload_image(
     file: UploadFile = File(...),
     keep_original: bool = Query(False),
-    detail_safe: bool = Query(True),
 ):
     try:
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
@@ -336,7 +329,7 @@ async def upload_image(
     _sess_set(session_id, status="ready" if keep_original else "queued", created_at=time.time())
 
     if not keep_original:
-        t = threading.Thread(target=_bg_process_session, args=(session_id, detail_safe), daemon=True)
+        t = threading.Thread(target=_bg_process_session, args=(session_id,), daemon=True)
         t.start()
 
     return {
@@ -591,7 +584,7 @@ def job_status(job_id: str):
 
 
 # ----------------------------
-# UI (FIXED: real uploader JS included)
+# UI (same UI; detailSafe removed from backend now but we keep the checkbox without breaking)
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
@@ -690,7 +683,7 @@ def ui(
 
       <div class="row" style="margin-top:12px;">
         <label class="pill"><input type="checkbox" id="keepOriginal"> Keep original (skip AI)</label>
-        <label class="pill"><input type="checkbox" id="detailSafe" checked> Keep tiny details (stars/text)</label>
+        <label class="pill" style="opacity:.6;"><input type="checkbox" id="detailSafe" checked disabled> Detail-safe (auto)</label>
       </div>
 
       <div class="statusline" id="statusline1"></div>
@@ -730,7 +723,6 @@ def ui(
 
   const fileEl = document.getElementById('file');
   const keepOriginalEl = document.getElementById('keepOriginal');
-  const detailSafeEl = document.getElementById('detailSafe');
 
   const step1 = document.getElementById('step1');
   const step3 = document.getElementById('step3');
@@ -759,7 +751,6 @@ def ui(
   const SLOT = params.get('slot') || 'main';
   const RETURN_TO = params.get('return_to') || '';
 
-  // Selecting the SAME file twice should still trigger.
   fileEl.addEventListener('click', () => { fileEl.value = ""; });
 
   function saveState() {
@@ -981,10 +972,9 @@ def ui(
     fd.append('file', f);
 
     const keep = keepOriginalEl.checked ? 'true' : 'false';
-    const detailSafe = detailSafeEl.checked ? 'true' : 'false';
 
     try{
-      const r = await fetch(`${API_BASE}/upload?keep_original=${keep}&detail_safe=${detailSafe}`, {
+      const r = await fetch(`${API_BASE}/upload?keep_original=${keep}`, {
         method:'POST',
         body: fd,
         cache: "no-store"
@@ -1001,12 +991,10 @@ def ui(
 
       sessionId = j.session_id;
 
-      // Load original immediately (fast)
       await new Promise(res => { origImg.onload=res; origImg.src=`${API_BASE}/original/${sessionId}?t=${Date.now()}`; });
       ctx.clearRect(0,0,cv.width,cv.height);
       ctx.drawImage(origImg,0,0,cv.width,cv.height);
 
-      // curr starts as orig; if AI is running, it will swap later
       currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
 
       updateCursorSize();
@@ -1023,7 +1011,6 @@ def ui(
     }
   }
 
-  // Embedded contexts sometimes fire input but not change; listen to both.
   fileEl.addEventListener('change', handlePickedFile);
   fileEl.addEventListener('input', handlePickedFile);
 
