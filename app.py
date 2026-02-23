@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.5.1")  # bumped
+app = FastAPI(title="Studio Uploader", version="1.5.0")  # bumped
 
 
 # ----------------------------
@@ -48,9 +48,6 @@ TARGET_PX = int(os.getenv("TARGET_PX", "3000"))
 EDITOR_PX = int(os.getenv("EDITOR_PX", "1200"))  # smaller = faster UI
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-# Client-side safety: if a file is too large, we auto-downscale before uploading.
-CLIENT_MAX_DIM = int(os.getenv("CLIENT_MAX_DIM", "2400"))
 
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 
@@ -305,17 +302,14 @@ async def upload_image(
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
     except ValueError as e:
         if str(e) == "too_large":
-            return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB). Try a smaller file."}, status_code=413)
+            return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
         return JSONResponse({"error": "Upload read failed"}, status_code=400)
 
     try:
         img = _pil_open_safe(data)
     except ValueError as e:
         if str(e) == "too_many_pixels":
-            return JSONResponse(
-                {"error": "Image resolution too large. Please upload a smaller image (or take a screenshot of the logo)."},
-                status_code=413,
-            )
+            return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
         return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
     except Exception:
         return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
@@ -398,7 +392,6 @@ def _run_shopify_provision_job(
     storefront_handle: str,
     owner_customer_id: str,
     type_of_store: Optional[str],
-    primary_color: Optional[str],
     main_session_id: str,
     secondary_session_id: Optional[str],
 ):
@@ -425,13 +418,8 @@ def _run_shopify_provision_job(
 
     if secondary_session_id:
         cmd += ["--secondary_session_id", secondary_session_id]
-
     if type_of_store:
         cmd += ["--type_of_store", type_of_store]
-
-    # ✅ FIX #1: pass primary_color through to shopify_provision.py
-    if primary_color:
-        cmd += ["--primary_color", primary_color]
 
     print("🚀 Provision cmd:", " ".join(cmd))
 
@@ -489,10 +477,6 @@ async def storefront_request(
     org_type: str = Form(None),
     military_branch: str = Form(None),
     sport_type: str = Form(None),
-
-    # ✅ FIX #1 (front half): accept primary_color from Shopify form
-    primary_color: Optional[str] = Form(None),
-
     main_session_id: Optional[str] = Form(None),
     secondary_session_id: Optional[str] = Form(None),
     storefront_logo_file: Optional[UploadFile] = File(None),
@@ -506,15 +490,7 @@ async def storefront_request(
         return JSONResponse({"error": "customer_id is required"}, status_code=400)
 
     owner_customer_id = customer_id.split("/")[-1].strip()
-
-    # Keep your existing behavior (works), but normalize it.
-    type_of_store = (org_type or "").strip() or None
-
-    # ✅ normalize primary_color so it’s never empty/null downstream
-    pc = (primary_color or "").strip()
-    if not pc:
-        pc = "No preference"
-    primary_color = pc
+    type_of_store = (org_type or military_branch or sport_type or "").strip() or None
 
     if not main_session_id:
         if not storefront_logo_file:
@@ -586,23 +562,12 @@ async def storefront_request(
         main_session_id=main_session_id,
         secondary_session_id=secondary_session_id,
         customer_email=customer_email,
-        type_of_store=type_of_store,
-        primary_color=primary_color,
         created_at=time.time(),
     )
 
     t = threading.Thread(
         target=_run_shopify_provision_job,
-        args=(
-            job_id,
-            storefront_name,
-            storefront_handle,
-            owner_customer_id,
-            type_of_store,
-            primary_color,  # ✅ FIX #1 (back half): forward into provisioning cmd
-            main_session_id,
-            secondary_session_id,
-        ),
+        args=(job_id, storefront_name, storefront_handle, owner_customer_id, type_of_store, main_session_id, secondary_session_id),
         daemon=True,
     )
     t.start()
@@ -619,7 +584,7 @@ def job_status(job_id: str):
 
 
 # ----------------------------
-# UI (same UI; we add client-side auto-downscale to reduce 413s)
+# UI (same UI; detailSafe removed from backend now but we keep the checkbox without breaking)
 # ----------------------------
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
@@ -714,9 +679,6 @@ def ui(
         <div style="font-size:32px;">🪄</div>
         <div style="font-weight:900; margin-top:8px;">Upload logo</div>
         <div class="muted" style="margin-top:6px;">Opens instantly. AI cutout loads in the background.</div>
-        <div class="muted" style="margin-top:8px; opacity:.85;">
-          Max upload: <b>__MAX_UPLOAD_MB__MB</b>. If your file is bigger, we’ll auto-shrink it.
-        </div>
       </div>
 
       <div class="row" style="margin-top:12px;">
@@ -752,11 +714,6 @@ def ui(
 
 <script>
   const API_BASE = window.location.origin;
-
-  // ✅ server-config (injected)
-  const MAX_UPLOAD_MB = __MAX_UPLOAD_MB__;
-  const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-  const CLIENT_MAX_DIM = __CLIENT_MAX_DIM__;
 
   let sessionId = null;
   let mode = 'restore';
@@ -1001,67 +958,11 @@ def ui(
     statusline.textContent = "AI cutout taking longer — you can still finish with original.";
   }
 
-  // ✅ FIX #2: if file is huge, auto-downscale BEFORE upload to avoid 413
-  async function maybeDownscaleFile(file) {
-    if (!file) return file;
-    if (file.size <= MAX_UPLOAD_BYTES) return file;
-
-    statusline1.textContent = `File is large (${Math.round(file.size/1024/1024)}MB). Auto-shrinking…`;
-
-    // Load image in browser
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    await new Promise((res, rej) => { img.onload=res; img.onerror=rej; img.src=url; });
-
-    const w = img.naturalWidth || 0;
-    const h = img.naturalHeight || 0;
-    URL.revokeObjectURL(url);
-
-    if (!w || !h) return file;
-
-    const maxDim = CLIENT_MAX_DIM;
-    const scale = Math.min(1, maxDim / Math.max(w, h));
-    const newW = Math.max(1, Math.round(w * scale));
-    const newH = Math.max(1, Math.round(h * scale));
-
-    const c = document.createElement('canvas');
-    c.width = newW;
-    c.height = newH;
-    const cctx = c.getContext('2d');
-    cctx.drawImage(img, 0, 0, newW, newH);
-
-    // WebP is usually MUCH smaller than PNG for photos/screenshots
-    const blob = await new Promise((res) => c.toBlob(res, 'image/webp', 0.92));
-    if (!blob) return file;
-
-    if (blob.size > MAX_UPLOAD_BYTES) {
-      // try slightly smaller quality if still too big
-      const blob2 = await new Promise((res) => c.toBlob(res, 'image/webp', 0.84));
-      if (blob2 && blob2.size <= MAX_UPLOAD_BYTES) {
-        return new File([blob2], "upload.webp", { type: "image/webp" });
-      }
-      // still too large
-      return file;
-    }
-
-    return new File([blob], "upload.webp", { type: "image/webp" });
-  }
-
   async function handlePickedFile() {
-    let f = fileEl.files && fileEl.files[0];
+    const f = fileEl.files && fileEl.files[0];
     if(!f) return;
 
-    statusline1.textContent = "Preparing…";
-
-    // ✅ auto-shrink if needed
-    const originalSize = f.size;
-    f = await maybeDownscaleFile(f);
-
-    if (f.size > MAX_UPLOAD_BYTES) {
-      alert(`That file is too large to upload (max ${MAX_UPLOAD_MB}MB). Please choose a smaller file.`);
-      location.reload();
-      return;
-    }
+    statusline1.textContent = "Uploading…";
 
     step1.style.display='none';
     step3.style.display='block';
@@ -1104,12 +1005,6 @@ def ui(
       } else {
         statusline.textContent = "Using original (AI skipped)";
       }
-
-      if (originalSize !== f.size) {
-        statusline.textContent = `Optimized upload (${Math.round(originalSize/1024/1024)}MB → ${Math.round(f.size/1024/1024)}MB)`;
-        setTimeout(() => { /* no-op */ }, 1);
-      }
-
     }catch(err){
       alert(err.message || "Upload failed");
       location.reload();
@@ -1158,10 +1053,4 @@ def ui(
 </script>
 </body>
 </html>"""
-
-    # Inject server settings into the static HTML
-    html = (
-        html.replace("__MAX_UPLOAD_MB__", str(MAX_UPLOAD_MB))
-            .replace("__CLIENT_MAX_DIM__", str(CLIENT_MAX_DIM))
-    )
     return HTMLResponse(content=html)
