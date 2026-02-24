@@ -522,6 +522,9 @@ def metaobject_upsert_custom_shop(
     }
     """
 
+    # ✅ ONLY CHANGE: normalize primary_color so we ALWAYS write something (prevents null)
+    primary_color_value = (primary_color or "").strip() or "No preference"
+
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
@@ -529,6 +532,9 @@ def metaobject_upsert_custom_shop(
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
+
+        # ✅ ONLY CHANGE: always include primary_color field
+        {"key": "primary_color", "value": primary_color_value},
     ]
 
     if secondary_logo_file_gid:
@@ -536,12 +542,6 @@ def metaobject_upsert_custom_shop(
 
     if type_of_store:
         fields.append({"key": "type_of_store", "value": type_of_store})
-
-    # Optional: single-line-text field in the metaobject definition
-    if primary_color:
-        pc = (primary_color or "").strip()
-        if pc:
-            fields.append({"key": "primary_color", "value": pc})
 
     variables = {
         "handle": {"type": METAOBJECT_TYPE, "handle": handle},
@@ -597,9 +597,13 @@ def provision(
 
     tag_value = handle
 
+    # ✅ ONLY CHANGE: normalize primary_color for logs/payloads (consistent with metaobject)
+    primary_color_value = (primary_color or "").strip() or "No preference"
+
     print(f"🧩 Provisioning handle: {handle}")
     print(f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} {_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}")
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
+    print(f"🎨 primary_color (normalized): {repr(primary_color_value)}")
 
     # 1) Upload main logo
     main_png = read_session_png(uploads_dir, main_session_id)
@@ -662,7 +666,7 @@ def provision(
         secondary_logo_file_gid=secondary_file_gid,
         type_of_store=type_of_store,
         is_fully_ready=True,
-        primary_color=primary_color,
+        primary_color=primary_color_value,  # ✅ ONLY CHANGE: always normalized
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
@@ -680,7 +684,9 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
-        "primary_color": (primary_color or "").strip() or None,
+
+        # ✅ ONLY CHANGE: always send normalized string (not None)
+        "primary_color": primary_color_value,
     }
     trigger_studio_automation(automation_payload)
     print("🚀 Studio Automation triggered successfully")
@@ -694,7 +700,10 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
-        "primary_color": (primary_color or "").strip() or None,
+
+        # ✅ ONLY CHANGE: return normalized string (not None)
+        "primary_color": primary_color_value,
+
         "customer_tags_added": [admin_tag, member_tag],
     }
 
@@ -718,7 +727,9 @@ def main():
 
     secondary_session_id = args.secondary_session_id.strip() or None
     type_of_store = args.type_of_store.strip() or None
-    primary_color = args.primary_color.strip() or None
+
+    # ✅ ONLY CHANGE: normalize here too (so metaobject always gets a value)
+    primary_color = args.primary_color.strip() or "No preference"
 
     result = provision(
         storefront_name=args.name.strip(),

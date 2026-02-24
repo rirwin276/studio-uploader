@@ -392,6 +392,7 @@ def _run_shopify_provision_job(
     storefront_handle: str,
     owner_customer_id: str,
     type_of_store: Optional[str],
+    primary_color: Optional[str],  # ✅ PRIMARY COLOR FIX
     main_session_id: str,
     secondary_session_id: Optional[str],
 ):
@@ -420,6 +421,10 @@ def _run_shopify_provision_job(
         cmd += ["--secondary_session_id", secondary_session_id]
     if type_of_store:
         cmd += ["--type_of_store", type_of_store]
+
+    # ✅ PRIMARY COLOR FIX: pass it as a CLI arg (never None/empty)
+    if primary_color:
+        cmd += ["--primary_color", primary_color]
 
     print("🚀 Provision cmd:", " ".join(cmd))
 
@@ -477,6 +482,10 @@ async def storefront_request(
     org_type: str = Form(None),
     military_branch: str = Form(None),
     sport_type: str = Form(None),
+
+    # ✅ PRIMARY COLOR FIX: accept the field from the form
+    primary_color: Optional[str] = Form(None),
+
     main_session_id: Optional[str] = Form(None),
     secondary_session_id: Optional[str] = Form(None),
     storefront_logo_file: Optional[UploadFile] = File(None),
@@ -491,6 +500,10 @@ async def storefront_request(
 
     owner_customer_id = customer_id.split("/")[-1].strip()
     type_of_store = (org_type or military_branch or sport_type or "").strip() or None
+
+    # ✅ PRIMARY COLOR FIX: normalize (never allow None/empty to pass through)
+    primary_color_norm = (primary_color or "").strip() or "No preference"
+    print("🎨 primary_color received:", repr(primary_color), "-> normalized:", repr(primary_color_norm))
 
     if not main_session_id:
         if not storefront_logo_file:
@@ -562,12 +575,25 @@ async def storefront_request(
         main_session_id=main_session_id,
         secondary_session_id=secondary_session_id,
         customer_email=customer_email,
+
+        # ✅ PRIMARY COLOR FIX: store on the job for visibility/debugging
+        primary_color=primary_color_norm,
+
         created_at=time.time(),
     )
 
     t = threading.Thread(
         target=_run_shopify_provision_job,
-        args=(job_id, storefront_name, storefront_handle, owner_customer_id, type_of_store, main_session_id, secondary_session_id),
+        args=(
+            job_id,
+            storefront_name,
+            storefront_handle,
+            owner_customer_id,
+            type_of_store,
+            primary_color_norm,  # ✅ PRIMARY COLOR FIX
+            main_session_id,
+            secondary_session_id,
+        ),
         daemon=True,
     )
     t.start()
