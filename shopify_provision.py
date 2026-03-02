@@ -8,6 +8,7 @@
 # - Upserts custom_shop metaobject with required fields (+ optional primary_color)
 # - Publishes collection to all publications
 # - Triggers Studio Automation ALWAYS (required)
+# - Triggers Printful Automation (optional but enabled via env)
 #
 # IMPORTANT: This file matches the app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
@@ -17,6 +18,14 @@
 #    Type is only provided in MetaobjectHandleInput ("handle" variable).
 # 2) customer tagging adds BOTH admin+member tags.
 # 3) smart collection rule enums forced to TAG/EQUALS etc.
+#
+# NEW: Printful Automation trigger
+# - Set env PRINTFUL_AUTOMATION_URL to enable (recommended):
+#     PRINTFUL_AUTOMATION_URL=https://printfulautomation-production.up.railway.app/run
+# - Optional bearer:
+#     PRINTFUL_AUTOMATION_TOKEN=...
+
+from __future__ import annotations
 
 import os
 import re
@@ -30,7 +39,7 @@ import requests
 
 
 # -----------------------------
-# ENV REQUIRED
+# ENV
 # -----------------------------
 def env_get(name: str, required: bool = True, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
@@ -40,17 +49,21 @@ def env_get(name: str, required: bool = True, default: Optional[str] = None) -> 
 
 
 SHOP = env_get("SHOP", required=True)  # e.g. stellaandsage.myshopify.com
-API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2025-01
+API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2026-01
 ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
 
-# REQUIRED: always called (your whole point)
+# REQUIRED: always called
 STUDIO_AUTOMATION_URL = env_get("STUDIO_AUTOMATION_URL", required=True)
 STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # optional bearer token
+
+# OPTIONAL: Printful Automation (enabled if URL is set)
+PRINTFUL_AUTOMATION_URL = os.getenv("PRINTFUL_AUTOMATION_URL", "").strip()
+PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
 COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
 
-# Smart collection rule config (Shopify expects ENUMS, not lowercase strings)
+# Smart collection rule config (Shopify expects ENUMS)
 COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()           # TAG / TITLE / ...
 COLLECTION_RULE_RELATION = os.getenv("COLLECTION_RULE_RELATION", "EQUALS").strip()  # EQUALS / CONTAINS / ...
 
@@ -60,6 +73,9 @@ PUBLISH_RETRY_S = float(os.getenv("PUBLISH_RETRY_S", "1.5"))
 PUBLISH_RETRY_MAX = int(os.getenv("PUBLISH_RETRY_MAX", "5"))
 
 
+# -----------------------------
+# Shopify GraphQL
+# -----------------------------
 def shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
     url = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
     headers = {
@@ -166,7 +182,7 @@ def customer_add_tags(customer_gid: str, new_tags: List[str]) -> None:
     - Adds new tags if missing
     - Updates customer with merged tags (never deletes old tags)
     """
-    cleaned = []
+    cleaned: List[str] = []
     for t in (new_tags or []):
         t2 = (t or "").strip()
         if t2:
@@ -522,7 +538,6 @@ def metaobject_upsert_custom_shop(
     }
     """
 
-    # ✅ ONLY CHANGE: normalize primary_color so we ALWAYS write something (prevents null)
     primary_color_value = (primary_color or "").strip() or "No preference"
 
     fields = [
@@ -532,8 +547,6 @@ def metaobject_upsert_custom_shop(
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
-
-        # ✅ ONLY CHANGE: always include primary_color field
         {"key": "primary_color", "value": primary_color_value},
     ]
 
@@ -563,19 +576,53 @@ def metaobject_upsert_custom_shop(
 
 
 # -----------------------------
-# Studio Automation trigger (REQUIRED)
+# Triggers
 # -----------------------------
-def trigger_studio_automation(payload: Dict[str, Any]) -> None:
+def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> requests.Response:
     headers = {"Content-Type": "application/json"}
-    if STUDIO_AUTOMATION_TOKEN:
-        headers["Authorization"] = f"Bearer {STUDIO_AUTOMATION_TOKEN}"
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    return requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
 
-    r = requests.post(STUDIO_AUTOMATION_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+
+def trigger_studio_automation(payload: Dict[str, Any]) -> None:
+    r = _post_json(STUDIO_AUTOMATION_URL, payload, bearer_token=STUDIO_AUTOMATION_TOKEN)
     if r.status_code >= 300:
         raise RuntimeError(
             f"Studio Automation trigger failed: HTTP {r.status_code}\n"
+            f"URL: {STUDIO_AUTOMATION_URL}\n"
             f"Response: {r.text[:2000]}"
         )
+
+
+def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> None:
+    """
+    Enabled if PRINTFUL_AUTOMATION_URL is set.
+    Expecting Printful Automation service has endpoint:
+      POST /run  JSON: {"store_handle":"...","type_of_store":"...","primary_color":"..."}
+    """
+    if not PRINTFUL_AUTOMATION_URL:
+        print("ℹ️ PRINTFUL_AUTOMATION_URL not set — skipping Printful automation trigger.")
+        return
+
+    payload = {
+        "store_handle": store_handle,
+        "type_of_store": type_of_store or "",
+        "primary_color": primary_color or "",
+    }
+
+    r = _post_json(PRINTFUL_AUTOMATION_URL, payload, bearer_token=PRINTFUL_AUTOMATION_TOKEN)
+    if r.status_code >= 300:
+        raise RuntimeError(
+            f"Printful Automation trigger failed: HTTP {r.status_code}\n"
+            f"URL: {PRINTFUL_AUTOMATION_URL}\n"
+            f"Response: {r.text[:2000]}"
+        )
+
+    try:
+        print("🧵 Printful Automation response:", r.json())
+    except Exception:
+        print("🧵 Printful Automation response (text):", r.text[:500])
 
 
 # -----------------------------
@@ -596,14 +643,17 @@ def provision(
         handle = slugify_handle(storefront_name)
 
     tag_value = handle
-
-    # ✅ ONLY CHANGE: normalize primary_color for logs/payloads (consistent with metaobject)
     primary_color_value = (primary_color or "").strip() or "No preference"
 
     print(f"🧩 Provisioning handle: {handle}")
-    print(f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} {_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}")
+    print(f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} "
+          f"{_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}")
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
     print(f"🎨 primary_color (normalized): {repr(primary_color_value)}")
+    if PRINTFUL_AUTOMATION_URL:
+        print(f"🧵 Printful Automation enabled: {PRINTFUL_AUTOMATION_URL}")
+    else:
+        print("🧵 Printful Automation disabled (PRINTFUL_AUTOMATION_URL not set).")
 
     # 1) Upload main logo
     main_png = read_session_png(uploads_dir, main_session_id)
@@ -614,7 +664,7 @@ def provision(
     )
     print("✅ Main logo uploaded:", main_file_gid, main_file_url)
 
-    # 2) Upload secondary logo (optional) — SAFE
+    # 2) Upload secondary logo (optional)
     secondary_file_gid = None
     secondary_file_url = None
     if secondary_session_id:
@@ -632,7 +682,7 @@ def provision(
         except Exception as e:
             print("⚠️ Secondary logo failed — skipping:", str(e))
 
-    # 3) Create or update collection (smart collection via ruleSet)
+    # 3) Create or update collection
     existing = collection_by_handle(handle)
     if existing:
         collection_gid = existing["id"]
@@ -648,13 +698,13 @@ def provision(
     publish_to_all_publications(collection_gid)
     print("✅ Collection published to all publications")
 
-    # 5) Customer GID + MERGE-SAFE tagging
+    # 5) Customer tags
     owner_customer_gid = ensure_gid_customer(owner_customer_id)
     admin_tag = f"storefront-admin--{handle}"
     member_tag = f"storefront-member--{handle}"
     customer_add_tags(owner_customer_gid, [admin_tag, member_tag])
 
-    # 6) Upsert metaobject custom_shop (fills ALL required fields)
+    # 6) Upsert metaobject
     owner_customer_id_text = normalize_customer_id_value(owner_customer_id)
     metaobject_id = metaobject_upsert_custom_shop(
         handle=handle,
@@ -666,7 +716,7 @@ def provision(
         secondary_logo_file_gid=secondary_file_gid,
         type_of_store=type_of_store,
         is_fully_ready=True,
-        primary_color=primary_color_value,  # ✅ ONLY CHANGE: always normalized
+        primary_color=primary_color_value,
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
@@ -684,12 +734,18 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
-
-        # ✅ ONLY CHANGE: always send normalized string (not None)
         "primary_color": primary_color_value,
     }
     trigger_studio_automation(automation_payload)
     print("🚀 Studio Automation triggered successfully")
+
+    # 8) Trigger Printful Automation (enabled via env)
+    trigger_printful_automation(
+        store_handle=handle,
+        type_of_store=(type_of_store or ""),
+        primary_color=primary_color_value,
+    )
+    print("🧵 Printful Automation trigger complete")
 
     return {
         "handle": handle,
@@ -700,11 +756,9 @@ def provision(
         "secondary_logo_file_gid": secondary_file_gid,
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
-
-        # ✅ ONLY CHANGE: return normalized string (not None)
         "primary_color": primary_color_value,
-
         "customer_tags_added": [admin_tag, member_tag],
+        "printful_automation_url": PRINTFUL_AUTOMATION_URL or "",
     }
 
 
@@ -727,8 +781,6 @@ def main():
 
     secondary_session_id = args.secondary_session_id.strip() or None
     type_of_store = args.type_of_store.strip() or None
-
-    # ✅ ONLY CHANGE: normalize here too (so metaobject always gets a value)
     primary_color = args.primary_color.strip() or "No preference"
 
     result = provision(
