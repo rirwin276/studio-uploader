@@ -8,22 +8,10 @@
 # - Upserts custom_shop metaobject with required fields (+ optional primary_color)
 # - Publishes collection to all publications
 # - Triggers Studio Automation ALWAYS (required)
-# - Triggers Printful Automation (optional but enabled via env)
+# - Triggers Printful Automation (hardcoded URL)
 #
 # IMPORTANT: This file matches the app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
-#
-# Key FIXES:
-# 1) metaobjectUpsert: MetaobjectUpsertInput DOES NOT accept "type" field -> remove it.
-#    Type is only provided in MetaobjectHandleInput ("handle" variable).
-# 2) customer tagging adds BOTH admin+member tags.
-# 3) smart collection rule enums forced to TAG/EQUALS etc.
-#
-# NEW: Printful Automation trigger
-# - Set env PRINTFUL_AUTOMATION_URL to enable (recommended):
-#     PRINTFUL_AUTOMATION_URL=https://printfulautomation-production.up.railway.app/run
-# - Optional bearer:
-#     PRINTFUL_AUTOMATION_TOKEN=...
 
 from __future__ import annotations
 
@@ -56,8 +44,8 @@ ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
 STUDIO_AUTOMATION_URL = env_get("STUDIO_AUTOMATION_URL", required=True)
 STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
-# OPTIONAL: Printful Automation (enabled if URL is set)
-PRINTFUL_AUTOMATION_URL = os.getenv("PRINTFUL_AUTOMATION_URL", "").strip()
+# ✅ HARD-CODED: Printful Automation endpoint (no env required)
+PRINTFUL_AUTOMATION_URL = "https://printfulautomation-production.up.railway.app/run"
 PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
@@ -558,9 +546,7 @@ def metaobject_upsert_custom_shop(
 
     variables = {
         "handle": {"type": METAOBJECT_TYPE, "handle": handle},
-        "metaobject": {
-            "fields": fields,
-        }
+        "metaobject": {"fields": fields},
     }
 
     data = shopify_graphql(q, variables)
@@ -597,14 +583,9 @@ def trigger_studio_automation(payload: Dict[str, Any]) -> None:
 
 def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> None:
     """
-    Enabled if PRINTFUL_AUTOMATION_URL is set.
-    Expecting Printful Automation service has endpoint:
+    Calls hardcoded Printful Automation service endpoint:
       POST /run  JSON: {"store_handle":"...","type_of_store":"...","primary_color":"..."}
     """
-    if not PRINTFUL_AUTOMATION_URL:
-        print("ℹ️ PRINTFUL_AUTOMATION_URL not set — skipping Printful automation trigger.")
-        return
-
     payload = {
         "store_handle": store_handle,
         "type_of_store": type_of_store or "",
@@ -646,14 +627,13 @@ def provision(
     primary_color_value = (primary_color or "").strip() or "No preference"
 
     print(f"🧩 Provisioning handle: {handle}")
-    print(f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} "
-          f"{_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}")
+    print(
+        f"🏷️ Collection tag rule: {_normalize_rule_enum(COLLECTION_RULE_FIELD,'column')} "
+        f"{_normalize_rule_enum(COLLECTION_RULE_RELATION,'relation')} {tag_value}"
+    )
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
     print(f"🎨 primary_color (normalized): {repr(primary_color_value)}")
-    if PRINTFUL_AUTOMATION_URL:
-        print(f"🧵 Printful Automation enabled: {PRINTFUL_AUTOMATION_URL}")
-    else:
-        print("🧵 Printful Automation disabled (PRINTFUL_AUTOMATION_URL not set).")
+    print(f"🧵 Printful Automation URL (hardcoded): {PRINTFUL_AUTOMATION_URL}")
 
     # 1) Upload main logo
     main_png = read_session_png(uploads_dir, main_session_id)
@@ -739,7 +719,7 @@ def provision(
     trigger_studio_automation(automation_payload)
     print("🚀 Studio Automation triggered successfully")
 
-    # 8) Trigger Printful Automation (enabled via env)
+    # 8) Trigger Printful Automation (hardcoded)
     trigger_printful_automation(
         store_handle=handle,
         type_of_store=(type_of_store or ""),
@@ -758,7 +738,7 @@ def provision(
         "type_of_store": type_of_store,
         "primary_color": primary_color_value,
         "customer_tags_added": [admin_tag, member_tag],
-        "printful_automation_url": PRINTFUL_AUTOMATION_URL or "",
+        "printful_automation_url": PRINTFUL_AUTOMATION_URL,
     }
 
 
