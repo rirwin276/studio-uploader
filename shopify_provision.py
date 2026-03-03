@@ -7,8 +7,7 @@
 #     storefront-member--{handle}
 # - Upserts custom_shop metaobject with required fields (+ optional primary_color)
 # - Publishes collection to all publications
-# - Triggers Studio Automation ALWAYS (required)
-# - Triggers Printful Automation (hardcoded URL)
+# - Triggers PRINTFUL Automation ONLY (hardcoded URL)
 #
 # IMPORTANT: This file matches the app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
@@ -40,12 +39,9 @@ SHOP = env_get("SHOP", required=True)  # e.g. stellaandsage.myshopify.com
 API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2026-01
 ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
 
-# REQUIRED: always called
-STUDIO_AUTOMATION_URL = env_get("STUDIO_AUTOMATION_URL", required=True)
-STUDIO_AUTOMATION_TOKEN = os.getenv("STUDIO_AUTOMATION_TOKEN", "").strip()  # optional bearer token
-
 # ✅ HARD-CODED: Printful Automation endpoint (no env required)
-PRINTFUL_AUTOMATION_URL = "https://printfulautomation-production.up.railway.app/run"
+# NOTE: this matches what you set in Railway: /trigger_automation
+PRINTFUL_AUTOMATION_URL = "https://printfulautomation-production.up.railway.app/trigger_automation"
 PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
@@ -562,7 +558,7 @@ def metaobject_upsert_custom_shop(
 
 
 # -----------------------------
-# Triggers
+# Trigger: Printful Automation ONLY
 # -----------------------------
 def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> requests.Response:
     headers = {"Content-Type": "application/json"}
@@ -571,21 +567,7 @@ def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> req
     return requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
 
 
-def trigger_studio_automation(payload: Dict[str, Any]) -> None:
-    r = _post_json(STUDIO_AUTOMATION_URL, payload, bearer_token=STUDIO_AUTOMATION_TOKEN)
-    if r.status_code >= 300:
-        raise RuntimeError(
-            f"Studio Automation trigger failed: HTTP {r.status_code}\n"
-            f"URL: {STUDIO_AUTOMATION_URL}\n"
-            f"Response: {r.text[:2000]}"
-        )
-
-
 def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> None:
-    """
-    Calls hardcoded Printful Automation service endpoint:
-      POST /run  JSON: {"store_handle":"...","type_of_store":"...","primary_color":"..."}
-    """
     payload = {
         "store_handle": store_handle,
         "type_of_store": type_of_store or "",
@@ -700,26 +682,7 @@ def provision(
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
-    # 7) Trigger Studio Automation ALWAYS (required)
-    automation_payload = {
-        "store_handle": handle,
-        "collection_handle": handle,
-        "collection_gid": collection_gid,
-        "metaobject_type": METAOBJECT_TYPE,
-        "storefront_name": storefront_name,
-        "owner_customer_gid": owner_customer_gid,
-        "owner_customer_id": owner_customer_id_text,
-        "logo_file_gid": main_file_gid,
-        "logo_url": main_file_url,
-        "secondary_logo_file_gid": secondary_file_gid,
-        "secondary_logo_url": secondary_file_url,
-        "type_of_store": type_of_store,
-        "primary_color": primary_color_value,
-    }
-    trigger_studio_automation(automation_payload)
-    print("🚀 Studio Automation triggered successfully")
-
-    # 8) Trigger Printful Automation (hardcoded)
+    # 7) Trigger PRINTFUL Automation ONLY
     trigger_printful_automation(
         store_handle=handle,
         type_of_store=(type_of_store or ""),
