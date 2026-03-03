@@ -7,7 +7,7 @@
 #     storefront-member--{handle}
 # - Upserts custom_shop metaobject with required fields (+ optional primary_color)
 # - Publishes collection to all publications
-# - Triggers PRINTFUL Automation ONLY (hardcoded URL)
+# - Triggers Printful Automation ONLY (Studio Automation removed)
 #
 # IMPORTANT: This file matches the app.py subprocess contract:
 #   python shopify_provision.py --name ... --handle ... --owner_customer_id ... --main_session_id ... --uploads_dir ...
@@ -39,9 +39,8 @@ SHOP = env_get("SHOP", required=True)  # e.g. stellaandsage.myshopify.com
 API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2026-01
 ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
 
-# ✅ HARD-CODED: Printful Automation endpoint (no env required)
-# NOTE: this matches what you set in Railway: /trigger_automation
-PRINTFUL_AUTOMATION_URL = "https://printfulautomation-production.up.railway.app/trigger_automation"
+# ✅ Printful Automation (hardcoded base; we will try /run then /trigger_automation)
+PRINTFUL_AUTOMATION_BASE = "https://printfulautomation-production.up.railway.app"
 PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
@@ -558,7 +557,7 @@ def metaobject_upsert_custom_shop(
 
 
 # -----------------------------
-# Trigger: Printful Automation ONLY
+# Printful trigger ONLY
 # -----------------------------
 def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> requests.Response:
     headers = {"Content-Type": "application/json"}
@@ -567,25 +566,56 @@ def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> req
     return requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
 
 
-def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> None:
+def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> str:
+    """
+    Tries these endpoints in order:
+      1) /run
+      2) /trigger_automation
+    Returns the URL that succeeded.
+    """
     payload = {
         "store_handle": store_handle,
         "type_of_store": type_of_store or "",
         "primary_color": primary_color or "",
     }
 
-    r = _post_json(PRINTFUL_AUTOMATION_URL, payload, bearer_token=PRINTFUL_AUTOMATION_TOKEN)
-    if r.status_code >= 300:
-        raise RuntimeError(
-            f"Printful Automation trigger failed: HTTP {r.status_code}\n"
-            f"URL: {PRINTFUL_AUTOMATION_URL}\n"
-            f"Response: {r.text[:2000]}"
-        )
+    candidates = [
+        f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/run",
+        f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/trigger_automation",
+    ]
 
-    try:
-        print("🧵 Printful Automation response:", r.json())
-    except Exception:
-        print("🧵 Printful Automation response (text):", r.text[:500])
+    last_resp: Optional[requests.Response] = None
+
+    for url in candidates:
+        r = _post_json(url, payload, bearer_token=PRINTFUL_AUTOMATION_TOKEN)
+        last_resp = r
+
+        if r.status_code == 404:
+            print(f"⚠️ Printful endpoint not found (404): {url} — trying next…")
+            continue
+
+        if r.status_code >= 300:
+            raise RuntimeError(
+                f"Printful Automation trigger failed: HTTP {r.status_code}\n"
+                f"URL: {url}\n"
+                f"Response: {r.text[:2000]}"
+            )
+
+        try:
+            print("🧵 Printful Automation response:", r.json())
+        except Exception:
+            print("🧵 Printful Automation response (text):", r.text[:500])
+
+        print(f"✅ Printful Automation succeeded: {url}")
+        return url
+
+    # If we got here, everything 404'd
+    body = (last_resp.text[:2000] if last_resp is not None else "")
+    raise RuntimeError(
+        "Printful Automation trigger failed: all candidate endpoints returned 404.\n"
+        f"Tried: {', '.join(candidates)}\n"
+        f"Last response: {body}"
+    )
 
 
 # -----------------------------
@@ -615,7 +645,7 @@ def provision(
     )
     print(f"🎨 Template suffix: {COLLECTION_TEMPLATE_SUFFIX}")
     print(f"🎨 primary_color (normalized): {repr(primary_color_value)}")
-    print(f"🧵 Printful Automation URL (hardcoded): {PRINTFUL_AUTOMATION_URL}")
+    print(f"🧵 Printful Automation base: {PRINTFUL_AUTOMATION_BASE}")
 
     # 1) Upload main logo
     main_png = read_session_png(uploads_dir, main_session_id)
@@ -682,8 +712,8 @@ def provision(
     )
     print("✅ Metaobject upserted:", metaobject_id)
 
-    # 7) Trigger PRINTFUL Automation ONLY
-    trigger_printful_automation(
+    # 7) Trigger Printful Automation ONLY
+    used_printful_url = trigger_printful_automation(
         store_handle=handle,
         type_of_store=(type_of_store or ""),
         primary_color=primary_color_value,
@@ -701,7 +731,7 @@ def provision(
         "type_of_store": type_of_store,
         "primary_color": primary_color_value,
         "customer_tags_added": [admin_tag, member_tag],
-        "printful_automation_url": PRINTFUL_AUTOMATION_URL,
+        "printful_automation_url": used_printful_url,
     }
 
 
