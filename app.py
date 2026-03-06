@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + improved editor UX
+# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + polished editor UX
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import threading
 import subprocess
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import cv2
 import numpy as np
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.6.0")
+app = FastAPI(title="Studio Uploader", version="1.7.0")
 
 
 # ----------------------------
@@ -214,23 +214,10 @@ def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Ima
     return img.crop(bbox)
 
 
-def _fit_to_square_canvas(img: Image.Image, canvas_size: int) -> Image.Image:
-    trimmed = _trim_transparent_padding(img.convert("RGBA"), alpha_threshold=6)
-    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-
-    w, h = trimmed.size
-    if w <= 0 or h <= 0:
-        return canvas
-
-    scale = min(canvas_size / w, canvas_size / h)
-    nw = max(1, int(w * scale))
-    nh = max(1, int(h * scale))
-    fitted = trimmed.resize((nw, nh), Image.LANCZOS)
-
-    x = (canvas_size - nw) // 2
-    y = (canvas_size - nh) // 2
-    canvas.alpha_composite(fitted, (x, y))
-    return canvas
+def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional[Tuple[int, int, int, int]]:
+    img = img.convert("RGBA")
+    a = img.split()[-1]
+    return a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
 
 
 def _cleanup_cutout(img: Image.Image) -> Image.Image:
@@ -243,10 +230,8 @@ def _cleanup_cutout(img: Image.Image) -> Image.Image:
     rgba = np.array(img.convert("RGBA"))
     alpha = rgba[:, :, 3].copy()
 
-    # Hard cutoff for faint haze
     alpha[alpha < AI_ALPHA_CUTOFF] = 0
 
-    # Build binary mask
     mask = (alpha > 0).astype(np.uint8) * 255
     if mask.max() == 0:
         rgba[:, :, 3] = alpha
@@ -255,7 +240,6 @@ def _cleanup_cutout(img: Image.Image) -> Image.Image:
     kernel3 = np.ones((3, 3), np.uint8)
     kernel5 = np.ones((5, 5), np.uint8)
 
-    # Clean tiny noise and tiny holes
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel3, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel3, iterations=1)
 
@@ -272,25 +256,18 @@ def _cleanup_cutout(img: Image.Image) -> Image.Image:
 
     for i in range(1, num_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
-        # Keep large enough islands and islands that are meaningful relative to largest
         if area >= AI_KEEP_COMPONENT_MIN_AREA or (largest_area > 0 and area >= int(largest_area * 0.015)):
             keep[labels == i] = 255
 
     if keep.max() == 0:
         keep = mask
 
-    # soften / close one more time to reduce jagged holes
     keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel5, iterations=1)
-
-    # Apply keep mask back to alpha
     alpha = np.where(keep > 0, alpha, 0).astype(np.uint8)
-
-    # Slightly tighten ultra-low alpha after masking
     alpha[alpha < AI_ALPHA_CUTOFF] = 0
 
     rgba[:, :, 3] = alpha
-    out = Image.fromarray(rgba, "RGBA")
-    return out
+    return Image.fromarray(rgba, "RGBA")
 
 
 def _quality_flags(img: Image.Image) -> List[str]:
@@ -324,6 +301,54 @@ def _quality_flags(img: Image.Image) -> List[str]:
             flags.append("possible_matte_box")
 
     return flags
+
+
+def _fit_cutout_into_reference_box(
+    cutout: Image.Image,
+    reference_canvas: Image.Image,
+    canvas_size: int,
+) -> Image.Image:
+    """
+    Critical fix:
+    place the cleaned cutout back into the SAME geometry footprint as the original upload.
+    This keeps restore aligned and avoids the "small image underneath" bug.
+    """
+    out = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+
+    ref_box = _nontransparent_bbox(reference_canvas, alpha_threshold=6)
+    trimmed = _trim_transparent_padding(cutout.convert("RGBA"), alpha_threshold=6)
+
+    if not ref_box:
+        # fallback: center-fit if original bbox isn't available
+        tw, th = trimmed.size
+        if tw <= 0 or th <= 0:
+            return out
+        scale = min(canvas_size / tw, canvas_size / th)
+        nw = max(1, int(tw * scale))
+        nh = max(1, int(th * scale))
+        fitted = trimmed.resize((nw, nh), Image.LANCZOS)
+        x = (canvas_size - nw) // 2
+        y = (canvas_size - nh) // 2
+        out.alpha_composite(fitted, (x, y))
+        return out
+
+    rx1, ry1, rx2, ry2 = ref_box
+    rw = max(1, rx2 - rx1)
+    rh = max(1, ry2 - ry1)
+
+    tw, th = trimmed.size
+    if tw <= 0 or th <= 0:
+        return out
+
+    scale = min(rw / tw, rh / th)
+    nw = max(1, int(tw * scale))
+    nh = max(1, int(th * scale))
+    fitted = trimmed.resize((nw, nh), Image.LANCZOS)
+
+    x = rx1 + (rw - nw) // 2
+    y = ry1 + (rh - nh) // 2
+    out.alpha_composite(fitted, (x, y))
+    return out
 
 
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
@@ -370,7 +395,7 @@ def _bg_process_session(session_id: str):
         flags = _quality_flags(cleaned)
 
         _sess_set(session_id, stage="finishing_details")
-        editor_ready = _fit_to_square_canvas(cleaned, EDITOR_PX)
+        editor_ready = _fit_cutout_into_reference_box(cleaned, orig_sq, EDITOR_PX)
 
         _save_png(editor_ready, p["curr"])
         _sess_set(
@@ -455,6 +480,7 @@ async def upload_image(
 
     _save_png(canvas_orig, p["orig"])
     _save_png(canvas_orig, p["curr"])
+
     _sess_set(
         session_id,
         status="ready" if keep_original else "queued",
@@ -753,62 +779,96 @@ def ui(
   <title>Logo Studio</title>
   <style>
     :root {
-      --bg: #09111f;
-      --surface: #111c31;
-      --surface-2: #17243f;
-      --panel: rgba(255,255,255,0.04);
-      --panel-border: rgba(255,255,255,0.08);
-      --primary: #10b981;
-      --primary-hover: #059669;
-      --text: #f8fafc;
-      --muted: #9fb0c9;
-      --danger: #ef4444;
-      --radius: 18px;
+      --bg0: #f5f7fb;
+      --bg1: #eef2f7;
+      --panel: rgba(255,255,255,0.72);
+      --panel-strong: rgba(255,255,255,0.90);
+      --panel-border: rgba(15,23,42,0.08);
+      --text: #0f172a;
+      --muted: #6b7280;
+      --muted-2: #94a3b8;
+      --accent: #111827;
+      --green: #16a34a;
+      --green-2: #22c55e;
+      --shadow: 0 24px 60px rgba(15,23,42,0.12);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 16px;
+      --radius-sm: 12px;
     }
 
     * { box-sizing: border-box; }
     html, body { height: 100%; overflow: hidden; }
     body {
-      font-family: ui-sans-serif, system-ui, sans-serif;
-      background: linear-gradient(180deg, #08111d 0%, #091322 100%);
-      color: var(--text);
       margin: 0;
+      min-height: 100vh;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 500px at 50% -120px, rgba(255,255,255,0.96), rgba(255,255,255,0) 60%),
+        linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 100%);
       display: flex;
       flex-direction: column;
-      min-height: 100vh;
     }
 
     .header {
       flex: 0 0 auto;
-      padding: 14px 18px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      background: rgba(17, 28, 49, 0.88);
-      backdrop-filter: blur(14px);
-      border-bottom: 1px solid rgba(255,255,255,0.06);
+      padding: 14px 18px;
+      background: rgba(255,255,255,0.68);
+      backdrop-filter: blur(18px) saturate(1.15);
+      border-bottom: 1px solid rgba(15,23,42,0.06);
     }
 
-    .header h2 {
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand h2 {
       margin: 0;
       font-size: 16px;
-      font-weight: 900;
-      letter-spacing: 0.2px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .brand-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      min-width: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.06);
+      color: #475569;
+      border: 1px solid rgba(15,23,42,0.06);
+      font-size: 12px;
+      font-weight: 700;
     }
 
     .btn-done {
-      background: var(--primary);
-      color: white;
       border: none;
-      padding: 10px 16px;
       border-radius: 999px;
-      font-weight: 900;
+      padding: 10px 16px;
+      min-width: 84px;
+      background: linear-gradient(180deg, #34d399, #10b981);
+      color: white;
       font-size: 13px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      box-shadow: 0 10px 24px rgba(16,185,129,0.22);
       cursor: pointer;
-      box-shadow: 0 8px 18px rgba(16,185,129,0.24);
     }
-    .btn-done:hover { background: var(--primary-hover); }
-    .btn-done:disabled { opacity: 0.65; cursor: not-allowed; }
+
+    .btn-done:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
 
     .main {
       flex: 1 1 auto;
@@ -816,29 +876,36 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 14px;
+      padding: 16px;
     }
 
-    .card {
-      width: 100%;
-      max-width: 560px;
+    .upload-card {
+      width: min(560px, 100%);
       background: var(--panel);
+      backdrop-filter: blur(18px) saturate(1.12);
       border: 1px solid var(--panel-border);
-      border-radius: 22px;
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
       padding: 18px;
-      box-shadow: 0 24px 50px rgba(0,0,0,0.38);
     }
 
     .upload-box {
-      border: 2px dashed rgba(255,255,255,0.20);
-      border-radius: 18px;
-      padding: 46px 18px;
-      background: rgba(255,255,255,0.03);
-      cursor: pointer;
       position: relative;
+      border-radius: 24px;
+      padding: 46px 20px;
       text-align: center;
+      border: 1.5px dashed rgba(15,23,42,0.12);
+      background: rgba(255,255,255,0.58);
+      transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
+      overflow: hidden;
     }
-    .upload-box:hover { border-color: var(--primary); }
+
+    .upload-box:hover {
+      border-color: rgba(15,23,42,0.22);
+      background: rgba(255,255,255,0.76);
+      transform: translateY(-1px);
+    }
+
     .upload-box input {
       position: absolute;
       inset: 0;
@@ -848,39 +915,64 @@ def ui(
       height: 100%;
     }
 
-    .muted { color: var(--muted); font-size: 13px; }
-    .row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: center;
+    .title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-top: 8px;
     }
-    .pill {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      padding: 10px 12px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
+
+    .muted {
+      color: var(--muted);
       font-size: 13px;
-      color: var(--text);
+      line-height: 1.45;
     }
-    .pill input { transform: scale(1.08); }
+
+    .row {
+      margin-top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 40px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(15,23,42,0.08);
+      font-size: 13px;
+      font-weight: 600;
+      color: #334155;
+      box-shadow: 0 6px 18px rgba(15,23,42,0.05);
+    }
 
     .editor-shell {
-      width: min(1100px, 100%);
+      width: min(1180px, 100%);
       height: min(92vh, 920px);
-      display: grid;
-      grid-template-rows: 1fr auto auto auto;
-      gap: 12px;
       min-height: 0;
-      background: rgba(255,255,255,0.035);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 22px;
-      box-shadow: 0 24px 50px rgba(0,0,0,0.42);
+      display: grid;
+      grid-template-rows: 1fr auto auto;
+      gap: 14px;
       padding: 14px;
+      background: var(--panel);
+      backdrop-filter: blur(20px) saturate(1.14);
+      border: 1px solid var(--panel-border);
+      border-radius: 30px;
+      box-shadow: 0 30px 70px rgba(15,23,42,0.14);
+    }
+
+    .editor-top {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 76px;
+      gap: 14px;
+      align-items: center;
     }
 
     .canvas-panel {
@@ -888,112 +980,83 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 20px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.56));
+      border: 1px solid rgba(15,23,42,0.08);
       overflow: hidden;
+      padding: 16px;
     }
 
-    .canvas-wrap {
-      width: min(100%, 880px);
-      height: min(100%, 100%);
+    .canvas-stage {
+      width: min(74vw, 74vh, 700px);
+      height: min(74vw, 74vh, 700px);
+      max-width: 100%;
+      max-height: 100%;
       aspect-ratio: 1 / 1;
-      border-radius: 18px;
-      overflow: hidden;
-      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 24px;
       position: relative;
-      background: #fff;
+      overflow: hidden;
+      border: 1px solid rgba(15,23,42,0.08);
+      background: #ffffff;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
     }
 
-    .canvas-wrap.bg-checker {
+    .canvas-stage.bg-checker {
       background-color: #fff;
       background-image:
-        linear-gradient(45deg, #e8e8e8 25%, transparent 25%),
-        linear-gradient(-45deg, #e8e8e8 25%, transparent 25%),
-        linear-gradient(45deg, transparent 75%, #e8e8e8 75%),
-        linear-gradient(-45deg, transparent 75%, #e8e8e8 75%);
-      background-size: 18px 18px;
-      background-position: 0 0, 0 9px, 9px -9px, -9px 0px;
+        linear-gradient(45deg, #eceef2 25%, transparent 25%),
+        linear-gradient(-45deg, #eceef2 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #eceef2 75%),
+        linear-gradient(-45deg, transparent 75%, #eceef2 75%);
+      background-size: 20px 20px;
+      background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
     }
 
-    .canvas-wrap.bg-white {
+    .canvas-stage.bg-white {
       background: #ffffff;
       background-image: none;
     }
 
-    .canvas-wrap.bg-dark {
-      background: #111827;
-      background-image: none;
-    }
-
-    .canvas-wrap.bg-mid {
-      background: #d1d5db;
+    .canvas-stage.bg-dark {
+      background: #101828;
       background-image: none;
     }
 
     canvas {
+      position: absolute;
+      inset: 0;
       width: 100%;
       height: 100%;
       display: block;
-      position: relative;
-      z-index: 2;
       touch-action: none;
       cursor: none;
-      image-rendering: auto;
-    }
-
-    #cursor {
-      position: fixed;
-      border: 2px solid rgba(0,0,0,0.88);
-      background: rgba(255,255,255,0.10);
-      box-shadow:
-        0 0 0 2px rgba(255,255,255,0.9),
-        inset 0 0 0 1px rgba(255,255,255,0.65);
-      border-radius: 50%;
-      pointer-events: none;
-      transform: translate(-50%,-50%);
-      z-index: 9999;
-      display: none;
-    }
-
-    .cursor-dot {
-      position: fixed;
-      width: 4px;
-      height: 4px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.95);
-      box-shadow: 0 0 0 1px rgba(0,0,0,0.85);
-      pointer-events: none;
-      transform: translate(-50%,-50%);
-      z-index: 10000;
-      display: none;
+      z-index: 2;
     }
 
     .processing-overlay {
       position: absolute;
       inset: 0;
-      z-index: 5;
       display: none;
+      z-index: 5;
       align-items: center;
       justify-content: center;
       flex-direction: column;
       gap: 12px;
-      background: linear-gradient(180deg, rgba(8,17,29,0.70), rgba(8,17,29,0.82));
-      backdrop-filter: blur(2px);
       text-align: center;
-      padding: 20px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.86));
+      backdrop-filter: blur(6px);
+      padding: 22px;
     }
 
     .processing-overlay.show { display: flex; }
 
     .spinner {
-      width: 54px;
-      height: 54px;
+      width: 46px;
+      height: 46px;
       border-radius: 999px;
-      border: 4px solid rgba(255,255,255,0.18);
-      border-top-color: #10b981;
+      border: 3px solid rgba(15,23,42,0.10);
+      border-top-color: rgba(15,23,42,0.80);
       animation: spin 0.9s linear infinite;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.06);
     }
 
     @keyframes spin {
@@ -1003,113 +1066,331 @@ def ui(
 
     .overlay-title {
       font-size: 16px;
-      font-weight: 900;
-      letter-spacing: 0.2px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #0f172a;
     }
 
     .overlay-sub {
-      font-size: 13px;
-      color: var(--muted);
       max-width: 320px;
-      line-height: 1.4;
+      font-size: 13px;
+      color: #64748b;
+      line-height: 1.45;
     }
 
-    .toolbar-row,
-    .controls-row,
-    .status-row {
-      flex: 0 0 auto;
-    }
-
-    .toolbar-row {
+    .swatch-rail {
       display: flex;
-      gap: 8px;
+      flex-direction: column;
       justify-content: center;
+      align-items: center;
+      gap: 12px;
+      align-self: stretch;
+      padding: 10px 0;
+      border-radius: 24px;
+      background: rgba(255,255,255,0.58);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+    }
+
+    .swatch-btn {
+      width: 42px;
+      height: 42px;
+      border-radius: 999px;
+      border: 1px solid rgba(15,23,42,0.10);
+      cursor: pointer;
+      position: relative;
+      box-shadow: 0 8px 18px rgba(15,23,42,0.08);
+      transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+      background: #fff;
+    }
+
+    .swatch-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(15,23,42,0.12);
+    }
+
+    .swatch-btn.active {
+      box-shadow: 0 0 0 3px rgba(15,23,42,0.10), 0 14px 30px rgba(15,23,42,0.12);
+      border-color: rgba(15,23,42,0.24);
+    }
+
+    .swatch-btn.checker {
+      background-color: #fff;
+      background-image:
+        linear-gradient(45deg, #e5e7eb 25%, transparent 25%),
+        linear-gradient(-45deg, #e5e7eb 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #e5e7eb 75%),
+        linear-gradient(-45deg, transparent 75%, #e5e7eb 75%);
+      background-size: 12px 12px;
+      background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
+    }
+    .swatch-btn.white { background: #ffffff; }
+    .swatch-btn.dark { background: #111827; }
+
+    .swatch-label {
+      font-size: 11px;
+      color: #64748b;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin-top: -4px;
+    }
+
+    .controls-shell {
+      display: grid;
+      gap: 12px;
+      justify-items: center;
+    }
+
+    .tool-segment {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.70);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: 0 10px 26px rgba(15,23,42,0.06);
       flex-wrap: wrap;
+      justify-content: center;
     }
 
     .tool-btn {
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.10);
-      color: var(--text);
-      padding: 10px 14px;
+      min-width: 86px;
+      height: 40px;
+      border: none;
       border-radius: 999px;
-      cursor: pointer;
-      font-weight: 900;
+      background: transparent;
+      color: #475569;
       font-size: 13px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      cursor: pointer;
+      transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .tool-btn:hover {
+      background: rgba(15,23,42,0.05);
+      color: #0f172a;
     }
 
     .tool-btn.active {
-      outline: 2px solid rgba(16,185,129,0.45);
-      background: rgba(16,185,129,0.10);
+      background: #0f172a;
+      color: white;
+      box-shadow: 0 10px 24px rgba(15,23,42,0.16);
     }
 
-    .tool-btn.subtle {
-      color: var(--muted);
-      font-weight: 800;
-    }
-
-    .tool-btn.bg-active {
-      outline: 2px solid rgba(255,255,255,0.16);
-      background: rgba(255,255,255,0.12);
-    }
-
-    .controls-row {
+    .utility-row {
       display: flex;
-      gap: 10px;
       align-items: center;
       justify-content: center;
+      gap: 12px;
       flex-wrap: wrap;
     }
 
+    .utility-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      height: 42px;
+      padding: 0 14px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: 0 10px 26px rgba(15,23,42,0.05);
+      color: #334155;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .ghost-btn {
+      height: 42px;
+      padding: 0 16px;
+      border: 1px solid rgba(15,23,42,0.08);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 10px 26px rgba(15,23,42,0.05);
+    }
+
+    .ghost-btn:hover {
+      background: rgba(255,255,255,0.88);
+      color: #0f172a;
+    }
+
     input[type=range] {
-      width: min(260px, 52vw);
-      accent-color: var(--primary);
+      width: min(280px, 55vw);
+      accent-color: #0f172a;
     }
 
     .status-row {
-      text-align: center;
-      font-size: 13px;
-      color: var(--muted);
-      min-height: 18px;
+      min-height: 24px;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
       flex-wrap: wrap;
+      color: #64748b;
+      font-size: 13px;
+      font-weight: 600;
     }
 
     .warn-badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 6px 10px;
+      padding: 7px 11px;
       border-radius: 999px;
-      background: rgba(245, 158, 11, 0.12);
-      border: 1px solid rgba(245, 158, 11, 0.28);
-      color: #fbbf24;
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.24);
+      color: #b45309;
       font-size: 12px;
-      font-weight: 900;
+      font-weight: 700;
     }
 
-    @media (max-width: 900px) {
-      .main { padding: 10px; align-items: stretch; }
+    #cursor {
+      position: fixed;
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      border: 2px solid rgba(15,23,42,0.84);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.96);
+      background: rgba(255,255,255,0.08);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      z-index: 9999;
+      display: none;
+    }
+
+    .cursor-dot {
+      position: fixed;
+      width: 4px;
+      height: 4px;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.92);
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.92);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      z-index: 10000;
+      display: none;
+    }
+
+    @media (max-width: 980px) {
+      .main {
+        align-items: stretch;
+        padding: 10px;
+      }
+
       .editor-shell {
-        height: calc(100vh - 84px);
+        width: 100%;
+        height: calc(100vh - 80px);
+        border-radius: 24px;
+        padding: 12px;
+      }
+
+      .editor-top {
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .canvas-panel {
+        padding: 12px;
+      }
+
+      .canvas-stage {
+        width: min(92vw, 58vh);
+        height: min(92vw, 58vh);
+      }
+
+      .swatch-rail {
+        flex-direction: row;
         padding: 10px;
         gap: 10px;
       }
-      .canvas-panel {
-        min-height: 0;
+
+      .swatch-label {
+        display: none;
       }
-      .toolbar-row,
-      .controls-row {
-        gap: 8px;
+
+      .tool-btn {
+        min-width: 78px;
+      }
+
+      input[type=range] {
+        width: min(220px, 54vw);
       }
     }
 
-    @media (max-height: 760px) {
+    @media (max-width: 640px) {
+      .header {
+        padding: 12px 14px;
+      }
+
+      .brand h2 {
+        font-size: 15px;
+      }
+
+      .main {
+        padding: 8px;
+      }
+
+      .upload-card {
+        border-radius: 22px;
+        padding: 14px;
+      }
+
+      .upload-box {
+        border-radius: 20px;
+        padding: 38px 16px;
+      }
+
       .editor-shell {
-        height: calc(100vh - 78px);
+        height: calc(100vh - 72px);
+        gap: 10px;
+        padding: 10px;
+      }
+
+      .canvas-panel {
+        padding: 10px;
+        border-radius: 20px;
+      }
+
+      .canvas-stage {
+        width: min(92vw, 52vh);
+        height: min(92vw, 52vh);
+        border-radius: 20px;
+      }
+
+      .swatch-rail {
+        border-radius: 18px;
+      }
+
+      .tool-segment {
+        width: 100%;
+      }
+
+      .tool-btn {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+
+      .utility-row {
+        gap: 10px;
+      }
+
+      .utility-pill {
+        width: 100%;
+        justify-content: center;
+      }
+
+      .ghost-btn {
+        flex: 1 1 auto;
+      }
+
+      input[type=range] {
+        width: min(200px, 60vw);
       }
     }
   </style>
@@ -1119,57 +1400,74 @@ def ui(
   <div class="cursor-dot" id="cursorDot"></div>
 
   <div class="header">
-    <h2>Studio Uploader</h2>
+    <div class="brand">
+      <h2>Studio Uploader</h2>
+      <span class="brand-pill">main</span>
+    </div>
     <button class="btn-done" id="btnDone" style="display:none;">Done</button>
   </div>
 
   <div class="main">
-    <div class="card" id="step1">
-      <div class="upload-box" id="uploadBox">
+    <div class="upload-card" id="step1">
+      <div class="upload-box">
         <input id="file" type="file" accept="image/*" />
-        <div style="font-size:32px;">🪄</div>
-        <div style="font-weight:900; margin-top:8px;">Upload logo</div>
-        <div class="muted" style="margin-top:6px;">PhotoRoom will clean it up, then you can quickly fine-tune it if needed.</div>
+        <div style="font-size:32px;">✨</div>
+        <div class="title">Upload logo</div>
+        <div class="muted" style="margin-top:6px;">We’ll remove the background, clean the edges, and let you fine-tune anything that needs a quick touch-up.</div>
       </div>
 
-      <div class="row" style="margin-top:12px;">
-        <label class="pill"><input type="checkbox" id="keepOriginal"> Keep original (skip AI)</label>
-        <label class="pill" style="opacity:.6;"><input type="checkbox" id="detailSafe" checked disabled> Detail-safe (auto)</label>
+      <div class="row">
+        <label class="pill"><input type="checkbox" id="keepOriginal"> Keep original</label>
+        <label class="pill" style="opacity:.7;"><input type="checkbox" checked disabled> Detail-safe auto mode</label>
       </div>
 
       <div class="status-row" id="statusline1"></div>
     </div>
 
     <div class="editor-shell" id="step3" style="display:none;">
-      <div class="canvas-panel">
-        <div class="canvas-wrap bg-checker" id="canvasContainer">
-          <div class="processing-overlay" id="processingOverlay">
-            <div class="spinner"></div>
-            <div class="overlay-title" id="overlayTitle">Preparing your logo…</div>
-            <div class="overlay-sub" id="overlaySub">This usually takes 5–10 seconds.</div>
+      <div class="editor-top">
+        <div class="canvas-panel">
+          <div class="canvas-stage bg-checker" id="canvasContainer">
+            <div class="processing-overlay" id="processingOverlay">
+              <div class="spinner"></div>
+              <div class="overlay-title" id="overlayTitle">Preparing your logo…</div>
+              <div class="overlay-sub" id="overlaySub">This usually takes 5–10 seconds.</div>
+            </div>
+            <canvas id="cv" width="1000" height="1000"></canvas>
           </div>
-          <canvas id="cv" width="1000" height="1000"></canvas>
+        </div>
+
+        <div class="swatch-rail">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <button class="swatch-btn checker active" id="bgChecker" title="Checker"></button>
+            <div class="swatch-label">Grid</div>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <button class="swatch-btn white" id="bgWhite" title="White"></button>
+            <div class="swatch-label">White</div>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <button class="swatch-btn dark" id="bgDark" title="Dark"></button>
+            <div class="swatch-label">Dark</div>
+          </div>
         </div>
       </div>
 
-      <div class="toolbar-row">
-        <button class="tool-btn active" id="btnRestore">Restore</button>
-        <button class="tool-btn" id="btnErase">Erase</button>
-        <button class="tool-btn" id="btnMagic">Magic</button>
+      <div class="controls-shell">
+        <div class="tool-segment">
+          <button class="tool-btn active" id="btnRestore">Restore</button>
+          <button class="tool-btn" id="btnErase">Erase</button>
+          <button class="tool-btn" id="btnMagic">Magic</button>
+        </div>
 
-        <span style="width:16px;"></span>
-
-        <button class="tool-btn subtle bg-active" id="bgChecker">Checker</button>
-        <button class="tool-btn subtle" id="bgWhite">White</button>
-        <button class="tool-btn subtle" id="bgDark">Dark</button>
-        <button class="tool-btn subtle" id="bgMid">Gray</button>
-      </div>
-
-      <div class="controls-row">
-        <span class="muted">Brush</span>
-        <input type="range" id="brushSize" min="8" max="140" value="44">
-        <button class="tool-btn" id="btnUndo">Undo</button>
-        <button class="tool-btn" id="btnRestart">Start Over</button>
+        <div class="utility-row">
+          <div class="utility-pill">
+            <span>Brush</span>
+            <input type="range" id="brushSize" min="8" max="140" value="44">
+          </div>
+          <button class="ghost-btn" id="btnUndo">Undo</button>
+          <button class="ghost-btn" id="btnRestart">Reset</button>
+        </div>
       </div>
 
       <div class="status-row" id="statusline"></div>
@@ -1182,7 +1480,8 @@ def ui(
   let sessionId = null;
   let mode = 'restore';
   let isDown = false;
-  let lastX = 0, lastY = 0;
+  let lastX = 0;
+  let lastY = 0;
   let history = [];
   let aiReady = false;
   let stageCycleTimer = null;
@@ -1213,8 +1512,8 @@ def ui(
 
   const cursor = document.getElementById('cursor');
   const cursorDot = document.getElementById('cursorDot');
-  const canvasContainer = document.getElementById('canvasContainer');
 
+  const canvasContainer = document.getElementById('canvasContainer');
   const processingOverlay = document.getElementById('processingOverlay');
   const overlayTitle = document.getElementById('overlayTitle');
   const overlaySub = document.getElementById('overlaySub');
@@ -1225,7 +1524,6 @@ def ui(
   const bgChecker = document.getElementById('bgChecker');
   const bgWhite = document.getElementById('bgWhite');
   const bgDark = document.getElementById('bgDark');
-  const bgMid = document.getElementById('bgMid');
 
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
@@ -1253,31 +1551,26 @@ def ui(
   fileEl.addEventListener('click', () => { fileEl.value = ""; });
 
   function setBgMode(mode) {
-    canvasContainer.classList.remove('bg-checker', 'bg-white', 'bg-dark', 'bg-mid');
-    bgChecker.classList.remove('bg-active');
-    bgWhite.classList.remove('bg-active');
-    bgDark.classList.remove('bg-active');
-    bgMid.classList.remove('bg-active');
+    canvasContainer.classList.remove('bg-checker', 'bg-white', 'bg-dark');
+    bgChecker.classList.remove('active');
+    bgWhite.classList.remove('active');
+    bgDark.classList.remove('active');
 
-    if(mode === 'checker') {
+    if (mode === 'checker') {
       canvasContainer.classList.add('bg-checker');
-      bgChecker.classList.add('bg-active');
-    } else if(mode === 'white') {
+      bgChecker.classList.add('active');
+    } else if (mode === 'white') {
       canvasContainer.classList.add('bg-white');
-      bgWhite.classList.add('bg-active');
-    } else if(mode === 'dark') {
+      bgWhite.classList.add('active');
+    } else if (mode === 'dark') {
       canvasContainer.classList.add('bg-dark');
-      bgDark.classList.add('bg-active');
-    } else if(mode === 'mid') {
-      canvasContainer.classList.add('bg-mid');
-      bgMid.classList.add('bg-active');
+      bgDark.classList.add('active');
     }
   }
 
   bgChecker.addEventListener('click', () => setBgMode('checker'));
   bgWhite.addEventListener('click', () => setBgMode('white'));
   bgDark.addEventListener('click', () => setBgMode('dark'));
-  bgMid.addEventListener('click', () => setBgMode('mid'));
 
   function showOverlay(title, sub = "This usually takes 5–10 seconds.") {
     processingOverlay.classList.add('show');
@@ -1294,48 +1587,49 @@ def ui(
     let i = 0;
     showOverlay(CYCLE_MESSAGES[0]);
     stageCycleTimer = setInterval(() => {
-      if(aiReady) return;
+      if (aiReady) return;
       i = (i + 1) % CYCLE_MESSAGES.length;
       overlayTitle.textContent = CYCLE_MESSAGES[i];
     }, 1400);
   }
 
   function stopStageCycle() {
-    if(stageCycleTimer) {
+    if (stageCycleTimer) {
       clearInterval(stageCycleTimer);
       stageCycleTimer = null;
     }
   }
 
   function saveState() {
-    if(history.length > 12) history.shift();
+    if (history.length > 12) history.shift();
     history.push(ctx.getImageData(0, 0, cv.width, cv.height));
   }
 
   document.getElementById('btnUndo').addEventListener('click', () => {
-    if(history.length > 0) ctx.putImageData(history.pop(), 0, 0);
+    if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
   });
 
   document.getElementById('btnRestart').addEventListener('click', () => location.reload());
 
   function updateCursorSize() {
-    if(mode === 'magic') {
+    if (mode === 'magic') {
       cursor.style.display = 'none';
       cursorDot.style.display = 'none';
       cv.style.cursor = 'crosshair';
-    } else {
-      const displayWidth = cv.getBoundingClientRect().width;
-      const ratio = displayWidth / 1000;
-      const visualSize = brushSlider.value * ratio;
-      cursor.style.width = visualSize + 'px';
-      cursor.style.height = visualSize + 'px';
-      cv.style.cursor = 'none';
+      return;
     }
+
+    const displayWidth = cv.getBoundingClientRect().width;
+    const ratio = displayWidth / 1000;
+    const visualSize = brushSlider.value * ratio;
+    cursor.style.width = visualSize + 'px';
+    cursor.style.height = visualSize + 'px';
+    cv.style.cursor = 'none';
   }
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
-    if(mode !== 'magic') {
+    if (mode !== 'magic') {
       cursor.style.display = 'block';
       cursorDot.style.display = 'block';
       cursor.style.left = e.clientX + 'px';
@@ -1388,7 +1682,7 @@ def ui(
       const pos = (y * w + x) * 4;
       data[pos + 3] = 0;
 
-      const nbs = [[x-1,y],[x+1,y],[x,y-1],[x,y+1]];
+      const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
       for (let i = 0; i < nbs.length; i++) {
         const nx = nbs[i][0], ny = nbs[i][1];
         if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
@@ -1409,11 +1703,10 @@ def ui(
   }
 
   function drawBrush(x, y) {
-    const bSize = parseInt(brushSlider.value);
+    const bSize = parseInt(brushSlider.value, 10);
+
     offCtx.globalCompositeOperation = 'source-over';
     offCtx.clearRect(0, 0, 1000, 1000);
-
-    offCtx.shadowBlur = 0;
     offCtx.lineWidth = bSize;
     offCtx.lineCap = 'round';
     offCtx.lineJoin = 'round';
@@ -1438,26 +1731,25 @@ def ui(
     lastY = y;
   }
 
-  const setMode = (m, btn) => {
+  function setMode(m, btn) {
     mode = m;
     btnErase.classList.remove('active');
     btnRestore.classList.remove('active');
     btnMagic.classList.remove('active');
     btn.classList.add('active');
     updateCursorSize();
-  };
+  }
 
   btnErase.addEventListener('click', () => setMode('remove', btnErase));
   btnRestore.addEventListener('click', () => setMode('restore', btnRestore));
   btnMagic.addEventListener('click', () => setMode('magic', btnMagic));
 
-  const startDraw = (e) => {
-    if (!aiReady && !keepOriginalEl.checked) {
-      return;
-    }
+  function startDraw(e) {
+    if (!aiReady && !keepOriginalEl.checked) return;
     saveState();
     isDown = true;
     const c = getCoords(e);
+
     if (mode === 'magic') {
       magicRemove(c.x, c.y);
       isDown = false;
@@ -1466,13 +1758,16 @@ def ui(
       lastY = c.y;
       drawBrush(c.x, c.y);
     }
-    if (e.cancelable) e.preventDefault();
-  };
 
-  const moveDraw = (e) => {
+    if (e.cancelable) e.preventDefault();
+  }
+
+  function moveDraw(e) {
     if (!isDown || mode === 'magic') return;
+
     const c = getCoords(e);
     drawBrush(c.x, c.y);
+
     if (e.touches) {
       cursor.style.display = 'block';
       cursorDot.style.display = 'block';
@@ -1481,10 +1776,13 @@ def ui(
       cursorDot.style.left = e.touches[0].clientX + 'px';
       cursorDot.style.top = e.touches[0].clientY + 'px';
     }
-    if (e.cancelable) e.preventDefault();
-  };
 
-  const endDraw = () => { isDown = false; };
+    if (e.cancelable) e.preventDefault();
+  }
+
+  function endDraw() {
+    isDown = false;
+  }
 
   cv.addEventListener('mousedown', startDraw);
   cv.addEventListener('mousemove', moveDraw);
@@ -1500,13 +1798,13 @@ def ui(
         window.parent.postMessage(payload, "*");
         return true;
       }
-    } catch (e) {}
+    } catch(e) {}
     try {
       if (window.opener && !window.opener.closed) {
         window.opener.postMessage(payload, "*");
         return true;
       }
-    } catch (e) {}
+    } catch(e) {}
     return false;
   }
 
@@ -1514,7 +1812,7 @@ def ui(
     qualityFlags = Array.isArray(flags) ? flags : [];
     const warnings = [];
 
-    if (qualityFlags.includes("possible_matte_box")) warnings.push("Possible edge/matte artifact detected");
+    if (qualityFlags.includes("possible_matte_box")) warnings.push("Possible edge artifact detected");
     if (qualityFlags.includes("heavy_soft_edges")) warnings.push("Soft edges detected — review if needed");
     if (qualityFlags.includes("subject_too_small")) warnings.push("Logo looks small — review spacing");
 
@@ -1615,7 +1913,6 @@ def ui(
 
       ctx.clearRect(0, 0, cv.width, cv.height);
       ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
-      updateCursorSize();
 
       if (!keepOriginalEl.checked) {
         showOverlay("Uploading image…", "Please wait while we prepare your logo.");
@@ -1624,8 +1921,10 @@ def ui(
         pollAIReady(j.status_url);
       } else {
         hideOverlay();
-        statusline.textContent = "Using original (AI skipped)";
+        statusline.textContent = "Using original";
       }
+
+      updateCursorSize();
     } catch (err) {
       alert(err.message || "Upload failed");
       location.reload();
