@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.7.0")
+app = FastAPI(title="Studio Uploader", version="1.8.0")
 
 
 # ----------------------------
@@ -142,6 +142,17 @@ def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     if w <= max_dim and h <= max_dim:
         return img
     scale = min(max_dim / w, max_dim / h)
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+
+def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.82) -> Image.Image:
+    """
+    Scale both up and down for the editor so small uploads don't look tiny.
+    This is editor-only convenience, not final output logic.
+    """
+    w, h = img.size
+    target = max(1, int(max_dim * fill_ratio))
+    scale = min(target / w, target / h)
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 
@@ -309,9 +320,8 @@ def _fit_cutout_into_reference_box(
     canvas_size: int,
 ) -> Image.Image:
     """
-    Critical fix:
-    place the cleaned cutout back into the SAME geometry footprint as the original upload.
-    This keeps restore aligned and avoids the "small image underneath" bug.
+    Place the cleaned cutout back into the SAME geometry footprint as the original upload.
+    This keeps restore aligned and avoids the nested/smaller-image bug.
     """
     out = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
 
@@ -319,7 +329,6 @@ def _fit_cutout_into_reference_box(
     trimmed = _trim_transparent_padding(cutout.convert("RGBA"), alpha_threshold=6)
 
     if not ref_box:
-        # fallback: center-fit if original bbox isn't available
         tw, th = trimmed.size
         if tw <= 0 or th <= 0:
             return out
@@ -471,7 +480,7 @@ async def upload_image(
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    img_fit = _scale_to_fit(img, EDITOR_PX)
+    img_fit = _scale_to_editor_bounds(img, EDITOR_PX)
 
     canvas_orig = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
     x = (EDITOR_PX - img_fit.width) // 2
@@ -675,7 +684,7 @@ async def storefront_request(
                 return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
             return JSONResponse({"error": "Main logo is not a valid image"}, status_code=400)
 
-        img_main_fit = _scale_to_fit(img_main, EDITOR_PX)
+        img_main_fit = _scale_to_editor_bounds(img_main, EDITOR_PX)
 
         main_session_id = str(uuid.uuid4())
         p = _paths(main_session_id)
@@ -702,7 +711,7 @@ async def storefront_request(
                     raise ValueError("empty_bytes")
 
                 img_sec = _pil_open_safe(sec_bytes)
-                img_sec_fit = _scale_to_fit(img_sec, EDITOR_PX)
+                img_sec_fit = _scale_to_editor_bounds(img_sec, EDITOR_PX)
 
                 secondary_session_id = str(uuid.uuid4())
                 sp = _paths(secondary_session_id)
@@ -779,20 +788,21 @@ def ui(
   <title>Logo Studio</title>
   <style>
     :root {
-      --bg0: #f5f7fb;
-      --bg1: #eef2f7;
-      --panel: rgba(255,255,255,0.72);
-      --panel-strong: rgba(255,255,255,0.90);
-      --panel-border: rgba(15,23,42,0.08);
+      --bg0: #f6f8fb;
+      --bg1: #eef3f8;
+      --panel: rgba(255,255,255,0.78);
+      --panel-strong: rgba(255,255,255,0.92);
+      --panel-border: rgba(15,23,42,0.07);
       --text: #0f172a;
-      --muted: #6b7280;
+      --muted: #667085;
       --muted-2: #94a3b8;
       --accent: #111827;
-      --green: #16a34a;
+      --green: #10b981;
       --green-2: #22c55e;
-      --shadow: 0 24px 60px rgba(15,23,42,0.12);
-      --radius-xl: 28px;
-      --radius-lg: 20px;
+      --shadow: 0 26px 70px rgba(15,23,42,0.12);
+      --shadow-soft: 0 12px 30px rgba(15,23,42,0.07);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
       --radius-md: 16px;
       --radius-sm: 12px;
     }
@@ -805,7 +815,7 @@ def ui(
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(1200px 500px at 50% -120px, rgba(255,255,255,0.96), rgba(255,255,255,0) 60%),
+        radial-gradient(1200px 480px at 50% -120px, rgba(255,255,255,0.95), rgba(255,255,255,0) 60%),
         linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 100%);
       display: flex;
       flex-direction: column;
@@ -816,10 +826,12 @@ def ui(
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 14px 18px;
-      background: rgba(255,255,255,0.68);
-      backdrop-filter: blur(18px) saturate(1.15);
+      padding: 10px 14px;
+      background: rgba(255,255,255,0.70);
+      backdrop-filter: blur(18px) saturate(1.12);
       border-bottom: 1px solid rgba(15,23,42,0.06);
+      position: relative;
+      z-index: 20;
     }
 
     .brand {
@@ -830,9 +842,9 @@ def ui(
 
     .brand h2 {
       margin: 0;
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 700;
-      letter-spacing: -0.01em;
+      letter-spacing: -0.02em;
     }
 
     .brand-pill {
@@ -843,7 +855,7 @@ def ui(
       min-width: 28px;
       padding: 0 10px;
       border-radius: 999px;
-      background: rgba(15,23,42,0.06);
+      background: rgba(15,23,42,0.05);
       color: #475569;
       border: 1px solid rgba(15,23,42,0.06);
       font-size: 12px;
@@ -854,14 +866,16 @@ def ui(
       border: none;
       border-radius: 999px;
       padding: 10px 16px;
-      min-width: 84px;
+      min-width: 82px;
       background: linear-gradient(180deg, #34d399, #10b981);
       color: white;
       font-size: 13px;
       font-weight: 700;
       letter-spacing: -0.01em;
-      box-shadow: 0 10px 24px rgba(16,185,129,0.22);
+      box-shadow: 0 10px 22px rgba(16,185,129,0.20);
       cursor: pointer;
+      position: sticky;
+      top: 0;
     }
 
     .btn-done:disabled {
@@ -876,7 +890,7 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 16px;
+      padding: 8px;
     }
 
     .upload-card {
@@ -886,13 +900,13 @@ def ui(
       border: 1px solid var(--panel-border);
       border-radius: var(--radius-xl);
       box-shadow: var(--shadow);
-      padding: 18px;
+      padding: 16px;
     }
 
     .upload-box {
       position: relative;
       border-radius: 24px;
-      padding: 46px 20px;
+      padding: 42px 18px;
       text-align: center;
       border: 1.5px dashed rgba(15,23,42,0.12);
       background: rgba(255,255,255,0.58);
@@ -954,24 +968,25 @@ def ui(
 
     .editor-shell {
       width: min(1180px, 100%);
-      height: min(92vh, 920px);
+      height: calc(100vh - 68px);
       min-height: 0;
       display: grid;
-      grid-template-rows: 1fr auto auto;
-      gap: 14px;
-      padding: 14px;
+      grid-template-rows: minmax(0,1fr) auto auto;
+      gap: 10px;
+      padding: 10px;
       background: var(--panel);
       backdrop-filter: blur(20px) saturate(1.14);
       border: 1px solid var(--panel-border);
-      border-radius: 30px;
-      box-shadow: 0 30px 70px rgba(15,23,42,0.14);
+      border-radius: 28px;
+      box-shadow: 0 28px 70px rgba(15,23,42,0.14);
+      overflow: hidden;
     }
 
     .editor-top {
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 76px;
-      gap: 14px;
+      grid-template-columns: minmax(0, 1fr) 82px;
+      gap: 10px;
       align-items: center;
     }
 
@@ -981,15 +996,16 @@ def ui(
       align-items: center;
       justify-content: center;
       border-radius: 24px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.56));
+      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.58));
       border: 1px solid rgba(15,23,42,0.08);
       overflow: hidden;
-      padding: 16px;
+      padding: 10px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
     }
 
     .canvas-stage {
-      width: min(74vw, 74vh, 700px);
-      height: min(74vw, 74vh, 700px);
+      width: min(54vw, 44vh, 500px);
+      height: min(54vw, 44vh, 500px);
       max-width: 100%;
       max-height: 100%;
       aspect-ratio: 1 / 1;
@@ -1051,8 +1067,8 @@ def ui(
     .processing-overlay.show { display: flex; }
 
     .spinner {
-      width: 46px;
-      height: 46px;
+      width: 44px;
+      height: 44px;
       border-radius: 999px;
       border: 3px solid rgba(15,23,42,0.10);
       border-top-color: rgba(15,23,42,0.80);
@@ -1086,10 +1102,10 @@ def ui(
       gap: 12px;
       align-self: stretch;
       padding: 10px 0;
-      border-radius: 24px;
-      background: rgba(255,255,255,0.58);
+      border-radius: 22px;
+      background: rgba(255,255,255,0.60);
       border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.84);
     }
 
     .swatch-btn {
@@ -1124,6 +1140,7 @@ def ui(
       background-size: 12px 12px;
       background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
     }
+
     .swatch-btn.white { background: #ffffff; }
     .swatch-btn.dark { background: #111827; }
 
@@ -1137,8 +1154,18 @@ def ui(
 
     .controls-shell {
       display: grid;
-      gap: 12px;
+      gap: 10px;
       justify-items: center;
+      padding: 0 4px;
+    }
+
+    .tool-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      max-width: 100%;
     }
 
     .tool-segment {
@@ -1147,15 +1174,16 @@ def ui(
       gap: 8px;
       padding: 6px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.70);
+      background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: 0 10px 26px rgba(15,23,42,0.06);
+      box-shadow: var(--shadow-soft);
       flex-wrap: wrap;
       justify-content: center;
+      max-width: 100%;
     }
 
     .tool-btn {
-      min-width: 86px;
+      min-width: 82px;
       height: 40px;
       border: none;
       border-radius: 999px;
@@ -1166,6 +1194,7 @@ def ui(
       letter-spacing: -0.01em;
       cursor: pointer;
       transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+      padding: 0 14px;
     }
 
     .tool-btn:hover {
@@ -1179,12 +1208,46 @@ def ui(
       box-shadow: 0 10px 24px rgba(15,23,42,0.16);
     }
 
+    .mini-segment {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      padding: 5px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: var(--shadow-soft);
+      max-width: 100%;
+    }
+
+    .mini-segment.show { display: inline-flex; }
+
+    .mini-btn {
+      height: 34px;
+      min-width: 74px;
+      padding: 0 12px;
+      border: none;
+      border-radius: 999px;
+      background: transparent;
+      color: #475569;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .mini-btn.active {
+      background: rgba(15,23,42,0.92);
+      color: white;
+      box-shadow: 0 8px 18px rgba(15,23,42,0.14);
+    }
+
     .utility-row {
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 12px;
       flex-wrap: wrap;
+      max-width: 100%;
     }
 
     .utility-pill {
@@ -1196,7 +1259,7 @@ def ui(
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: 0 10px 26px rgba(15,23,42,0.05);
+      box-shadow: var(--shadow-soft);
       color: #334155;
       font-size: 13px;
       font-weight: 600;
@@ -1212,7 +1275,7 @@ def ui(
       font-size: 13px;
       font-weight: 700;
       cursor: pointer;
-      box-shadow: 0 10px 26px rgba(15,23,42,0.05);
+      box-shadow: var(--shadow-soft);
     }
 
     .ghost-btn:hover {
@@ -1221,7 +1284,7 @@ def ui(
     }
 
     input[type=range] {
-      width: min(280px, 55vw);
+      width: min(250px, 50vw);
       accent-color: #0f172a;
     }
 
@@ -1235,6 +1298,7 @@ def ui(
       color: #64748b;
       font-size: 13px;
       font-weight: 600;
+      text-align: center;
     }
 
     .warn-badge {
@@ -1249,6 +1313,43 @@ def ui(
       font-size: 12px;
       font-weight: 700;
     }
+
+    .hint-banner {
+      position: fixed;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      z-index: 12000;
+      max-width: min(92vw, 520px);
+      padding: 12px 16px;
+      border-radius: 18px;
+      background: rgba(15,23,42,0.92);
+      color: white;
+      box-shadow: 0 24px 50px rgba(15,23,42,0.24);
+      font-size: 13px;
+      line-height: 1.4;
+      display: none;
+      text-align: center;
+    }
+
+    .hint-banner.show { display: block; }
+
+    .hint-pop {
+      position: fixed;
+      z-index: 12001;
+      max-width: 240px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(15,23,42,0.94);
+      color: white;
+      box-shadow: 0 16px 32px rgba(15,23,42,0.24);
+      font-size: 12px;
+      line-height: 1.4;
+      display: none;
+      pointer-events: none;
+    }
+
+    .hint-pop.show { display: block; }
 
     #cursor {
       position: fixed;
@@ -1280,42 +1381,40 @@ def ui(
     @media (max-width: 980px) {
       .main {
         align-items: stretch;
-        padding: 10px;
+        padding: 8px;
       }
 
       .editor-shell {
         width: 100%;
-        height: calc(100vh - 80px);
+        height: calc(100vh - 64px);
         border-radius: 24px;
-        padding: 12px;
-      }
-
-      .editor-top {
-        grid-template-columns: 1fr;
-        gap: 12px;
-      }
-
-      .canvas-panel {
-        padding: 12px;
-      }
-
-      .canvas-stage {
-        width: min(92vw, 58vh);
-        height: min(92vw, 58vh);
-      }
-
-      .swatch-rail {
-        flex-direction: row;
         padding: 10px;
         gap: 10px;
       }
 
-      .swatch-label {
-        display: none;
+      .editor-top {
+        grid-template-columns: 1fr;
+        gap: 10px;
       }
 
-      .tool-btn {
-        min-width: 78px;
+      .canvas-panel {
+        padding: 10px;
+      }
+
+      .canvas-stage {
+        width: min(88vw, 34vh, 360px);
+        height: min(88vw, 34vh, 360px);
+      }
+
+      .swatch-rail {
+        flex-direction: row;
+        justify-content: center;
+        padding: 10px;
+        gap: 12px;
+      }
+
+      .swatch-label {
+        display: none;
       }
 
       input[type=range] {
@@ -1325,15 +1424,20 @@ def ui(
 
     @media (max-width: 640px) {
       .header {
-        padding: 12px 14px;
+        padding: 8px 10px;
       }
 
       .brand h2 {
-        font-size: 15px;
+        font-size: 14px;
+      }
+
+      .btn-done {
+        padding: 9px 14px;
+        min-width: 74px;
       }
 
       .main {
-        padding: 8px;
+        padding: 6px;
       }
 
       .upload-card {
@@ -1343,41 +1447,45 @@ def ui(
 
       .upload-box {
         border-radius: 20px;
-        padding: 38px 16px;
+        padding: 36px 16px;
       }
 
       .editor-shell {
-        height: calc(100vh - 72px);
-        gap: 10px;
-        padding: 10px;
+        height: calc(100vh - 56px);
+        gap: 8px;
+        padding: 8px;
       }
 
       .canvas-panel {
-        padding: 10px;
-        border-radius: 20px;
+        padding: 8px;
       }
 
       .canvas-stage {
-        width: min(92vw, 52vh);
-        height: min(92vw, 52vh);
+        width: min(88vw, 29vh, 300px);
+        height: min(88vw, 29vh, 300px);
         border-radius: 20px;
       }
 
-      .swatch-rail {
-        border-radius: 18px;
+      .tool-row,
+      .utility-row {
+        gap: 8px;
       }
 
-      .tool-segment {
+      .tool-segment,
+      .mini-segment {
         width: 100%;
+        justify-content: center;
       }
 
       .tool-btn {
-        flex: 1 1 auto;
+        flex: 1 1 0;
         min-width: 0;
+        padding: 0 10px;
       }
 
-      .utility-row {
-        gap: 10px;
+      .mini-btn {
+        flex: 1 1 0;
+        min-width: 0;
       }
 
       .utility-pill {
@@ -1390,7 +1498,12 @@ def ui(
       }
 
       input[type=range] {
-        width: min(200px, 60vw);
+        width: min(190px, 55vw);
+      }
+
+      .hint-banner {
+        bottom: 12px;
+        padding: 10px 14px;
       }
     }
   </style>
@@ -1398,6 +1511,8 @@ def ui(
 <body>
   <div id="cursor"></div>
   <div class="cursor-dot" id="cursorDot"></div>
+  <div class="hint-banner" id="hintBanner"></div>
+  <div class="hint-pop" id="hintPop"></div>
 
   <div class="header">
     <div class="brand">
@@ -1411,7 +1526,7 @@ def ui(
     <div class="upload-card" id="step1">
       <div class="upload-box">
         <input id="file" type="file" accept="image/*" />
-        <div style="font-size:32px;">✨</div>
+        <div style="font-size:30px;">✨</div>
         <div class="title">Upload logo</div>
         <div class="muted" style="margin-top:6px;">We’ll remove the background, clean the edges, and let you fine-tune anything that needs a quick touch-up.</div>
       </div>
@@ -1439,25 +1554,32 @@ def ui(
 
         <div class="swatch-rail">
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn checker active" id="bgChecker" title="Checker"></button>
+            <button class="swatch-btn checker active tip-target" id="bgChecker" data-tip="Grid shows transparency best. Use it to spot leftover background or holes." title="Grid"></button>
             <div class="swatch-label">Grid</div>
           </div>
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn white" id="bgWhite" title="White"></button>
+            <button class="swatch-btn white tip-target" id="bgWhite" data-tip="White helps you check whether white details were removed by mistake." title="White"></button>
             <div class="swatch-label">White</div>
           </div>
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn dark" id="bgDark" title="Dark"></button>
+            <button class="swatch-btn dark tip-target" id="bgDark" data-tip="Dark helps you spot soft halos, haze, and missed transparent edges." title="Dark"></button>
             <div class="swatch-label">Dark</div>
           </div>
         </div>
       </div>
 
       <div class="controls-shell">
-        <div class="tool-segment">
-          <button class="tool-btn active" id="btnRestore">Restore</button>
-          <button class="tool-btn" id="btnErase">Erase</button>
-          <button class="tool-btn" id="btnMagic">Magic</button>
+        <div class="tool-row">
+          <div class="tool-segment">
+            <button class="tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
+            <button class="tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
+            <button class="tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
+          </div>
+
+          <div class="mini-segment" id="magicModeWrap">
+            <button class="mini-btn active tip-target" id="magicRemoveMode" data-tip="Magic Remove removes one connected region based on color.">Remove</button>
+            <button class="mini-btn tip-target" id="magicRestoreMode" data-tip="Magic Restore brings back one connected region from the original image.">Restore</button>
+          </div>
         </div>
 
         <div class="utility-row">
@@ -1465,8 +1587,8 @@ def ui(
             <span>Brush</span>
             <input type="range" id="brushSize" min="8" max="140" value="44">
           </div>
-          <button class="ghost-btn" id="btnUndo">Undo</button>
-          <button class="ghost-btn" id="btnRestart">Reset</button>
+          <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
+          <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image.">Reset</button>
         </div>
       </div>
 
@@ -1479,6 +1601,7 @@ def ui(
 
   let sessionId = null;
   let mode = 'restore';
+  let magicMode = 'remove';
   let isDown = false;
   let lastX = 0;
   let lastY = 0;
@@ -1486,6 +1609,8 @@ def ui(
   let aiReady = false;
   let stageCycleTimer = null;
   let qualityFlags = [];
+  let hintTimer = null;
+  let introBannerTimer = null;
 
   const fileEl = document.getElementById('file');
   const keepOriginalEl = document.getElementById('keepOriginal');
@@ -1501,6 +1626,11 @@ def ui(
   offCanvas.height = 1000;
   const offCtx = offCanvas.getContext('2d');
 
+  const origBaseCanvas = document.createElement('canvas');
+  origBaseCanvas.width = 1000;
+  origBaseCanvas.height = 1000;
+  const origBaseCtx = origBaseCanvas.getContext('2d', { willReadFrequently: true });
+
   const origImg = new Image();
   const currImg = new Image();
 
@@ -1509,6 +1639,10 @@ def ui(
   const btnRestore = document.getElementById('btnRestore');
   const btnMagic = document.getElementById('btnMagic');
   const brushSlider = document.getElementById('brushSize');
+
+  const magicModeWrap = document.getElementById('magicModeWrap');
+  const magicRemoveMode = document.getElementById('magicRemoveMode');
+  const magicRestoreMode = document.getElementById('magicRestoreMode');
 
   const cursor = document.getElementById('cursor');
   const cursorDot = document.getElementById('cursorDot');
@@ -1520,6 +1654,9 @@ def ui(
 
   const statusline = document.getElementById('statusline');
   const statusline1 = document.getElementById('statusline1');
+
+  const hintBanner = document.getElementById('hintBanner');
+  const hintPop = document.getElementById('hintPop');
 
   const bgChecker = document.getElementById('bgChecker');
   const bgWhite = document.getElementById('bgWhite');
@@ -1626,6 +1763,7 @@ def ui(
     cursor.style.height = visualSize + 'px';
     cv.style.cursor = 'none';
   }
+
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
@@ -1654,13 +1792,18 @@ def ui(
     };
   }
 
+  function colorDistance(data, pos, r, g, b) {
+    return Math.abs(data[pos] - r) + Math.abs(data[pos + 1] - g) + Math.abs(data[pos + 2] - b);
+  }
+
   function magicRemove(startX, startY) {
     startX = Math.floor(startX);
     startY = Math.floor(startY);
 
     const imgData = ctx.getImageData(0, 0, cv.width, cv.height);
     const data = imgData.data;
-    const w = cv.width, h = cv.height;
+    const w = cv.width;
+    const h = cv.height;
 
     const startPos = (startY * w + startX) * 4;
     const sa = data[startPos + 3];
@@ -1684,14 +1827,15 @@ def ui(
 
       const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
       for (let i = 0; i < nbs.length; i++) {
-        const nx = nbs[i][0], ny = nbs[i][1];
+        const nx = nbs[i][0];
+        const ny = nbs[i][1];
         if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
           const idx = ny * w + nx;
           if (!seen[idx]) {
             seen[idx] = 1;
             const p2 = idx * 4;
             if (data[p2 + 3] > 0) {
-              const dist = Math.abs(data[p2] - sr) + Math.abs(data[p2 + 1] - sg) + Math.abs(data[p2 + 2] - sb);
+              const dist = colorDistance(data, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
             }
           }
@@ -1700,6 +1844,63 @@ def ui(
     }
 
     ctx.putImageData(imgData, 0, 0);
+  }
+
+  function magicRestore(startX, startY) {
+    startX = Math.floor(startX);
+    startY = Math.floor(startY);
+
+    const curr = ctx.getImageData(0, 0, cv.width, cv.height);
+    const currData = curr.data;
+
+    const orig = origBaseCtx.getImageData(0, 0, cv.width, cv.height);
+    const origData = orig.data;
+
+    const w = cv.width;
+    const h = cv.height;
+    const startPos = (startY * w + startX) * 4;
+
+    if (origData[startPos + 3] === 0) return;
+
+    const sr = origData[startPos];
+    const sg = origData[startPos + 1];
+    const sb = origData[startPos + 2];
+
+    const stack = [startX, startY];
+    const seen = new Uint8Array(w * h);
+    seen[startY * w + startX] = 1;
+
+    const tolerance = 55;
+
+    while (stack.length) {
+      const y = stack.pop();
+      const x = stack.pop();
+      const pos = (y * w + x) * 4;
+
+      currData[pos] = origData[pos];
+      currData[pos + 1] = origData[pos + 1];
+      currData[pos + 2] = origData[pos + 2];
+      currData[pos + 3] = origData[pos + 3];
+
+      const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+      for (let i = 0; i < nbs.length; i++) {
+        const nx = nbs[i][0];
+        const ny = nbs[i][1];
+        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+          const idx = ny * w + nx;
+          if (!seen[idx]) {
+            seen[idx] = 1;
+            const p2 = idx * 4;
+            if (origData[p2 + 3] > 0) {
+              const dist = colorDistance(origData, p2, sr, sg, sb);
+              if (dist <= tolerance) stack.push(nx, ny);
+            }
+          }
+        }
+      }
+    }
+
+    ctx.putImageData(curr, 0, 0);
   }
 
   function drawBrush(x, y) {
@@ -1722,7 +1923,7 @@ def ui(
       ctx.drawImage(offCanvas, 0, 0);
     } else if (mode === 'restore') {
       offCtx.globalCompositeOperation = 'source-in';
-      offCtx.drawImage(origImg, 0, 0, 1000, 1000);
+      offCtx.drawImage(origBaseCanvas, 0, 0, 1000, 1000);
       ctx.globalCompositeOperation = 'source-over';
       ctx.drawImage(offCanvas, 0, 0);
     }
@@ -1731,12 +1932,34 @@ def ui(
     lastY = y;
   }
 
+  function updateMagicModeUI() {
+    magicRemoveMode.classList.toggle('active', magicMode === 'remove');
+    magicRestoreMode.classList.toggle('active', magicMode === 'restore');
+  }
+
+  magicRemoveMode.addEventListener('click', () => {
+    magicMode = 'remove';
+    updateMagicModeUI();
+  });
+
+  magicRestoreMode.addEventListener('click', () => {
+    magicMode = 'restore';
+    updateMagicModeUI();
+  });
+
   function setMode(m, btn) {
     mode = m;
     btnErase.classList.remove('active');
     btnRestore.classList.remove('active');
     btnMagic.classList.remove('active');
     btn.classList.add('active');
+
+    if (mode === 'magic') {
+      magicModeWrap.classList.add('show');
+    } else {
+      magicModeWrap.classList.remove('show');
+    }
+
     updateCursorSize();
   }
 
@@ -1746,12 +1969,17 @@ def ui(
 
   function startDraw(e) {
     if (!aiReady && !keepOriginalEl.checked) return;
+
     saveState();
     isDown = true;
     const c = getCoords(e);
 
     if (mode === 'magic') {
-      magicRemove(c.x, c.y);
+      if (magicMode === 'remove') {
+        magicRemove(c.x, c.y);
+      } else {
+        magicRestore(c.x, c.y);
+      }
       isDown = false;
     } else {
       lastX = c.x;
@@ -1798,13 +2026,13 @@ def ui(
         window.parent.postMessage(payload, "*");
         return true;
       }
-    } catch(e) {}
+    } catch (e) {}
     try {
       if (window.opener && !window.opener.closed) {
         window.opener.postMessage(payload, "*");
         return true;
       }
-    } catch(e) {}
+    } catch (e) {}
     return false;
   }
 
@@ -1821,6 +2049,47 @@ def ui(
     } else {
       statusline.textContent = "AI cutout ready ✓";
     }
+  }
+
+  function showBanner(message, seconds = 5) {
+    hintBanner.textContent = message;
+    hintBanner.classList.add('show');
+    if (introBannerTimer) clearTimeout(introBannerTimer);
+    introBannerTimer = setTimeout(() => {
+      hintBanner.classList.remove('show');
+    }, seconds * 1000);
+  }
+
+  function hideHintPop() {
+    hintPop.classList.remove('show');
+  }
+
+  function showHintPop(target, text, seconds = 5) {
+    if (!text) return;
+    hintPop.textContent = text;
+    const rect = target.getBoundingClientRect();
+    const popW = 230;
+    const x = Math.max(10, Math.min(window.innerWidth - popW - 10, rect.left + (rect.width / 2) - (popW / 2)));
+    const y = rect.top - 62 > 10 ? rect.top - 62 : rect.bottom + 10;
+
+    hintPop.style.left = x + 'px';
+    hintPop.style.top = y + 'px';
+    hintPop.classList.add('show');
+
+    if (hintTimer) clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => {
+      hideHintPop();
+    }, seconds * 1000);
+  }
+
+  function bindHints() {
+    document.querySelectorAll('.tip-target').forEach(el => {
+      const tip = el.getAttribute('data-tip') || '';
+      el.addEventListener('mouseenter', () => showHintPop(el, tip, 5));
+      el.addEventListener('focus', () => showHintPop(el, tip, 5));
+      el.addEventListener('click', () => showHintPop(el, tip, 4));
+      el.addEventListener('touchstart', () => showHintPop(el, tip, 4), { passive: true });
+    });
   }
 
   async function pollAIReady(statusUrl) {
@@ -1843,6 +2112,7 @@ def ui(
             ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
             hideOverlay();
             renderQualityFlags(j.quality_flags || []);
+            showBanner("Tip: try Grid, White, and Dark to double-check your edges before you hit Done.", 6);
           };
 
           currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
@@ -1911,6 +2181,9 @@ def ui(
         origImg.src = `${API_BASE}/original/${sessionId}?t=${Date.now()}`;
       });
 
+      origBaseCtx.clearRect(0, 0, 1000, 1000);
+      origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
+
       ctx.clearRect(0, 0, cv.width, cv.height);
       ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
 
@@ -1922,6 +2195,7 @@ def ui(
       } else {
         hideOverlay();
         statusline.textContent = "Using original";
+        showBanner("Tip: use Grid, White, and Dark to check for missing details before you finish.", 6);
       }
 
       updateCursorSize();
@@ -1977,6 +2251,8 @@ def ui(
 
   setBgMode('checker');
   updateCursorSize();
+  updateMagicModeUI();
+  bindHints();
 </script>
 </body>
 </html>"""
