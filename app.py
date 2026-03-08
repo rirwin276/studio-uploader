@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.3.0")
+app = FastAPI(title="Studio Uploader", version="2.4.0")
 
 
 # ----------------------------
@@ -1453,6 +1453,24 @@ def ui(
 
     .hint-pop.show { display: block; }
 
+    .mobile-editor-note {
+      display: none;
+      width: 100%;
+      max-width: 520px;
+      padding: 10px 12px;
+      border-radius: 16px;
+      background: rgba(15,23,42,0.92);
+      color: white;
+      font-size: 12px;
+      line-height: 1.4;
+      text-align: center;
+      box-shadow: 0 18px 40px rgba(15,23,42,0.20);
+    }
+
+    .mobile-editor-note.show {
+      display: block;
+    }
+
     #cursor {
       position: fixed;
       width: 32px;
@@ -1480,11 +1498,9 @@ def ui(
       display: none;
     }
 
-    .mobile-tools {
-      display: none;
-    }
-
-    .mobile-magic-sheet {
+    .mobile-tools,
+    .mobile-editor-note,
+    .mobile-magic-controls {
       display: none;
     }
 
@@ -1509,11 +1525,6 @@ def ui(
 
       .tool-rail {
         display: none !important;
-      }
-
-      .mobile-tools {
-        display: flex;
-        width: 100%;
       }
 
       .canvas-panel {
@@ -1542,6 +1553,11 @@ def ui(
 
       input[type=range] {
         width: min(180px, 36vw);
+      }
+
+      .mobile-tools {
+        display: flex;
+        width: 100%;
       }
     }
 
@@ -1578,6 +1594,7 @@ def ui(
         height: calc(100vh - 56px);
         gap: 6px;
         padding: 6px;
+        grid-template-rows: minmax(0,1fr) auto;
       }
 
       .canvas-panel {
@@ -1623,73 +1640,46 @@ def ui(
         border-radius: 16px;
       }
 
-      .tool-row,
-      .utility-row {
-        gap: 6px;
+      .editor-controls {
+        width: 100%;
       }
 
-      .tool-segment {
+      .editor-controls.show {
         display: grid;
+      }
+
+      .mobile-editor-note.show {
+        display: block;
+      }
+
+      .mobile-magic-controls.show {
+        display: grid;
+        width: 100%;
         grid-template-columns: 1fr 1fr;
-        gap: 6px;
-        padding: 6px;
-        border-radius: 18px;
-        width: 100%;
+        gap: 8px;
       }
 
-      .tool-btn {
-        width: 100%;
-        height: 38px;
-        padding: 0 8px;
-        font-size: 12px;
-        border-radius: 14px;
+      .mobile-magic-btn {
+        height: 42px;
+        border: none;
+        border-radius: 16px;
+        background: rgba(255,255,255,0.90);
+        color: #334155;
+        font-size: 13px;
+        font-weight: 800;
+        cursor: pointer;
+        border: 1px solid rgba(15,23,42,0.08);
+        box-shadow: var(--shadow-soft);
       }
 
-      .utility-row {
-        display: grid;
-        grid-template-columns: 1fr;
-        width: 100%;
+      .mobile-magic-btn.active {
+        background: #0f172a;
+        color: white;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.16);
       }
 
-      .utility-pill,
-      .zoom-pill {
-        width: 100%;
-        justify-content: center;
-        height: 36px;
-        font-size: 11px;
-        border-radius: 18px;
-      }
-
-      .ghost-btn {
-        height: 36px;
-        padding: 0 10px;
-        font-size: 11px;
-        border-radius: 18px;
-      }
-
-      .utility-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr 1fr;
-        gap: 6px;
-        width: 100%;
-      }
-
-      input[type=range] {
-        width: min(150px, 38vw);
-      }
-
-      .zoom-range {
-        width: min(118px, 28vw);
-      }
-
-      .zoom-readout {
-        min-width: 38px;
-        font-size: 11px;
-      }
-
-      .zoom-btn {
-        width: 26px;
-        height: 26px;
+      .desktop-edit-controls {
+        display: none !important;
       }
 
       .status-row {
@@ -1701,56 +1691,6 @@ def ui(
         bottom: 12px;
         padding: 10px 14px;
       }
-
-      .mobile-magic-sheet {
-        position: fixed;
-        left: 12px;
-        right: 12px;
-        bottom: 22px;
-        z-index: 13000;
-        display: none;
-        padding: 10px;
-        border-radius: 22px;
-        background: rgba(255,255,255,0.96);
-        border: 1px solid rgba(15,23,42,0.08);
-        box-shadow: 0 24px 50px rgba(15,23,42,0.18);
-        backdrop-filter: blur(18px) saturate(1.15);
-      }
-
-      .mobile-magic-sheet.show {
-        display: block;
-      }
-
-      .mobile-magic-title {
-        font-size: 12px;
-        font-weight: 800;
-        color: #475569;
-        text-align: center;
-        margin-bottom: 8px;
-      }
-
-      .mobile-magic-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 8px;
-      }
-
-      .mobile-magic-btn {
-        height: 42px;
-        border: none;
-        border-radius: 16px;
-        background: rgba(15,23,42,0.06);
-        color: #334155;
-        font-size: 13px;
-        font-weight: 800;
-        cursor: pointer;
-      }
-
-      .mobile-magic-btn.active {
-        background: #0f172a;
-        color: white;
-        box-shadow: 0 10px 24px rgba(15,23,42,0.16);
-      }
     }
   </style>
 </head>
@@ -1759,14 +1699,6 @@ def ui(
   <div class="cursor-dot" id="cursorDot"></div>
   <div class="hint-banner" id="hintBanner"></div>
   <div class="hint-pop" id="hintPop"></div>
-
-  <div class="mobile-magic-sheet" id="mobileMagicSheet">
-    <div class="mobile-magic-title">Magic mode</div>
-    <div class="mobile-magic-actions">
-      <button class="mobile-magic-btn active" id="magicRemoveModeMobileSheet">Remove</button>
-      <button class="mobile-magic-btn" id="magicRestoreModeMobileSheet">Restore</button>
-    </div>
-  </div>
 
   <div class="header">
     <div class="brand">
@@ -1848,32 +1780,43 @@ def ui(
         </div>
 
         <div class="editor-controls" id="editorControls">
-          <div class="tool-row mobile-tools">
-            <div class="tool-segment">
-              <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
-              <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
-              <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
-              <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
-            </div>
+          <div class="mobile-editor-note" id="mobileEditorNote">
+            Quick mobile fix mode: you can use Magic Remove or Magic Restore here. For finer edits and full tools, open this on a desktop or laptop.
           </div>
 
-          <div class="utility-row">
-            <div class="utility-pill">
-              <span>Brush</span>
-              <input type="range" id="brushSize" min="8" max="140" value="44">
+          <div class="mobile-magic-controls" id="mobileMagicControls">
+            <button class="mobile-magic-btn active" id="btnMagicRemoveOnlyMobile">Magic Remove</button>
+            <button class="mobile-magic-btn" id="btnMagicRestoreOnlyMobile">Magic Restore</button>
+          </div>
+
+          <div class="desktop-edit-controls" id="desktopEditControls">
+            <div class="tool-row">
+              <div class="tool-segment">
+                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
+                <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
+                <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
+                <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
+              </div>
             </div>
 
-            <div class="zoom-pill">
-              <button class="zoom-btn" id="zoomOut" type="button">−</button>
-              <span class="zoom-readout" id="zoomReadout">100%</span>
-              <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
-              <button class="zoom-btn" id="zoomIn" type="button">+</button>
-            </div>
+            <div class="utility-row">
+              <div class="utility-pill">
+                <span>Brush</span>
+                <input type="range" id="brushSize" min="8" max="140" value="44">
+              </div>
 
-            <div class="utility-actions">
-              <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
-              <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-              <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+              <div class="zoom-pill">
+                <button class="zoom-btn" id="zoomOut" type="button">−</button>
+                <span class="zoom-readout" id="zoomReadout">100%</span>
+                <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
+                <button class="zoom-btn" id="zoomIn" type="button">+</button>
+              </div>
+
+              <div class="utility-actions">
+                <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
+                <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
+                <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1938,6 +1881,9 @@ def ui(
   const reviewControls = document.getElementById('reviewControls');
   const editorControls = document.getElementById('editorControls');
   const desktopToolRail = document.getElementById('desktopToolRail');
+  const mobileEditorNote = document.getElementById('mobileEditorNote');
+  const mobileMagicControls = document.getElementById('mobileMagicControls');
+  const desktopEditControls = document.getElementById('desktopEditControls');
 
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
@@ -1949,15 +1895,14 @@ def ui(
   const btnMagicMobile = document.getElementById('btnMagicMobile');
   const btnPanMobile = document.getElementById('btnPanMobile');
 
+  const btnMagicRemoveOnlyMobile = document.getElementById('btnMagicRemoveOnlyMobile');
+  const btnMagicRestoreOnlyMobile = document.getElementById('btnMagicRestoreOnlyMobile');
+
   const brushSlider = document.getElementById('brushSize');
 
   const magicModeWrapDesktop = document.getElementById('magicModeWrapDesktop');
   const magicRemoveModeDesktop = document.getElementById('magicRemoveModeDesktop');
   const magicRestoreModeDesktop = document.getElementById('magicRestoreModeDesktop');
-
-  const mobileMagicSheet = document.getElementById('mobileMagicSheet');
-  const magicRemoveModeMobileSheet = document.getElementById('magicRemoveModeMobileSheet');
-  const magicRestoreModeMobileSheet = document.getElementById('magicRestoreModeMobileSheet');
 
   const cursor = document.getElementById('cursor');
   const cursorDot = document.getElementById('cursorDot');
@@ -2019,6 +1964,10 @@ def ui(
   }
 
   function isMobile() {
+    return window.innerWidth <= 640;
+  }
+
+  function isTabletOrMobile() {
     return window.innerWidth <= 980;
   }
 
@@ -2040,7 +1989,8 @@ def ui(
     reviewControls.style.display = 'grid';
     editorControls.classList.remove('show');
     desktopToolRail.style.display = 'none';
-    mobileMagicSheet.classList.remove('show');
+    mobileEditorNote.classList.remove('show');
+    mobileMagicControls.classList.remove('show');
     fitView();
     setCanvasCursor('default');
     showBanner("Review your image first. If it looks good, hit Done. If not, tap Edit.", 4);
@@ -2053,13 +2003,30 @@ def ui(
     reviewControls.style.display = 'none';
     editorControls.classList.add('show');
 
-    if (!isMobile()) {
+    if (isMobile()) {
+      desktopToolRail.style.display = 'none';
+      mobileEditorNote.classList.add('show');
+      mobileMagicControls.classList.add('show');
+      desktopEditControls.style.display = 'none';
+      mode = 'magic';
+      magicMode = 'remove';
+      updateMobileMagicOnlyUI();
+      setCanvasCursor('crosshair');
+      showBanner("Quick mobile fix mode enabled. Desktop or laptop gives you finer editing.", 5);
+      return;
+    }
+
+    mobileEditorNote.classList.remove('show');
+    mobileMagicControls.classList.remove('show');
+    desktopEditControls.style.display = 'grid';
+
+    if (!isTabletOrMobile()) {
       desktopToolRail.style.display = 'flex';
     } else {
       desktopToolRail.style.display = 'none';
     }
 
-    updateMagicSheetVisibility();
+    updateMagicModeUI();
     updateCursorSize();
     showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
   }
@@ -2098,17 +2065,17 @@ def ui(
   }
 
   zoomIn.addEventListener('click', () => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     setZoom(viewScale + 0.25);
   });
 
   zoomOut.addEventListener('click', () => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     setZoom(viewScale - 0.25);
   });
 
   zoomSlider.addEventListener('input', () => {
-    if (!editorUnlocked) {
+    if (!editorUnlocked || isMobile()) {
       fitView();
       return;
     }
@@ -2116,12 +2083,12 @@ def ui(
   });
 
   btnFit.addEventListener('click', () => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     fitView();
   });
 
   canvasViewport.addEventListener('wheel', (e) => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     e.preventDefault();
     const delta = e.deltaY < 0 ? 0.15 : -0.15;
     setZoom(viewScale + delta);
@@ -2183,12 +2150,12 @@ def ui(
   }
 
   document.getElementById('btnUndo').addEventListener('click', () => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
   });
 
   document.getElementById('btnRestart').addEventListener('click', async () => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     if (sessionId) {
       await loadExistingSession(sessionId, false);
       enterEditMode();
@@ -2202,6 +2169,13 @@ def ui(
       cursor.style.display = 'none';
       cursorDot.style.display = 'none';
       setCanvasCursor('default');
+      return;
+    }
+
+    if (isMobile()) {
+      cursor.style.display = 'none';
+      cursorDot.style.display = 'none';
+      setCanvasCursor('crosshair');
       return;
     }
 
@@ -2230,7 +2204,7 @@ def ui(
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
     if (mode !== 'magic' && mode !== 'pan') {
       cursor.style.display = 'block';
       cursorDot.style.display = 'block';
@@ -2399,20 +2373,15 @@ def ui(
   function updateMagicModeUI() {
     magicRemoveModeDesktop.classList.toggle('active', magicMode === 'remove');
     magicRestoreModeDesktop.classList.toggle('active', magicMode === 'restore');
-    magicRemoveModeMobileSheet.classList.toggle('active', magicMode === 'remove');
-    magicRestoreModeMobileSheet.classList.toggle('active', magicMode === 'restore');
   }
 
-  function updateMagicSheetVisibility() {
-    if (window.innerWidth <= 640 && editorUnlocked && mode === 'magic') {
-      mobileMagicSheet.classList.add('show');
-    } else {
-      mobileMagicSheet.classList.remove('show');
-    }
+  function updateMobileMagicOnlyUI() {
+    btnMagicRemoveOnlyMobile.classList.toggle('active', magicMode === 'remove');
+    btnMagicRestoreOnlyMobile.classList.toggle('active', magicMode === 'restore');
   }
 
   function setMode(m) {
-    if (!editorUnlocked) return;
+    if (!editorUnlocked || isMobile()) return;
 
     mode = m;
 
@@ -2441,7 +2410,7 @@ def ui(
       magicModeWrapDesktop.classList.remove('show');
     }
 
-    updateMagicSheetVisibility();
+    updateMagicModeUI();
     updateCursorSize();
   }
 
@@ -2455,14 +2424,18 @@ def ui(
     updateMagicModeUI();
   });
 
-  magicRemoveModeMobileSheet.addEventListener('click', () => {
+  btnMagicRemoveOnlyMobile.addEventListener('click', () => {
     magicMode = 'remove';
-    updateMagicModeUI();
+    mode = 'magic';
+    updateMobileMagicOnlyUI();
+    updateCursorSize();
   });
 
-  magicRestoreModeMobileSheet.addEventListener('click', () => {
+  btnMagicRestoreOnlyMobile.addEventListener('click', () => {
     magicMode = 'restore';
-    updateMagicModeUI();
+    mode = 'magic';
+    updateMobileMagicOnlyUI();
+    updateCursorSize();
   });
 
   btnErase.addEventListener('click', () => setMode('remove'));
@@ -2522,7 +2495,7 @@ def ui(
     if (!editorUnlocked) return;
     if (!aiReady && !keepOriginalEl.checked) return;
 
-    if (mode === 'pan') {
+    if (!isMobile() && mode === 'pan') {
       beginPan(e);
       if (e.cancelable) e.preventDefault();
       return;
@@ -2532,7 +2505,7 @@ def ui(
     isDown = true;
     const c = getCoords(e);
 
-    if (mode === 'magic') {
+    if (mode === 'magic' || isMobile()) {
       if (magicMode === 'remove') {
         magicRemove(c.x, c.y);
       } else {
@@ -2550,6 +2523,7 @@ def ui(
 
   function moveDraw(e) {
     if (!editorUnlocked) return;
+    if (isMobile()) return;
 
     if (mode === 'pan') {
       movePan(e);
@@ -2862,25 +2836,48 @@ def ui(
   setBgMode('checker');
   fitView();
   updateMagicModeUI();
+  updateMobileMagicOnlyUI();
   bindHints();
   syncTopDoneButton();
   enterReviewMode();
 
   window.addEventListener('resize', () => {
     updateViewportTransform();
-    updateMagicSheetVisibility();
+
     if (!editorUnlocked) {
       step3.classList.add('review-mode');
       step3.classList.remove('edit-mode');
-    } else {
+      desktopToolRail.style.display = 'none';
+      return;
+    }
+
+    if (isMobile()) {
       step3.classList.add('edit-mode');
       step3.classList.remove('review-mode');
-      if (!isMobile()) {
-        desktopToolRail.style.display = 'flex';
-      } else {
-        desktopToolRail.style.display = 'none';
-      }
+      desktopToolRail.style.display = 'none';
+      mobileEditorNote.classList.add('show');
+      mobileMagicControls.classList.add('show');
+      desktopEditControls.style.display = 'none';
+      mode = 'magic';
+      updateMobileMagicOnlyUI();
+      updateCursorSize();
+      return;
     }
+
+    mobileEditorNote.classList.remove('show');
+    mobileMagicControls.classList.remove('show');
+    desktopEditControls.style.display = 'grid';
+
+    step3.classList.add('edit-mode');
+    step3.classList.remove('review-mode');
+
+    if (!isTabletOrMobile()) {
+      desktopToolRail.style.display = 'flex';
+    } else {
+      desktopToolRail.style.display = 'none';
+    }
+
+    updateCursorSize();
   });
 
   (async function boot() {
