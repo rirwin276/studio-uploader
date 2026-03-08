@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.8.0")
+app = FastAPI(title="Studio Uploader", version="1.9.0")
 
 
 # ----------------------------
@@ -132,6 +132,11 @@ def _paths(session_id: str) -> Dict[str, Path]:
     }
 
 
+def _session_exists(session_id: str) -> bool:
+    p = _paths(session_id)
+    return p["orig"].exists() and p["curr"].exists()
+
+
 def _save_png(img: Image.Image, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(path), "PNG", optimize=True)
@@ -145,7 +150,7 @@ def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 
-def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.82) -> Image.Image:
+def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.92) -> Image.Image:
     """
     Scale both up and down for the editor so small uploads don't look tiny.
     This is editor-only convenience, not final output logic.
@@ -449,8 +454,31 @@ def healthz():
 def session_status(session_id: str):
     s = _sess_get(session_id)
     if not s:
+        if _session_exists(session_id):
+            return {
+                "status": "ready",
+                "stage": "ready",
+                "quality_flags": [],
+            }
         return {"status": "unknown"}
     return s
+
+
+@app.get("/session-info/{session_id}")
+def session_info(session_id: str):
+    if not _session_exists(session_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    s = _sess_get(session_id)
+    return {
+        "status": s.get("status", "ready"),
+        "stage": s.get("stage", "ready"),
+        "quality_flags": s.get("quality_flags", []),
+        "session_id": session_id,
+        "preview_url": f"/preview/{session_id}",
+        "original_url": f"/original/{session_id}",
+        "status_url": f"/status/{session_id}",
+    }
 
 
 # --------
@@ -542,6 +570,7 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
 
     final_img = _normalize_logo(browser_img, target_size=TARGET_PX)
     _save_png(final_img, p["curr"])
+    _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
     return {"status": "ok"}
 
 
@@ -779,6 +808,7 @@ def ui(
     return_mode: str = Query("postmessage", alias="return"),
     slot: str = Query("main"),
     return_to: str = Query("", alias="return_to"),
+    session_id: str = Query("", alias="session_id"),
 ):
     html = r"""<!doctype html>
 <html lang="en">
@@ -967,7 +997,7 @@ def ui(
     }
 
     .editor-shell {
-      width: min(1180px, 100%);
+      width: min(1400px, 100%);
       height: calc(100vh - 68px);
       min-height: 0;
       display: grid;
@@ -1004,8 +1034,8 @@ def ui(
     }
 
     .canvas-stage {
-      width: min(54vw, 44vh, 500px);
-      height: min(54vw, 44vh, 500px);
+      width: min(78vw, 74vh, 920px);
+      height: min(78vw, 74vh, 920px);
       max-width: 100%;
       max-height: 100%;
       aspect-ratio: 1 / 1;
@@ -1038,6 +1068,20 @@ def ui(
       background-image: none;
     }
 
+    .canvas-viewport {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      touch-action: none;
+    }
+
+    .canvas-inner {
+      position: absolute;
+      inset: 0;
+      transform-origin: center center;
+      will-change: transform;
+    }
+
     canvas {
       position: absolute;
       inset: 0;
@@ -1053,7 +1097,7 @@ def ui(
       position: absolute;
       inset: 0;
       display: none;
-      z-index: 5;
+      z-index: 6;
       align-items: center;
       justify-content: center;
       flex-direction: column;
@@ -1283,9 +1327,45 @@ def ui(
       color: #0f172a;
     }
 
+    .zoom-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 42px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: var(--shadow-soft);
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .zoom-btn {
+      width: 32px;
+      height: 32px;
+      border: none;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.06);
+      color: #0f172a;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .zoom-readout {
+      min-width: 52px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+
     input[type=range] {
       width: min(250px, 50vw);
       accent-color: #0f172a;
+    }
+
+    .zoom-range {
+      width: min(170px, 36vw);
     }
 
     .status-row {
@@ -1402,8 +1482,8 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(88vw, 34vh, 360px);
-        height: min(88vw, 34vh, 360px);
+        width: min(94vw, 52vh, 620px);
+        height: min(94vw, 52vh, 620px);
       }
 
       .swatch-rail {
@@ -1419,6 +1499,10 @@ def ui(
 
       input[type=range] {
         width: min(220px, 54vw);
+      }
+
+      .zoom-range {
+        width: min(180px, 42vw);
       }
     }
 
@@ -1461,8 +1545,8 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(88vw, 29vh, 300px);
-        height: min(88vw, 29vh, 300px);
+        width: min(96vw, 48vh, 500px);
+        height: min(96vw, 48vh, 500px);
         border-radius: 20px;
       }
 
@@ -1488,7 +1572,8 @@ def ui(
         min-width: 0;
       }
 
-      .utility-pill {
+      .utility-pill,
+      .zoom-pill {
         width: 100%;
         justify-content: center;
       }
@@ -1499,6 +1584,10 @@ def ui(
 
       input[type=range] {
         width: min(190px, 55vw);
+      }
+
+      .zoom-range {
+        width: min(160px, 44vw);
       }
 
       .hint-banner {
@@ -1517,7 +1606,7 @@ def ui(
   <div class="header">
     <div class="brand">
       <h2>Studio Uploader</h2>
-      <span class="brand-pill">main</span>
+      <span class="brand-pill" id="slotPill">main</span>
     </div>
     <button class="btn-done" id="btnDone" style="display:none;">Done</button>
   </div>
@@ -1543,12 +1632,17 @@ def ui(
       <div class="editor-top">
         <div class="canvas-panel">
           <div class="canvas-stage bg-checker" id="canvasContainer">
+            <div class="canvas-viewport" id="canvasViewport">
+              <div class="canvas-inner" id="canvasInner">
+                <canvas id="cv" width="1000" height="1000"></canvas>
+              </div>
+            </div>
+
             <div class="processing-overlay" id="processingOverlay">
               <div class="spinner"></div>
               <div class="overlay-title" id="overlayTitle">Preparing your logo…</div>
               <div class="overlay-sub" id="overlaySub">This usually takes 5–10 seconds.</div>
             </div>
-            <canvas id="cv" width="1000" height="1000"></canvas>
           </div>
         </div>
 
@@ -1574,6 +1668,7 @@ def ui(
             <button class="tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
             <button class="tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
             <button class="tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
+            <button class="tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around when zoomed in for precise edits.">Pan</button>
           </div>
 
           <div class="mini-segment" id="magicModeWrap">
@@ -1587,8 +1682,17 @@ def ui(
             <span>Brush</span>
             <input type="range" id="brushSize" min="8" max="140" value="44">
           </div>
+
+          <div class="zoom-pill">
+            <button class="zoom-btn" id="zoomOut" type="button">−</button>
+            <span class="zoom-readout" id="zoomReadout">100%</span>
+            <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
+            <button class="zoom-btn" id="zoomIn" type="button">+</button>
+          </div>
+
+          <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
           <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-          <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image.">Reset</button>
+          <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
         </div>
       </div>
 
@@ -1611,6 +1715,15 @@ def ui(
   let qualityFlags = [];
   let hintTimer = null;
   let introBannerTimer = null;
+
+  let viewScale = 1;
+  let panX = 0;
+  let panY = 0;
+  let isPanning = false;
+  let panStartX = 0;
+  let panStartY = 0;
+  let startPanX = 0;
+  let startPanY = 0;
 
   const fileEl = document.getElementById('file');
   const keepOriginalEl = document.getElementById('keepOriginal');
@@ -1638,6 +1751,7 @@ def ui(
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
   const btnMagic = document.getElementById('btnMagic');
+  const btnPan = document.getElementById('btnPan');
   const brushSlider = document.getElementById('brushSize');
 
   const magicModeWrap = document.getElementById('magicModeWrap');
@@ -1648,6 +1762,8 @@ def ui(
   const cursorDot = document.getElementById('cursorDot');
 
   const canvasContainer = document.getElementById('canvasContainer');
+  const canvasViewport = document.getElementById('canvasViewport');
+  const canvasInner = document.getElementById('canvasInner');
   const processingOverlay = document.getElementById('processingOverlay');
   const overlayTitle = document.getElementById('overlayTitle');
   const overlaySub = document.getElementById('overlaySub');
@@ -1662,9 +1778,19 @@ def ui(
   const bgWhite = document.getElementById('bgWhite');
   const bgDark = document.getElementById('bgDark');
 
+  const zoomSlider = document.getElementById('zoomSlider');
+  const zoomReadout = document.getElementById('zoomReadout');
+  const zoomIn = document.getElementById('zoomIn');
+  const zoomOut = document.getElementById('zoomOut');
+  const btnFit = document.getElementById('btnFit');
+  const slotPill = document.getElementById('slotPill');
+
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
   const RETURN_TO = params.get('return_to') || '';
+  const EXISTING_SESSION_ID = (params.get('session_id') || '').trim();
+
+  slotPill.textContent = SLOT;
 
   const STAGE_LABELS = {
     queued: "Uploading image…",
@@ -1686,6 +1812,58 @@ def ui(
   ];
 
   fileEl.addEventListener('click', () => { fileEl.value = ""; });
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function updateViewportTransform() {
+    canvasInner.style.transform = `translate(${panX}px, ${panY}px) scale(${viewScale})`;
+    zoomSlider.value = Math.round(viewScale * 100);
+    zoomReadout.textContent = `${Math.round(viewScale * 100)}%`;
+    updateCursorSize();
+  }
+
+  function fitView() {
+    viewScale = 1;
+    panX = 0;
+    panY = 0;
+    updateViewportTransform();
+  }
+
+  function setZoom(nextScale) {
+    const oldScale = viewScale;
+    viewScale = clamp(nextScale, 1, 6);
+
+    if (oldScale === viewScale) {
+      updateViewportTransform();
+      return;
+    }
+
+    const stageRect = canvasViewport.getBoundingClientRect();
+    const maxPanX = ((viewScale - 1) * stageRect.width) / 2;
+    const maxPanY = ((viewScale - 1) * stageRect.height) / 2;
+
+    panX = clamp(panX, -maxPanX, maxPanX);
+    panY = clamp(panY, -maxPanY, maxPanY);
+
+    updateViewportTransform();
+  }
+
+  function zoomBy(delta) {
+    setZoom(viewScale + delta);
+  }
+
+  zoomIn.addEventListener('click', () => zoomBy(0.25));
+  zoomOut.addEventListener('click', () => zoomBy(-0.25));
+  zoomSlider.addEventListener('input', () => setZoom(parseInt(zoomSlider.value, 10) / 100));
+  btnFit.addEventListener('click', fitView);
+
+  canvasViewport.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.15 : -0.15;
+    zoomBy(delta);
+  }, { passive: false });
 
   function setBgMode(mode) {
     canvasContainer.classList.remove('bg-checker', 'bg-white', 'bg-dark');
@@ -1746,18 +1924,24 @@ def ui(
     if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
   });
 
-  document.getElementById('btnRestart').addEventListener('click', () => location.reload());
+  document.getElementById('btnRestart').addEventListener('click', async () => {
+    if (sessionId) {
+      await loadExistingSession(sessionId, false);
+    } else {
+      location.reload();
+    }
+  });
 
   function updateCursorSize() {
-    if (mode === 'magic') {
+    if (mode === 'magic' || mode === 'pan') {
       cursor.style.display = 'none';
       cursorDot.style.display = 'none';
-      cv.style.cursor = 'crosshair';
+      cv.style.cursor = mode === 'pan' ? 'grab' : 'crosshair';
       return;
     }
 
-    const displayWidth = cv.getBoundingClientRect().width;
-    const ratio = displayWidth / 1000;
+    const rect = cv.getBoundingClientRect();
+    const ratio = rect.width / 1000;
     const visualSize = brushSlider.value * ratio;
     cursor.style.width = visualSize + 'px';
     cursor.style.height = visualSize + 'px';
@@ -1767,7 +1951,7 @@ def ui(
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
-    if (mode !== 'magic') {
+    if (mode !== 'magic' && mode !== 'pan') {
       cursor.style.display = 'block';
       cursorDot.style.display = 'block';
       cursor.style.left = e.clientX + 'px';
@@ -1952,6 +2136,7 @@ def ui(
     btnErase.classList.remove('active');
     btnRestore.classList.remove('active');
     btnMagic.classList.remove('active');
+    btnPan.classList.remove('active');
     btn.classList.add('active');
 
     if (mode === 'magic') {
@@ -1960,15 +2145,61 @@ def ui(
       magicModeWrap.classList.remove('show');
     }
 
+    if (mode === 'pan') {
+      cv.style.cursor = 'grab';
+    }
+
     updateCursorSize();
   }
 
   btnErase.addEventListener('click', () => setMode('remove', btnErase));
   btnRestore.addEventListener('click', () => setMode('restore', btnRestore));
   btnMagic.addEventListener('click', () => setMode('magic', btnMagic));
+  btnPan.addEventListener('click', () => setMode('pan', btnPan));
+
+  function beginPan(evt) {
+    isPanning = true;
+    const pointX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    const pointY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+    panStartX = pointX;
+    panStartY = pointY;
+    startPanX = panX;
+    startPanY = panY;
+    cv.style.cursor = 'grabbing';
+  }
+
+  function movePan(evt) {
+    if (!isPanning) return;
+
+    const pointX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    const pointY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+    const dx = pointX - panStartX;
+    const dy = pointY - panStartY;
+
+    const stageRect = canvasViewport.getBoundingClientRect();
+    const maxPanX = ((viewScale - 1) * stageRect.width) / 2;
+    const maxPanY = ((viewScale - 1) * stageRect.height) / 2;
+
+    panX = clamp(startPanX + dx, -maxPanX, maxPanX);
+    panY = clamp(startPanY + dy, -maxPanY, maxPanY);
+    updateViewportTransform();
+
+    if (evt.cancelable) evt.preventDefault();
+  }
+
+  function endPan() {
+    isPanning = false;
+    if (mode === 'pan') cv.style.cursor = 'grab';
+  }
 
   function startDraw(e) {
     if (!aiReady && !keepOriginalEl.checked) return;
+
+    if (mode === 'pan') {
+      beginPan(e);
+      if (e.cancelable) e.preventDefault();
+      return;
+    }
 
     saveState();
     isDown = true;
@@ -1991,6 +2222,11 @@ def ui(
   }
 
   function moveDraw(e) {
+    if (mode === 'pan') {
+      movePan(e);
+      return;
+    }
+
     if (!isDown || mode === 'magic') return;
 
     const c = getCoords(e);
@@ -2010,6 +2246,7 @@ def ui(
 
   function endDraw() {
     isDown = false;
+    endPan();
   }
 
   cv.addEventListener('mousedown', startDraw);
@@ -2112,6 +2349,7 @@ def ui(
             ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
             hideOverlay();
             renderQualityFlags(j.quality_flags || []);
+            fitView();
             showBanner("Tip: try Grid, White, and Dark to double-check your edges before you hit Done.", 6);
           };
 
@@ -2139,6 +2377,44 @@ def ui(
     overlayTitle.textContent = "Still processing…";
     overlaySub.textContent = "This is taking longer than usual. You can wait a bit longer or restart.";
     statusline.textContent = "AI cutout taking longer than usual.";
+  }
+
+  async function loadExistingSession(existingId, showSavedBanner = true) {
+    const r = await fetch(`${API_BASE}/session-info/${existingId}?t=${Date.now()}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Saved session not found");
+
+    sessionId = existingId;
+    aiReady = true;
+    qualityFlags = Array.isArray(j.quality_flags) ? j.quality_flags : [];
+
+    step1.style.display = 'none';
+    step3.style.display = 'grid';
+    btnDone.style.display = 'inline-flex';
+    hideOverlay();
+
+    await new Promise(res => {
+      origImg.onload = res;
+      origImg.src = `${API_BASE}/original/${sessionId}?t=${Date.now()}`;
+    });
+
+    origBaseCtx.clearRect(0, 0, 1000, 1000);
+    origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
+
+    await new Promise(res => {
+      currImg.onload = res;
+      currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
+    });
+
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
+
+    renderQualityFlags(qualityFlags);
+    fitView();
+
+    if (showSavedBanner) {
+      showBanner("Loaded your saved image. You can keep editing right where you left off.", 5);
+    }
   }
 
   async function handlePickedFile() {
@@ -2186,6 +2462,8 @@ def ui(
 
       ctx.clearRect(0, 0, cv.width, cv.height);
       ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
+
+      fitView();
 
       if (!keepOriginalEl.checked) {
         showOverlay("Uploading image…", "Please wait while we prepare your logo.");
@@ -2250,9 +2528,23 @@ def ui(
   });
 
   setBgMode('checker');
-  updateCursorSize();
+  fitView();
   updateMagicModeUI();
   bindHints();
+
+  window.addEventListener('resize', () => {
+    updateViewportTransform();
+  });
+
+  (async function boot() {
+    try {
+      if (EXISTING_SESSION_ID) {
+        await loadExistingSession(EXISTING_SESSION_ID, true);
+      }
+    } catch (e) {
+      console.warn("Failed to load existing session:", e);
+    }
+  })();
 </script>
 </body>
 </html>"""
