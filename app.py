@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — review-first editor UX
+# app.py — Studio Uploader (FastAPI) — mask-based editor (non-destructive)
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.6.0")
+app = FastAPI(title="Studio Uploader", version="3.0.0")
 
 
 # ----------------------------
@@ -127,15 +127,16 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
-        "orig": UPLOAD_DIR / f"{session_id}_orig.png",
-        "curr": UPLOAD_DIR / f"{session_id}_curr.png",
-        "restore": UPLOAD_DIR / f"{session_id}_restore.png",
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",      # editor-sized, original aligned
+        "editor": UPLOAD_DIR / f"{session_id}_editor.png",  # editor-sized preview
+        "curr": UPLOAD_DIR / f"{session_id}_curr.png",      # final normalized output for downstream
+        "mask": UPLOAD_DIR / f"{session_id}_mask.png",      # editor-sized alpha mask
     }
 
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    return p["orig"].exists() and p["curr"].exists()
+    return p["orig"].exists() and p["editor"].exists() and p["curr"].exists() and p["mask"].exists()
 
 
 def _save_png(img: Image.Image, path: Path):
@@ -176,6 +177,13 @@ def _pil_to_png_bytes(img: Image.Image) -> bytes:
     out = BytesIO()
     img.save(out, format="PNG")
     return out.getvalue()
+
+
+def _pil_to_mask_rgba(img: Image.Image) -> Image.Image:
+    alpha = img.convert("RGBA").split()[-1]
+    rgba = Image.new("RGBA", img.size, (255, 255, 255, 0))
+    rgba.putalpha(alpha)
+    return rgba
 
 
 # ----------------------------
@@ -348,37 +356,11 @@ def _fit_cutout_into_reference_box(
     return out
 
 
-def _expand_alpha_one_pixel(img: Image.Image) -> Image.Image:
-    rgba = np.array(img.convert("RGBA"))
-    alpha = rgba[:, :, 3]
-
-    kernel = np.ones((3, 3), np.uint8)
-    expanded = cv2.dilate(alpha, kernel, iterations=1)
-
-    rgba[:, :, 3] = expanded
-    return Image.fromarray(rgba, "RGBA")
-
-
-def _build_restore_source(reference_canvas: Image.Image, removed_rgba: Image.Image, canvas_size: int) -> Image.Image:
-    """
-    Create a subject-only restore source:
-    - colors come from the original uploaded image
-    - alpha comes from the AI removed image
-    - result is aligned to the editor canvas
-    - alpha is expanded slightly so narrow edges restore more naturally
-    """
-    ref = reference_canvas.convert("RGBA")
-    rem = removed_rgba.convert("RGBA")
-
-    aligned_removed = _fit_cutout_into_reference_box(rem, ref, canvas_size).convert("RGBA")
-    aligned_removed = _expand_alpha_one_pixel(aligned_removed)
-
-    ref_arr = np.array(ref)
-    rem_arr = np.array(aligned_removed)
-
-    out = ref_arr.copy()
-    out[:, :, 3] = rem_arr[:, :, 3]
-
+def _compose_base_with_alpha(base_rgba: Image.Image, alpha_rgba: Image.Image) -> Image.Image:
+    base_arr = np.array(base_rgba.convert("RGBA"))
+    alpha_arr = np.array(alpha_rgba.convert("RGBA"))
+    out = base_arr.copy()
+    out[:, :, 3] = alpha_arr[:, :, 3]
     return Image.fromarray(out, "RGBA")
 
 
@@ -400,6 +382,13 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
     y = (target_size - new_h) // 2
     canvas.alpha_composite(img2, (x, y))
     return canvas
+
+
+def _build_editor_assets(reference_canvas: Image.Image, removed_rgba: Image.Image) -> Tuple[Image.Image, Image.Image]:
+    aligned_removed = _fit_cutout_into_reference_box(removed_rgba, reference_canvas, EDITOR_PX)
+    mask_rgba = _pil_to_mask_rgba(aligned_removed)
+    editor_preview = _compose_base_with_alpha(reference_canvas, mask_rgba)
+    return editor_preview, mask_rgba
 
 
 # ----------------------------
@@ -426,11 +415,12 @@ def _bg_process_session(session_id: str):
         flags = _quality_flags(cleaned)
 
         _sess_set(session_id, stage="finishing_details")
-        editor_ready = _fit_cutout_into_reference_box(cleaned, orig_sq, EDITOR_PX)
-        restore_source = _build_restore_source(orig_sq, removed, EDITOR_PX)
+        editor_preview, mask_rgba = _build_editor_assets(orig_sq, cleaned)
+        final_png = _normalize_logo(editor_preview, target_size=TARGET_PX)
 
-        _save_png(editor_ready, p["curr"])
-        _save_png(restore_source, p["restore"])
+        _save_png(editor_preview, p["editor"])
+        _save_png(mask_rgba, p["mask"])
+        _save_png(final_png, p["curr"])
 
         _sess_set(
             session_id,
@@ -445,8 +435,9 @@ def _bg_process_session(session_id: str):
             p = _paths(session_id)
             if p["orig"].exists():
                 fallback = Image.open(p["orig"]).convert("RGBA")
-                _save_png(fallback, p["curr"])
-                _save_png(fallback, p["restore"])
+                _save_png(fallback, p["editor"])
+                _save_png(_pil_to_mask_rgba(fallback), p["mask"])
+                _save_png(_normalize_logo(fallback, target_size=TARGET_PX), p["curr"])
         except Exception:
             pass
 
@@ -495,7 +486,7 @@ def session_info(session_id: str):
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
-        "restore_url": f"/restore-source/{session_id}",
+        "mask_url": f"/mask/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -532,8 +523,9 @@ async def upload_image(
     canvas_orig.alpha_composite(img_fit, (x, y))
 
     _save_png(canvas_orig, p["orig"])
-    _save_png(canvas_orig, p["curr"])
-    _save_png(canvas_orig, p["restore"])
+    _save_png(canvas_orig, p["editor"])
+    _save_png(_pil_to_mask_rgba(canvas_orig), p["mask"])
+    _save_png(_normalize_logo(canvas_orig, target_size=TARGET_PX), p["curr"])
 
     _sess_set(
         session_id,
@@ -552,14 +544,14 @@ async def upload_image(
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
-        "restore_url": f"/restore-source/{session_id}",
+        "mask_url": f"/mask/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
-    path = _paths(session_id)["curr"]
+    path = _paths(session_id)["editor"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -573,9 +565,9 @@ def get_original(session_id: str):
     return Response(content=path.read_bytes(), media_type="image/png")
 
 
-@app.get("/restore-source/{session_id}")
-def get_restore_source(session_id: str):
-    path = _paths(session_id)["restore"]
+@app.get("/mask/{session_id}")
+def get_mask(session_id: str):
+    path = _paths(session_id)["mask"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -584,6 +576,7 @@ def get_restore_source(session_id: str):
 @app.post("/save-edit/{session_id}")
 async def save_edit(session_id: str, file: UploadFile = File(...)):
     p = _paths(session_id)
+
     try:
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
     except ValueError:
@@ -594,8 +587,14 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
     except ValueError:
         return JSONResponse({"error": "Bad image payload"}, status_code=400)
 
-    final_img = _normalize_logo(browser_img, target_size=TARGET_PX)
+    editor_img = browser_img.resize((EDITOR_PX, EDITOR_PX), Image.LANCZOS).convert("RGBA")
+    mask_img = _pil_to_mask_rgba(editor_img)
+    final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
+
+    _save_png(editor_img, p["editor"])
+    _save_png(mask_img, p["mask"])
     _save_png(final_img, p["curr"])
+
     _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
     return {"status": "ok"}
 
@@ -630,11 +629,16 @@ def _run_shopify_provision_job(
     cmd = [
         "python",
         str(PROVISION_SCRIPT),
-        "--name", storefront_name,
-        "--handle", storefront_handle,
-        "--owner_customer_id", owner_customer_id,
-        "--main_session_id", main_session_id,
-        "--uploads_dir", str(UPLOAD_DIR),
+        "--name",
+        storefront_name,
+        "--handle",
+        storefront_handle,
+        "--owner_customer_id",
+        owner_customer_id,
+        "--main_session_id",
+        main_session_id,
+        "--uploads_dir",
+        str(UPLOAD_DIR),
     ]
 
     if secondary_session_id:
@@ -745,8 +749,9 @@ async def storefront_request(
         canvas.alpha_composite(img_main_fit, (x, y))
 
         _save_png(canvas, p["orig"])
+        _save_png(canvas, p["editor"])
+        _save_png(_pil_to_mask_rgba(canvas), p["mask"])
         _save_png(_normalize_logo(canvas, target_size=TARGET_PX), p["curr"])
-        _save_png(canvas, p["restore"])
 
         if storefront_logo_secondary:
             try:
@@ -773,8 +778,9 @@ async def storefront_request(
                 canvas2.alpha_composite(img_sec_fit, (x2, y2))
 
                 _save_png(canvas2, sp["orig"])
+                _save_png(canvas2, sp["editor"])
+                _save_png(_pil_to_mask_rgba(canvas2), sp["mask"])
                 _save_png(_normalize_logo(canvas2, target_size=TARGET_PX), sp["curr"])
-                _save_png(canvas2, sp["restore"])
 
             except Exception as e:
                 print("⚠️ Secondary logo skipped:", str(e))
@@ -1852,7 +1858,7 @@ def ui(
           <div class="desktop-edit-controls" id="desktopEditControls">
             <div class="tool-row">
               <div class="tool-segment">
-                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
+                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints original transparency back in.">Restore</button>
                 <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
                 <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
                 <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
@@ -1921,18 +1927,33 @@ def ui(
   const cv = document.getElementById('cv');
   const ctx = cv.getContext('2d', { willReadFrequently: true });
 
+  const baseCanvas = document.createElement('canvas');
+  baseCanvas.width = 1000;
+  baseCanvas.height = 1000;
+  const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = 1000;
+  maskCanvas.height = 1000;
+  const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+
+  const origAlphaCanvas = document.createElement('canvas');
+  origAlphaCanvas.width = 1000;
+  origAlphaCanvas.height = 1000;
+  const origAlphaCtx = origAlphaCanvas.getContext('2d', { willReadFrequently: true });
+
   const offCanvas = document.createElement('canvas');
   offCanvas.width = 1000;
   offCanvas.height = 1000;
-  const offCtx = offCanvas.getContext('2d');
+  const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
 
-  const origBaseCanvas = document.createElement('canvas');
-  origBaseCanvas.width = 1000;
-  origBaseCanvas.height = 1000;
-  const origBaseCtx = origBaseCanvas.getContext('2d', { willReadFrequently: true });
+  const tmpCanvas = document.createElement('canvas');
+  tmpCanvas.width = 1000;
+  tmpCanvas.height = 1000;
+  const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
 
-  const origImg = new Image();
-  const currImg = new Image();
+  const baseImg = new Image();
+  const maskImg = new Image();
 
   const btnDone = document.getElementById('btnDone');
   const btnApprove = document.getElementById('btnApprove');
@@ -2205,20 +2226,23 @@ def ui(
     }
   }
 
+  function setMaskFromImageData(imgData) {
+    maskCtx.putImageData(imgData, 0, 0);
+    renderFromMask();
+  }
+
   function saveState() {
-    if (history.length > 12) history.shift();
-    history.push(ctx.getImageData(0, 0, cv.width, cv.height));
+    if (history.length > 15) history.shift();
+    history.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
   }
 
   document.getElementById('btnUndo').addEventListener('click', () => {
     if (!editorUnlocked || isMobile()) return;
-    if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
+    if (history.length > 0) setMaskFromImageData(history.pop());
   });
 
   btnUndoMobile.addEventListener('click', () => {
-    if (history.length > 0) {
-      ctx.putImageData(history.pop(), 0, 0);
-    }
+    if (history.length > 0) setMaskFromImageData(history.pop());
   });
 
   document.getElementById('btnRestart').addEventListener('click', async () => {
@@ -2297,6 +2321,25 @@ def ui(
     };
   }
 
+  function renderFromMask() {
+    const base = baseCtx.getImageData(0, 0, 1000, 1000);
+    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
+
+    const out = ctx.createImageData(1000, 1000);
+    const bd = base.data;
+    const md = mask.data;
+    const od = out.data;
+
+    for (let i = 0; i < bd.length; i += 4) {
+      od[i] = bd[i];
+      od[i + 1] = bd[i + 1];
+      od[i + 2] = bd[i + 2];
+      od[i + 3] = md[i + 3];
+    }
+
+    ctx.putImageData(out, 0, 0);
+  }
+
   function colorDistance(data, pos, r, g, b) {
     return Math.abs(data[pos] - r) + Math.abs(data[pos + 1] - g) + Math.abs(data[pos + 2] - b);
   }
@@ -2305,42 +2348,46 @@ def ui(
     startX = Math.floor(startX);
     startY = Math.floor(startY);
 
-    const imgData = ctx.getImageData(0, 0, cv.width, cv.height);
-    const data = imgData.data;
-    const w = cv.width;
-    const h = cv.height;
+    const base = baseCtx.getImageData(0, 0, 1000, 1000);
+    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
+
+    const bd = base.data;
+    const md = mask.data;
+    const w = 1000;
+    const h = 1000;
 
     const startPos = (startY * w + startX) * 4;
-    const sa = data[startPos + 3];
-    if (sa === 0) return;
+    if (md[startPos + 3] === 0) return;
 
-    const sr = data[startPos];
-    const sg = data[startPos + 1];
-    const sb = data[startPos + 2];
+    const sr = bd[startPos];
+    const sg = bd[startPos + 1];
+    const sb = bd[startPos + 2];
 
     const stack = [startX, startY];
     const seen = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
-    const tolerance = 55;
+    const tolerance = 60;
 
     while (stack.length) {
       const y = stack.pop();
       const x = stack.pop();
-      const pos = (y * w + x) * 4;
-      data[pos + 3] = 0;
+      const idx = y * w + x;
+      const pos = idx * 4;
+
+      md[pos + 3] = 0;
 
       const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
       for (let i = 0; i < nbs.length; i++) {
         const nx = nbs[i][0];
         const ny = nbs[i][1];
         if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          const idx = ny * w + nx;
-          if (!seen[idx]) {
-            seen[idx] = 1;
-            const p2 = idx * 4;
-            if (data[p2 + 3] > 0) {
-              const dist = colorDistance(data, p2, sr, sg, sb);
+          const nIdx = ny * w + nx;
+          if (!seen[nIdx]) {
+            seen[nIdx] = 1;
+            const p2 = nIdx * 4;
+            if (md[p2 + 3] > 0) {
+              const dist = colorDistance(bd, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
             }
           }
@@ -2348,35 +2395,37 @@ def ui(
       }
     }
 
-    ctx.putImageData(imgData, 0, 0);
+    maskCtx.putImageData(mask, 0, 0);
+    renderFromMask();
   }
 
   function magicRestore(startX, startY) {
     startX = Math.floor(startX);
     startY = Math.floor(startY);
 
-    const curr = ctx.getImageData(0, 0, cv.width, cv.height);
-    const currData = curr.data;
+    const base = baseCtx.getImageData(0, 0, 1000, 1000);
+    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
+    const origAlpha = origAlphaCtx.getImageData(0, 0, 1000, 1000);
 
-    const orig = origBaseCtx.getImageData(0, 0, cv.width, cv.height);
-    const origData = orig.data;
+    const bd = base.data;
+    const md = mask.data;
+    const od = origAlpha.data;
+    const w = 1000;
+    const h = 1000;
 
-    const w = cv.width;
-    const h = cv.height;
     const startPos = (startY * w + startX) * 4;
+    if (od[startPos + 3] === 0) return;
 
-    if (origData[startPos + 3] === 0) return;
-
-    const sr = origData[startPos];
-    const sg = origData[startPos + 1];
-    const sb = origData[startPos + 2];
+    const sr = bd[startPos];
+    const sg = bd[startPos + 1];
+    const sb = bd[startPos + 2];
 
     const stack = [startX, startY];
     const seen = new Uint8Array(w * h);
     const region = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
-    const tolerance = 55;
+    const tolerance = 80;
 
     while (stack.length) {
       const y = stack.pop();
@@ -2395,8 +2444,8 @@ def ui(
           if (!seen[nIdx]) {
             seen[nIdx] = 1;
             const p2 = nIdx * 4;
-            if (origData[p2 + 3] > 0) {
-              const dist = colorDistance(origData, p2, sr, sg, sb);
+            if (od[p2 + 3] > 0) {
+              const dist = colorDistance(bd, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
             }
           }
@@ -2404,12 +2453,12 @@ def ui(
       }
     }
 
-    const maskCanvas = document.createElement('canvas');
-    maskCanvas.width = w;
-    maskCanvas.height = h;
-    const maskCtx = maskCanvas.getContext('2d');
+    const maskRegionCanvas = document.createElement('canvas');
+    maskRegionCanvas.width = w;
+    maskRegionCanvas.height = h;
+    const mrCtx = maskRegionCanvas.getContext('2d');
 
-    const maskImg = maskCtx.createImageData(w, h);
+    const maskImg = mrCtx.createImageData(w, h);
     const maskData = maskImg.data;
 
     for (let i = 0; i < region.length; i++) {
@@ -2421,43 +2470,40 @@ def ui(
       maskData[p + 3] = a;
     }
 
-    maskCtx.putImageData(maskImg, 0, 0);
+    mrCtx.putImageData(maskImg, 0, 0);
 
     const featherCanvas = document.createElement('canvas');
     featherCanvas.width = w;
     featherCanvas.height = h;
-    const featherCtx = featherCanvas.getContext('2d');
-    featherCtx.filter = 'blur(1.25px)';
-    featherCtx.drawImage(maskCanvas, 0, 0);
-    featherCtx.filter = 'none';
+    const fCtx = featherCanvas.getContext('2d');
+    fCtx.filter = 'blur(1.1px)';
+    fCtx.drawImage(maskRegionCanvas, 0, 0);
+    fCtx.filter = 'none';
 
-    const softMask = featherCtx.getImageData(0, 0, w, h).data;
+    const feather = fCtx.getImageData(0, 0, w, h).data;
 
     for (let i = 0; i < region.length; i++) {
       const p = i * 4;
-      const maskAlpha = softMask[p + 3] / 255;
-      if (maskAlpha <= 0) continue;
+      const blend = feather[p + 3] / 255;
+      if (blend <= 0) continue;
 
-      const inv = 1 - maskAlpha;
-
-      currData[p]     = Math.round(currData[p]     * inv + origData[p]     * maskAlpha);
-      currData[p + 1] = Math.round(currData[p + 1] * inv + origData[p + 1] * maskAlpha);
-      currData[p + 2] = Math.round(currData[p + 2] * inv + origData[p + 2] * maskAlpha);
-      currData[p + 3] = Math.round(currData[p + 3] * inv + origData[p + 3] * maskAlpha);
+      const targetAlpha = od[p + 3];
+      md[p + 3] = Math.max(md[p + 3], Math.round(targetAlpha * blend));
     }
 
-    ctx.putImageData(curr, 0, 0);
+    maskCtx.putImageData(mask, 0, 0);
+    renderFromMask();
   }
 
-  function drawBrush(x, y) {
+  function drawBrushMask(x, y) {
     const bSize = parseInt(brushSlider.value, 10);
 
-    offCtx.globalCompositeOperation = 'source-over';
     offCtx.clearRect(0, 0, 1000, 1000);
+    offCtx.globalCompositeOperation = 'source-over';
     offCtx.lineWidth = bSize;
     offCtx.lineCap = 'round';
     offCtx.lineJoin = 'round';
-    offCtx.strokeStyle = 'black';
+    offCtx.strokeStyle = 'rgba(255,255,255,1)';
 
     offCtx.beginPath();
     offCtx.moveTo(lastX, lastY);
@@ -2465,17 +2511,24 @@ def ui(
     offCtx.stroke();
 
     if (mode === 'remove') {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.drawImage(offCanvas, 0, 0);
+      maskCtx.globalCompositeOperation = 'destination-out';
+      maskCtx.drawImage(offCanvas, 0, 0);
+      maskCtx.globalCompositeOperation = 'source-over';
     } else if (mode === 'restore') {
-      offCtx.globalCompositeOperation = 'source-in';
-      offCtx.drawImage(origBaseCanvas, 0, 0, 1000, 1000);
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.drawImage(offCanvas, 0, 0);
+      tmpCtx.clearRect(0, 0, 1000, 1000);
+      tmpCtx.globalCompositeOperation = 'source-over';
+      tmpCtx.drawImage(origAlphaCanvas, 0, 0);
+      tmpCtx.globalCompositeOperation = 'destination-in';
+      tmpCtx.drawImage(offCanvas, 0, 0);
+      tmpCtx.globalCompositeOperation = 'source-over';
+
+      maskCtx.globalCompositeOperation = 'source-over';
+      maskCtx.drawImage(tmpCanvas, 0, 0);
     }
 
     lastX = x;
     lastY = y;
+    renderFromMask();
   }
 
   function updateMagicModeUI() {
@@ -2627,7 +2680,7 @@ def ui(
     isDown = true;
     lastX = c.x;
     lastY = c.y;
-    drawBrush(c.x, c.y);
+    drawBrushMask(c.x, c.y);
 
     if (e.cancelable) e.preventDefault();
   }
@@ -2644,7 +2697,7 @@ def ui(
     if (!isDown || mode === 'magic') return;
 
     const c = getCoords(e);
-    drawBrush(c.x, c.y);
+    drawBrushMask(c.x, c.y);
 
     if (e.touches) {
       cursor.style.display = 'block';
@@ -2743,6 +2796,29 @@ def ui(
     });
   }
 
+  async function loadBaseAndMask(existingId) {
+    await new Promise(res => {
+      baseImg.onload = res;
+      baseImg.src = `${API_BASE}/original/${existingId}?t=${Date.now()}`;
+    });
+
+    baseCtx.clearRect(0, 0, 1000, 1000);
+    baseCtx.drawImage(baseImg, 0, 0, 1000, 1000);
+
+    origAlphaCtx.clearRect(0, 0, 1000, 1000);
+    origAlphaCtx.drawImage(baseImg, 0, 0, 1000, 1000);
+
+    await new Promise(res => {
+      maskImg.onload = res;
+      maskImg.src = `${API_BASE}/mask/${existingId}?t=${Date.now()}`;
+    });
+
+    maskCtx.clearRect(0, 0, 1000, 1000);
+    maskCtx.drawImage(maskImg, 0, 0, 1000, 1000);
+
+    renderFromMask();
+  }
+
   async function pollAIReady(statusUrl) {
     for (let i = 0; i < 120; i++) {
       try {
@@ -2757,19 +2833,11 @@ def ui(
         if (j.status === 'ready') {
           aiReady = true;
           stopStageCycle();
-
-          currImg.onload = () => {
-            ctx.clearRect(0, 0, cv.width, cv.height);
-            ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
-            hideOverlay();
-            renderQualityFlags(j.quality_flags || []);
-            fitView();
-            loadRestoreSource(sessionId).then(() => {
-              enterReviewMode();
-            });
-          };
-
-          currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
+          await loadBaseAndMask(sessionId);
+          hideOverlay();
+          renderQualityFlags(j.quality_flags || []);
+          fitView();
+          enterReviewMode();
           return;
         }
 
@@ -2780,6 +2848,8 @@ def ui(
           overlaySub.textContent = "You can still use the original image and make manual edits.";
           setTimeout(() => hideOverlay(), 1400);
           statusline.textContent = "AI cutout failed — edit original instead.";
+          await loadBaseAndMask(sessionId);
+          fitView();
           enterReviewMode();
           return;
         }
@@ -2792,16 +2862,6 @@ def ui(
     overlayTitle.textContent = "Still processing…";
     overlaySub.textContent = "This is taking longer than usual. You can wait a bit longer or restart.";
     statusline.textContent = "AI cutout taking longer than usual.";
-  }
-
-  async function loadRestoreSource(existingId) {
-    await new Promise(res => {
-      origImg.onload = res;
-      origImg.src = `${API_BASE}/restore-source/${existingId}?t=${Date.now()}`;
-    });
-
-    origBaseCtx.clearRect(0, 0, 1000, 1000);
-    origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
   }
 
   async function loadExistingSession(existingId, showSavedBanner = true) {
@@ -2818,15 +2878,7 @@ def ui(
     btnDone.style.display = 'inline-flex';
     hideOverlay();
 
-    await loadRestoreSource(sessionId);
-
-    await new Promise(res => {
-      currImg.onload = res;
-      currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
-    });
-
-    ctx.clearRect(0, 0, cv.width, cv.height);
-    ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
+    await loadBaseAndMask(sessionId);
 
     renderQualityFlags(qualityFlags);
     fitView();
@@ -2872,16 +2924,7 @@ def ui(
       aiReady = keepOriginalEl.checked;
       qualityFlags = [];
 
-      await loadRestoreSource(sessionId);
-
-      await new Promise(res => {
-        currImg.onload = res;
-        currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
-      });
-
-      ctx.clearRect(0, 0, cv.width, cv.height);
-      ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
-
+      await loadBaseAndMask(sessionId);
       fitView();
 
       if (!keepOriginalEl.checked) {
