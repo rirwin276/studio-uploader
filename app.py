@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.5.0")
+app = FastAPI(title="Studio Uploader", version="2.6.0")
 
 
 # ----------------------------
@@ -348,17 +348,30 @@ def _fit_cutout_into_reference_box(
     return out
 
 
+def _expand_alpha_one_pixel(img: Image.Image) -> Image.Image:
+    rgba = np.array(img.convert("RGBA"))
+    alpha = rgba[:, :, 3]
+
+    kernel = np.ones((3, 3), np.uint8)
+    expanded = cv2.dilate(alpha, kernel, iterations=1)
+
+    rgba[:, :, 3] = expanded
+    return Image.fromarray(rgba, "RGBA")
+
+
 def _build_restore_source(reference_canvas: Image.Image, removed_rgba: Image.Image, canvas_size: int) -> Image.Image:
     """
     Create a subject-only restore source:
     - colors come from the original uploaded image
     - alpha comes from the AI removed image
     - result is aligned to the editor canvas
+    - alpha is expanded slightly so narrow edges restore more naturally
     """
     ref = reference_canvas.convert("RGBA")
     rem = removed_rgba.convert("RGBA")
 
     aligned_removed = _fit_cutout_into_reference_box(rem, ref, canvas_size).convert("RGBA")
+    aligned_removed = _expand_alpha_one_pixel(aligned_removed)
 
     ref_arr = np.array(ref)
     rem_arr = np.array(aligned_removed)
@@ -2360,6 +2373,7 @@ def ui(
 
     const stack = [startX, startY];
     const seen = new Uint8Array(w * h);
+    const region = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
     const tolerance = 55;
@@ -2367,22 +2381,20 @@ def ui(
     while (stack.length) {
       const y = stack.pop();
       const x = stack.pop();
-      const pos = (y * w + x) * 4;
+      const idx = y * w + x;
+      const pos = idx * 4;
 
-      currData[pos] = origData[pos];
-      currData[pos + 1] = origData[pos + 1];
-      currData[pos + 2] = origData[pos + 2];
-      currData[pos + 3] = origData[pos + 3];
+      region[idx] = 255;
 
       const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
       for (let i = 0; i < nbs.length; i++) {
         const nx = nbs[i][0];
         const ny = nbs[i][1];
         if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          const idx = ny * w + nx;
-          if (!seen[idx]) {
-            seen[idx] = 1;
-            const p2 = idx * 4;
+          const nIdx = ny * w + nx;
+          if (!seen[nIdx]) {
+            seen[nIdx] = 1;
+            const p2 = nIdx * 4;
             if (origData[p2 + 3] > 0) {
               const dist = colorDistance(origData, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
@@ -2390,6 +2402,48 @@ def ui(
           }
         }
       }
+    }
+
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = w;
+    maskCanvas.height = h;
+    const maskCtx = maskCanvas.getContext('2d');
+
+    const maskImg = maskCtx.createImageData(w, h);
+    const maskData = maskImg.data;
+
+    for (let i = 0; i < region.length; i++) {
+      const a = region[i];
+      const p = i * 4;
+      maskData[p] = 255;
+      maskData[p + 1] = 255;
+      maskData[p + 2] = 255;
+      maskData[p + 3] = a;
+    }
+
+    maskCtx.putImageData(maskImg, 0, 0);
+
+    const featherCanvas = document.createElement('canvas');
+    featherCanvas.width = w;
+    featherCanvas.height = h;
+    const featherCtx = featherCanvas.getContext('2d');
+    featherCtx.filter = 'blur(1.25px)';
+    featherCtx.drawImage(maskCanvas, 0, 0);
+    featherCtx.filter = 'none';
+
+    const softMask = featherCtx.getImageData(0, 0, w, h).data;
+
+    for (let i = 0; i < region.length; i++) {
+      const p = i * 4;
+      const maskAlpha = softMask[p + 3] / 255;
+      if (maskAlpha <= 0) continue;
+
+      const inv = 1 - maskAlpha;
+
+      currData[p]     = Math.round(currData[p]     * inv + origData[p]     * maskAlpha);
+      currData[p + 1] = Math.round(currData[p + 1] * inv + origData[p + 1] * maskAlpha);
+      currData[p + 2] = Math.round(currData[p + 2] * inv + origData[p + 2] * maskAlpha);
+      currData[p + 3] = Math.round(currData[p + 3] * inv + origData[p + 3] * maskAlpha);
     }
 
     ctx.putImageData(curr, 0, 0);
@@ -2710,7 +2764,9 @@ def ui(
             hideOverlay();
             renderQualityFlags(j.quality_flags || []);
             fitView();
-            enterReviewMode();
+            loadRestoreSource(sessionId).then(() => {
+              enterReviewMode();
+            });
           };
 
           currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
