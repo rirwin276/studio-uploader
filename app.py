@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — mask-based editor (non-destructive)
+# app.py — Studio Uploader (FastAPI) — mask-based editor (non-destructive, dehalo, mobile-safe)
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.0.0")
+app = FastAPI(title="Studio Uploader", version="3.1.0")
 
 
 # ----------------------------
@@ -68,6 +68,8 @@ AI_ALPHA_CUTOFF = int(os.getenv("AI_ALPHA_CUTOFF", "14"))
 AI_KEEP_COMPONENT_MIN_AREA = int(os.getenv("AI_KEEP_COMPONENT_MIN_AREA", "36"))
 AI_LOW_ALPHA_RATIO_WARN = float(os.getenv("AI_LOW_ALPHA_RATIO_WARN", "0.22"))
 AI_TINY_SUBJECT_RATIO_WARN = float(os.getenv("AI_TINY_SUBJECT_RATIO_WARN", "0.08"))
+DEHALO_SOLID_ALPHA = int(os.getenv("DEHALO_SOLID_ALPHA", "210"))
+RESTORE_EXPAND_ITER = int(os.getenv("RESTORE_EXPAND_ITER", "1"))
 
 PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
 
@@ -127,16 +129,25 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
-        "orig": UPLOAD_DIR / f"{session_id}_orig.png",      # editor-sized, original aligned
-        "editor": UPLOAD_DIR / f"{session_id}_editor.png",  # editor-sized preview
-        "curr": UPLOAD_DIR / f"{session_id}_curr.png",      # final normalized output for downstream
-        "mask": UPLOAD_DIR / f"{session_id}_mask.png",      # editor-sized alpha mask
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",              # editor-sized original aligned upload
+        "base": UPLOAD_DIR / f"{session_id}_base.png",              # editor-sized clean RGB base for editing/final preview
+        "editor": UPLOAD_DIR / f"{session_id}_editor.png",          # editor-sized composed preview (base + current mask)
+        "curr": UPLOAD_DIR / f"{session_id}_curr.png",              # final normalized output for downstream
+        "mask": UPLOAD_DIR / f"{session_id}_mask.png",              # editor-sized current editable alpha mask
+        "restore_mask": UPLOAD_DIR / f"{session_id}_restore_mask.png",  # editor-sized restore source alpha mask
     }
 
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    return p["orig"].exists() and p["editor"].exists() and p["curr"].exists() and p["mask"].exists()
+    return (
+        p["orig"].exists()
+        and p["base"].exists()
+        and p["editor"].exists()
+        and p["curr"].exists()
+        and p["mask"].exists()
+        and p["restore_mask"].exists()
+    )
 
 
 def _save_png(img: Image.Image, path: Path):
@@ -179,10 +190,16 @@ def _pil_to_png_bytes(img: Image.Image) -> bytes:
     return out.getvalue()
 
 
-def _pil_to_mask_rgba(img: Image.Image) -> Image.Image:
+def _alpha_to_rgba_mask(img: Image.Image) -> Image.Image:
     alpha = img.convert("RGBA").split()[-1]
     rgba = Image.new("RGBA", img.size, (255, 255, 255, 0))
     rgba.putalpha(alpha)
+    return rgba
+
+
+def _mask_rgba_from_alpha(alpha_img: Image.Image) -> Image.Image:
+    rgba = Image.new("RGBA", alpha_img.size, (255, 255, 255, 0))
+    rgba.putalpha(alpha_img.convert("L"))
     return rgba
 
 
@@ -279,6 +296,38 @@ def _cleanup_cutout(img: Image.Image) -> Image.Image:
 
     rgba[:, :, 3] = alpha
     return Image.fromarray(rgba, "RGBA")
+
+
+def _dehalo_cutout(img: Image.Image) -> Image.Image:
+    """
+    Remove white/light matte halos by rebuilding edge RGB from nearby solid pixels.
+    This keeps the clean cutout look instead of reintroducing a fringe when composited.
+    """
+    arr = np.array(img.convert("RGBA")).astype(np.float32)
+    rgb = arr[:, :, :3]
+    alpha = arr[:, :, 3]
+
+    if alpha.max() <= 0:
+        return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+    solid = (alpha >= float(DEHALO_SOLID_ALPHA)).astype(np.float32)
+
+    if solid.max() <= 0:
+        return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+    weighted = rgb * solid[:, :, None]
+
+    blur_weighted = cv2.GaussianBlur(weighted, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    blur_solid = cv2.GaussianBlur(solid, (0, 0), sigmaX=2.0, sigmaY=2.0)
+
+    blur_solid_3 = np.repeat(np.maximum(blur_solid[:, :, None], 1e-5), 3, axis=2)
+    rebuilt_rgb = blur_weighted / blur_solid_3
+
+    edge = (alpha > 0) & (alpha < float(DEHALO_SOLID_ALPHA))
+    rgb[edge] = rebuilt_rgb[edge]
+
+    out = np.dstack([np.clip(rgb, 0, 255), np.clip(alpha, 0, 255)]).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
 
 
 def _quality_flags(img: Image.Image) -> List[str]:
@@ -384,11 +433,62 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
     return canvas
 
 
-def _build_editor_assets(reference_canvas: Image.Image, removed_rgba: Image.Image) -> Tuple[Image.Image, Image.Image]:
-    aligned_removed = _fit_cutout_into_reference_box(removed_rgba, reference_canvas, EDITOR_PX)
-    mask_rgba = _pil_to_mask_rgba(aligned_removed)
-    editor_preview = _compose_base_with_alpha(reference_canvas, mask_rgba)
-    return editor_preview, mask_rgba
+def _alpha_coverage_ratio(img: Image.Image) -> float:
+    alpha = np.array(img.convert("RGBA"))[:, :, 3]
+    if alpha.size == 0:
+        return 0.0
+    return float((alpha > 0).sum()) / float(alpha.size)
+
+
+def _expand_alpha_mask(alpha_rgba: Image.Image, iterations: int = RESTORE_EXPAND_ITER) -> Image.Image:
+    rgba = np.array(alpha_rgba.convert("RGBA"))
+    alpha = rgba[:, :, 3]
+    kernel = np.ones((3, 3), np.uint8)
+    alpha = cv2.dilate(alpha, kernel, iterations=max(0, int(iterations)))
+    out = np.zeros_like(rgba)
+    out[:, :, 0:3] = 255
+    out[:, :, 3] = alpha
+    return Image.fromarray(out, "RGBA")
+
+
+def _build_editor_assets(
+    original_aligned: Image.Image,
+    cleaned_removed: Image.Image,
+    keep_original: bool = False,
+) -> Tuple[Image.Image, Image.Image, Image.Image, Image.Image]:
+    """
+    Returns:
+    - base_rgba: clean RGB base used for display/final composition
+    - current_mask_rgba: editable current alpha mask
+    - restore_mask_rgba: restore source alpha mask
+    - editor_preview: base composed with current mask
+    """
+    original_aligned = original_aligned.convert("RGBA")
+
+    if keep_original:
+        base_rgba = original_aligned.copy()
+        current_mask_rgba = _alpha_to_rgba_mask(original_aligned)
+        restore_mask_rgba = current_mask_rgba.copy()
+        editor_preview = _compose_base_with_alpha(base_rgba, current_mask_rgba)
+        return base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview
+
+    cleaned_aligned = _fit_cutout_into_reference_box(cleaned_removed, original_aligned, EDITOR_PX).convert("RGBA")
+    cleaned_aligned = _dehalo_cutout(cleaned_aligned)
+
+    base_rgba = cleaned_aligned.copy()
+
+    current_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
+
+    # If the user uploaded a real transparent PNG/logo already, use its alpha for restore,
+    # otherwise use the AI mask expanded slightly so restore can bring back tight detail.
+    original_alpha_ratio = _alpha_coverage_ratio(original_aligned)
+    if original_alpha_ratio < 0.98:
+        restore_mask_rgba = _alpha_to_rgba_mask(original_aligned)
+    else:
+        restore_mask_rgba = _expand_alpha_mask(current_mask_rgba, iterations=RESTORE_EXPAND_ITER)
+
+    editor_preview = _compose_base_with_alpha(base_rgba, current_mask_rgba)
+    return base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview
 
 
 # ----------------------------
@@ -410,16 +510,23 @@ def _bg_process_session(session_id: str):
 
         _sess_set(session_id, stage="cleaning_edges")
         cleaned = _cleanup_cutout(removed)
+        cleaned = _dehalo_cutout(cleaned)
 
         _sess_set(session_id, stage="checking_quality")
         flags = _quality_flags(cleaned)
 
         _sess_set(session_id, stage="finishing_details")
-        editor_preview, mask_rgba = _build_editor_assets(orig_sq, cleaned)
+        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+            original_aligned=orig_sq,
+            cleaned_removed=cleaned,
+            keep_original=False,
+        )
         final_png = _normalize_logo(editor_preview, target_size=TARGET_PX)
 
+        _save_png(base_rgba, p["base"])
         _save_png(editor_preview, p["editor"])
-        _save_png(mask_rgba, p["mask"])
+        _save_png(current_mask_rgba, p["mask"])
+        _save_png(restore_mask_rgba, p["restore_mask"])
         _save_png(final_png, p["curr"])
 
         _sess_set(
@@ -435,8 +542,11 @@ def _bg_process_session(session_id: str):
             p = _paths(session_id)
             if p["orig"].exists():
                 fallback = Image.open(p["orig"]).convert("RGBA")
+                fallback_mask = _alpha_to_rgba_mask(fallback)
+                _save_png(fallback, p["base"])
                 _save_png(fallback, p["editor"])
-                _save_png(_pil_to_mask_rgba(fallback), p["mask"])
+                _save_png(fallback_mask, p["mask"])
+                _save_png(fallback_mask, p["restore_mask"])
                 _save_png(_normalize_logo(fallback, target_size=TARGET_PX), p["curr"])
         except Exception:
             pass
@@ -486,7 +596,9 @@ def session_info(session_id: str):
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
+        "base_url": f"/base/{session_id}",
         "mask_url": f"/mask/{session_id}",
+        "restore_mask_url": f"/restore-mask/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -523,9 +635,18 @@ async def upload_image(
     canvas_orig.alpha_composite(img_fit, (x, y))
 
     _save_png(canvas_orig, p["orig"])
-    _save_png(canvas_orig, p["editor"])
-    _save_png(_pil_to_mask_rgba(canvas_orig), p["mask"])
-    _save_png(_normalize_logo(canvas_orig, target_size=TARGET_PX), p["curr"])
+
+    if keep_original:
+        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+            original_aligned=canvas_orig,
+            cleaned_removed=canvas_orig,
+            keep_original=True,
+        )
+        _save_png(base_rgba, p["base"])
+        _save_png(editor_preview, p["editor"])
+        _save_png(current_mask_rgba, p["mask"])
+        _save_png(restore_mask_rgba, p["restore_mask"])
+        _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
 
     _sess_set(
         session_id,
@@ -544,7 +665,9 @@ async def upload_image(
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
+        "base_url": f"/base/{session_id}",
         "mask_url": f"/mask/{session_id}",
+        "restore_mask_url": f"/restore-mask/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -565,9 +688,25 @@ def get_original(session_id: str):
     return Response(content=path.read_bytes(), media_type="image/png")
 
 
+@app.get("/base/{session_id}")
+def get_base(session_id: str):
+    path = _paths(session_id)["base"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
 @app.get("/mask/{session_id}")
 def get_mask(session_id: str):
     path = _paths(session_id)["mask"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
+@app.get("/restore-mask/{session_id}")
+def get_restore_mask(session_id: str):
+    path = _paths(session_id)["restore_mask"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -588,11 +727,12 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
         return JSONResponse({"error": "Bad image payload"}, status_code=400)
 
     editor_img = browser_img.resize((EDITOR_PX, EDITOR_PX), Image.LANCZOS).convert("RGBA")
-    mask_img = _pil_to_mask_rgba(editor_img)
+    current_mask = _alpha_to_rgba_mask(editor_img)
     final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
 
+    # Do NOT overwrite base or restore_mask here.
     _save_png(editor_img, p["editor"])
-    _save_png(mask_img, p["mask"])
+    _save_png(current_mask, p["mask"])
     _save_png(final_img, p["curr"])
 
     _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
@@ -749,9 +889,17 @@ async def storefront_request(
         canvas.alpha_composite(img_main_fit, (x, y))
 
         _save_png(canvas, p["orig"])
-        _save_png(canvas, p["editor"])
-        _save_png(_pil_to_mask_rgba(canvas), p["mask"])
-        _save_png(_normalize_logo(canvas, target_size=TARGET_PX), p["curr"])
+
+        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+            original_aligned=canvas,
+            cleaned_removed=canvas,
+            keep_original=True,
+        )
+        _save_png(base_rgba, p["base"])
+        _save_png(editor_preview, p["editor"])
+        _save_png(current_mask_rgba, p["mask"])
+        _save_png(restore_mask_rgba, p["restore_mask"])
+        _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
 
         if storefront_logo_secondary:
             try:
@@ -778,9 +926,17 @@ async def storefront_request(
                 canvas2.alpha_composite(img_sec_fit, (x2, y2))
 
                 _save_png(canvas2, sp["orig"])
-                _save_png(canvas2, sp["editor"])
-                _save_png(_pil_to_mask_rgba(canvas2), sp["mask"])
-                _save_png(_normalize_logo(canvas2, target_size=TARGET_PX), sp["curr"])
+
+                base2, mask2, restore2, editor2 = _build_editor_assets(
+                    original_aligned=canvas2,
+                    cleaned_removed=canvas2,
+                    keep_original=True,
+                )
+                _save_png(base2, sp["base"])
+                _save_png(editor2, sp["editor"])
+                _save_png(mask2, sp["mask"])
+                _save_png(restore2, sp["restore_mask"])
+                _save_png(_normalize_logo(editor2, target_size=TARGET_PX), sp["curr"])
 
             except Exception as e:
                 print("⚠️ Secondary logo skipped:", str(e))
@@ -941,7 +1097,7 @@ def ui(
     }
 
     .upload-card {
-      width: min(560px, 100%);
+      width: min(620px, 100%);
       background: rgba(255,255,255,0.78);
       backdrop-filter: blur(18px) saturate(1.12);
       border: 1px solid var(--panel-border);
@@ -953,7 +1109,7 @@ def ui(
     .upload-box {
       position: relative;
       border-radius: 24px;
-      padding: 42px 18px;
+      padding: 30px 18px;
       text-align: center;
       border: 1.5px dashed rgba(15,23,42,0.12);
       background: rgba(255,255,255,0.58);
@@ -979,7 +1135,35 @@ def ui(
     .muted {
       color: var(--muted);
       font-size: 13px;
-      line-height: 1.45;
+      line-height: 1.5;
+    }
+
+    .upload-guidance {
+      margin-top: 14px;
+      display: grid;
+      gap: 10px;
+      text-align: left;
+    }
+
+    .guide-card {
+      border-radius: 18px;
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: 0 6px 18px rgba(15,23,42,0.05);
+      padding: 12px 14px;
+    }
+
+    .guide-title {
+      font-size: 13px;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 4px;
+    }
+
+    .guide-text {
+      font-size: 12px;
+      line-height: 1.5;
+      color: #475569;
     }
 
     .row {
@@ -995,8 +1179,8 @@ def ui(
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      height: 40px;
-      padding: 0 14px;
+      min-height: 42px;
+      padding: 8px 14px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
@@ -1645,7 +1829,7 @@ def ui(
 
       .upload-box {
         border-radius: 20px;
-        padding: 36px 16px;
+        padding: 28px 14px;
       }
 
       .editor-shell {
@@ -1779,12 +1963,37 @@ def ui(
         <input id="file" type="file" accept="image/*" />
         <div style="font-size:30px;">✨</div>
         <div class="title">Upload logo</div>
-        <div class="muted" style="margin-top:6px;">We’ll remove the background, clean the edges, and let you fine-tune anything that needs a quick touch-up.</div>
+        <div class="muted" style="margin-top:6px;">
+          Best results come from a logo that is already ready to print.
+        </div>
+      </div>
+
+      <div class="upload-guidance">
+        <div class="guide-card">
+          <div class="guide-title">Best option</div>
+          <div class="guide-text">
+            Use a PNG with the background already removed, no extra transparent padding, and large enough for print. Preferred target is at least 3000 × 3000 pixels for a 10-inch print at 300 DPI.
+          </div>
+        </div>
+
+        <div class="guide-card">
+          <div class="guide-title">If your file is already good to go</div>
+          <div class="guide-text">
+            Click <strong>Use original image</strong>. We will keep your original cutout and still normalize it for the final print workflow.
+          </div>
+        </div>
+
+        <div class="guide-card">
+          <div class="guide-title">If your file still needs help</div>
+          <div class="guide-text">
+            Leave automatic cleanup on. We can remove the background, clean edges, let you review it, and make quick edits before it goes back to the form.
+          </div>
+        </div>
       </div>
 
       <div class="row">
-        <label class="pill"><input type="checkbox" id="keepOriginal"> Keep original</label>
-        <label class="pill" style="opacity:.7;"><input type="checkbox" checked disabled> Detail-safe auto mode</label>
+        <label class="pill"><input type="checkbox" id="keepOriginal"> Use original image</label>
+        <label class="pill" style="opacity:.92;"><input type="checkbox" checked disabled> Automatic cleanup available</label>
       </div>
 
       <div class="status-row" id="statusline1"></div>
@@ -1793,14 +2002,14 @@ def ui(
     <div class="editor-shell review-mode" id="step3" style="display:none;">
       <div class="editor-top">
         <div class="tool-rail" id="desktopToolRail">
-          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in.">Restore</button>
+          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the saved restore mask back in.">Restore</button>
           <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts manually.">Erase</button>
           <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic removes or restores one connected area.">Magic</button>
           <button class="rail-tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around while zoomed in.">Pan</button>
 
           <div class="mini-rail" id="magicModeWrapDesktop">
-            <button class="mini-rail-btn active tip-target" id="magicRemoveModeDesktop" data-tip="Magic Remove removes one connected region based on color.">−</button>
-            <button class="mini-rail-btn tip-target" id="magicRestoreModeDesktop" data-tip="Magic Restore brings back one connected region from the original image.">+</button>
+            <button class="mini-rail-btn active tip-target" id="magicRemoveModeDesktop" data-tip="Magic Remove removes one connected region based on nearby color.">−</button>
+            <button class="mini-rail-btn tip-target" id="magicRestoreModeDesktop" data-tip="Magic Restore brings back one connected region from the restore mask.">+</button>
           </div>
         </div>
 
@@ -1858,7 +2067,7 @@ def ui(
           <div class="desktop-edit-controls" id="desktopEditControls">
             <div class="tool-row">
               <div class="tool-segment">
-                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints original transparency back in.">Restore</button>
+                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the saved restore mask back in.">Restore</button>
                 <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
                 <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
                 <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
@@ -1881,7 +2090,7 @@ def ui(
               <div class="utility-actions">
                 <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
                 <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-                <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+                <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset reloads the last saved version.">Reset</button>
               </div>
             </div>
           </div>
@@ -1937,10 +2146,10 @@ def ui(
   maskCanvas.height = 1000;
   const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
 
-  const origAlphaCanvas = document.createElement('canvas');
-  origAlphaCanvas.width = 1000;
-  origAlphaCanvas.height = 1000;
-  const origAlphaCtx = origAlphaCanvas.getContext('2d', { willReadFrequently: true });
+  const restoreMaskCanvas = document.createElement('canvas');
+  restoreMaskCanvas.width = 1000;
+  restoreMaskCanvas.height = 1000;
+  const restoreMaskCtx = restoreMaskCanvas.getContext('2d', { willReadFrequently: true });
 
   const offCanvas = document.createElement('canvas');
   offCanvas.width = 1000;
@@ -1954,6 +2163,7 @@ def ui(
 
   const baseImg = new Image();
   const maskImg = new Image();
+  const restoreMaskImg = new Image();
 
   const btnDone = document.getElementById('btnDone');
   const btnApprove = document.getElementById('btnApprove');
@@ -2232,7 +2442,7 @@ def ui(
   }
 
   function saveState() {
-    if (history.length > 15) history.shift();
+    if (history.length > 20) history.shift();
     history.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
   }
 
@@ -2367,7 +2577,7 @@ def ui(
     const seen = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
-    const tolerance = 60;
+    const tolerance = 72;
 
     while (stack.length) {
       const y = stack.pop();
@@ -2405,16 +2615,16 @@ def ui(
 
     const base = baseCtx.getImageData(0, 0, 1000, 1000);
     const mask = maskCtx.getImageData(0, 0, 1000, 1000);
-    const origAlpha = origAlphaCtx.getImageData(0, 0, 1000, 1000);
+    const restoreMask = restoreMaskCtx.getImageData(0, 0, 1000, 1000);
 
     const bd = base.data;
     const md = mask.data;
-    const od = origAlpha.data;
+    const rd = restoreMask.data;
     const w = 1000;
     const h = 1000;
 
     const startPos = (startY * w + startX) * 4;
-    if (od[startPos + 3] === 0) return;
+    if (rd[startPos + 3] === 0) return;
 
     const sr = bd[startPos];
     const sg = bd[startPos + 1];
@@ -2425,7 +2635,7 @@ def ui(
     const region = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
-    const tolerance = 80;
+    const tolerance = 110;
 
     while (stack.length) {
       const y = stack.pop();
@@ -2444,7 +2654,7 @@ def ui(
           if (!seen[nIdx]) {
             seen[nIdx] = 1;
             const p2 = nIdx * 4;
-            if (od[p2 + 3] > 0) {
+            if (rd[p2 + 3] > 0) {
               const dist = colorDistance(bd, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
             }
@@ -2453,31 +2663,31 @@ def ui(
       }
     }
 
-    const maskRegionCanvas = document.createElement('canvas');
-    maskRegionCanvas.width = w;
-    maskRegionCanvas.height = h;
-    const mrCtx = maskRegionCanvas.getContext('2d');
+    const regionCanvas = document.createElement('canvas');
+    regionCanvas.width = w;
+    regionCanvas.height = h;
+    const regionCtx = regionCanvas.getContext('2d', { willReadFrequently: true });
 
-    const maskImg = mrCtx.createImageData(w, h);
-    const maskData = maskImg.data;
+    const regionImg = regionCtx.createImageData(w, h);
+    const regionData = regionImg.data;
 
     for (let i = 0; i < region.length; i++) {
       const a = region[i];
       const p = i * 4;
-      maskData[p] = 255;
-      maskData[p + 1] = 255;
-      maskData[p + 2] = 255;
-      maskData[p + 3] = a;
+      regionData[p] = 255;
+      regionData[p + 1] = 255;
+      regionData[p + 2] = 255;
+      regionData[p + 3] = a;
     }
 
-    mrCtx.putImageData(maskImg, 0, 0);
+    regionCtx.putImageData(regionImg, 0, 0);
 
     const featherCanvas = document.createElement('canvas');
     featherCanvas.width = w;
     featherCanvas.height = h;
-    const fCtx = featherCanvas.getContext('2d');
-    fCtx.filter = 'blur(1.1px)';
-    fCtx.drawImage(maskRegionCanvas, 0, 0);
+    const fCtx = featherCanvas.getContext('2d', { willReadFrequently: true });
+    fCtx.filter = 'blur(1.0px)';
+    fCtx.drawImage(regionCanvas, 0, 0);
     fCtx.filter = 'none';
 
     const feather = fCtx.getImageData(0, 0, w, h).data;
@@ -2487,8 +2697,11 @@ def ui(
       const blend = feather[p + 3] / 255;
       if (blend <= 0) continue;
 
-      const targetAlpha = od[p + 3];
-      md[p + 3] = Math.max(md[p + 3], Math.round(targetAlpha * blend));
+      const restoreAlpha = rd[p + 3];
+      const targetAlpha = Math.round(restoreAlpha * blend);
+      if (targetAlpha > md[p + 3]) {
+        md[p + 3] = targetAlpha;
+      }
     }
 
     maskCtx.putImageData(mask, 0, 0);
@@ -2504,7 +2717,6 @@ def ui(
     offCtx.lineCap = 'round';
     offCtx.lineJoin = 'round';
     offCtx.strokeStyle = 'rgba(255,255,255,1)';
-
     offCtx.beginPath();
     offCtx.moveTo(lastX, lastY);
     offCtx.lineTo(x, y);
@@ -2517,7 +2729,7 @@ def ui(
     } else if (mode === 'restore') {
       tmpCtx.clearRect(0, 0, 1000, 1000);
       tmpCtx.globalCompositeOperation = 'source-over';
-      tmpCtx.drawImage(origAlphaCanvas, 0, 0);
+      tmpCtx.drawImage(restoreMaskCanvas, 0, 0);
       tmpCtx.globalCompositeOperation = 'destination-in';
       tmpCtx.drawImage(offCanvas, 0, 0);
       tmpCtx.globalCompositeOperation = 'source-over';
@@ -2796,17 +3008,14 @@ def ui(
     });
   }
 
-  async function loadBaseAndMask(existingId) {
+  async function loadBaseMaskAndRestore(existingId) {
     await new Promise(res => {
       baseImg.onload = res;
-      baseImg.src = `${API_BASE}/original/${existingId}?t=${Date.now()}`;
+      baseImg.src = `${API_BASE}/base/${existingId}?t=${Date.now()}`;
     });
 
     baseCtx.clearRect(0, 0, 1000, 1000);
     baseCtx.drawImage(baseImg, 0, 0, 1000, 1000);
-
-    origAlphaCtx.clearRect(0, 0, 1000, 1000);
-    origAlphaCtx.drawImage(baseImg, 0, 0, 1000, 1000);
 
     await new Promise(res => {
       maskImg.onload = res;
@@ -2815,6 +3024,14 @@ def ui(
 
     maskCtx.clearRect(0, 0, 1000, 1000);
     maskCtx.drawImage(maskImg, 0, 0, 1000, 1000);
+
+    await new Promise(res => {
+      restoreMaskImg.onload = res;
+      restoreMaskImg.src = `${API_BASE}/restore-mask/${existingId}?t=${Date.now()}`;
+    });
+
+    restoreMaskCtx.clearRect(0, 0, 1000, 1000);
+    restoreMaskCtx.drawImage(restoreMaskImg, 0, 0, 1000, 1000);
 
     renderFromMask();
   }
@@ -2833,7 +3050,7 @@ def ui(
         if (j.status === 'ready') {
           aiReady = true;
           stopStageCycle();
-          await loadBaseAndMask(sessionId);
+          await loadBaseMaskAndRestore(sessionId);
           hideOverlay();
           renderQualityFlags(j.quality_flags || []);
           fitView();
@@ -2848,7 +3065,7 @@ def ui(
           overlaySub.textContent = "You can still use the original image and make manual edits.";
           setTimeout(() => hideOverlay(), 1400);
           statusline.textContent = "AI cutout failed — edit original instead.";
-          await loadBaseAndMask(sessionId);
+          await loadBaseMaskAndRestore(sessionId);
           fitView();
           enterReviewMode();
           return;
@@ -2878,7 +3095,7 @@ def ui(
     btnDone.style.display = 'inline-flex';
     hideOverlay();
 
-    await loadBaseAndMask(sessionId);
+    await loadBaseMaskAndRestore(sessionId);
 
     renderQualityFlags(qualityFlags);
     fitView();
@@ -2924,7 +3141,7 @@ def ui(
       aiReady = keepOriginalEl.checked;
       qualityFlags = [];
 
-      await loadBaseAndMask(sessionId);
+      await loadBaseMaskAndRestore(sessionId);
       fitView();
 
       if (!keepOriginalEl.checked) {
@@ -2934,7 +3151,7 @@ def ui(
         pollAIReady(j.status_url);
       } else {
         hideOverlay();
-        statusline.textContent = "Using original";
+        statusline.textContent = "Using original image";
         enterReviewMode();
       }
 
