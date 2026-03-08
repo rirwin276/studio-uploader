@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.1.0")
+app = FastAPI(title="Studio Uploader", version="3.1.1")
 
 
 # ----------------------------
@@ -476,11 +476,8 @@ def _build_editor_assets(
     cleaned_aligned = _dehalo_cutout(cleaned_aligned)
 
     base_rgba = cleaned_aligned.copy()
-
     current_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
 
-    # If the user uploaded a real transparent PNG/logo already, use its alpha for restore,
-    # otherwise use the AI mask expanded slightly so restore can bring back tight detail.
     original_alpha_ratio = _alpha_coverage_ratio(original_aligned)
     if original_alpha_ratio < 0.98:
         restore_mask_rgba = _alpha_to_rgba_mask(original_aligned)
@@ -730,7 +727,6 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
     current_mask = _alpha_to_rgba_mask(editor_img)
     final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
 
-    # Do NOT overwrite base or restore_mask here.
     _save_png(editor_img, p["editor"])
     _save_png(current_mask, p["mask"])
     _save_png(final_img, p["curr"])
@@ -2274,6 +2270,13 @@ def ui(
     btnDone.textContent = 'Done';
   }
 
+  function clearEditorCanvases() {
+    baseCtx.clearRect(0, 0, 1000, 1000);
+    maskCtx.clearRect(0, 0, 1000, 1000);
+    restoreMaskCtx.clearRect(0, 0, 1000, 1000);
+    ctx.clearRect(0, 0, 1000, 1000);
+  }
+
   function enterReviewMode() {
     editorUnlocked = false;
     step3.classList.remove('edit-mode');
@@ -3008,28 +3011,24 @@ def ui(
     });
   }
 
-  async function loadBaseMaskAndRestore(existingId) {
-    await new Promise(res => {
-      baseImg.onload = res;
-      baseImg.src = `${API_BASE}/base/${existingId}?t=${Date.now()}`;
+  function loadImageEl(imgEl, src) {
+    return new Promise((resolve, reject) => {
+      imgEl.onload = () => resolve(imgEl);
+      imgEl.onerror = () => reject(new Error(`Failed to load image: ${src}`));
+      imgEl.src = src;
     });
+  }
 
+  async function loadBaseMaskAndRestore(existingId) {
+    await loadImageEl(baseImg, `${API_BASE}/base/${existingId}?t=${Date.now()}`);
     baseCtx.clearRect(0, 0, 1000, 1000);
     baseCtx.drawImage(baseImg, 0, 0, 1000, 1000);
 
-    await new Promise(res => {
-      maskImg.onload = res;
-      maskImg.src = `${API_BASE}/mask/${existingId}?t=${Date.now()}`;
-    });
-
+    await loadImageEl(maskImg, `${API_BASE}/mask/${existingId}?t=${Date.now()}`);
     maskCtx.clearRect(0, 0, 1000, 1000);
     maskCtx.drawImage(maskImg, 0, 0, 1000, 1000);
 
-    await new Promise(res => {
-      restoreMaskImg.onload = res;
-      restoreMaskImg.src = `${API_BASE}/restore-mask/${existingId}?t=${Date.now()}`;
-    });
-
+    await loadImageEl(restoreMaskImg, `${API_BASE}/restore-mask/${existingId}?t=${Date.now()}`);
     restoreMaskCtx.clearRect(0, 0, 1000, 1000);
     restoreMaskCtx.drawImage(restoreMaskImg, 0, 0, 1000, 1000);
 
@@ -3063,14 +3062,16 @@ def ui(
           stopStageCycle();
           overlayTitle.textContent = "AI cutout failed";
           overlaySub.textContent = "You can still use the original image and make manual edits.";
+          await loadBaseMaskAndRestore(sessionId);
           setTimeout(() => hideOverlay(), 1400);
           statusline.textContent = "AI cutout failed — edit original instead.";
-          await loadBaseMaskAndRestore(sessionId);
           fitView();
           enterReviewMode();
           return;
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn("Status poll error:", e);
+      }
 
       await new Promise(res => setTimeout(res, 800));
     }
@@ -3116,6 +3117,13 @@ def ui(
     step3.style.display = 'grid';
     btnDone.style.display = 'inline-flex';
 
+    clearEditorCanvases();
+    history = [];
+    aiReady = false;
+    qualityFlags = [];
+    hideOverlay();
+    statusline.textContent = "";
+
     const fd = new FormData();
     fd.append('file', f);
 
@@ -3138,25 +3146,27 @@ def ui(
       if (!r.ok) throw new Error(j.error || 'Upload failed');
 
       sessionId = j.session_id;
-      aiReady = keepOriginalEl.checked;
       qualityFlags = [];
 
-      await loadBaseMaskAndRestore(sessionId);
       fitView();
 
-      if (!keepOriginalEl.checked) {
-        showOverlay("Uploading image…", "Please wait while we prepare your logo.");
-        startStageCycle();
-        statusline.textContent = "Preparing your logo…";
-        pollAIReady(j.status_url);
-      } else {
+      if (keepOriginalEl.checked) {
+        aiReady = true;
+        await loadBaseMaskAndRestore(sessionId);
         hideOverlay();
         statusline.textContent = "Using original image";
         enterReviewMode();
+      } else {
+        aiReady = false;
+        showOverlay("Uploading image…", "Please wait while we prepare your logo.");
+        startStageCycle();
+        statusline.textContent = "Preparing your logo…";
+        await pollAIReady(j.status_url);
       }
 
       updateCursorSize();
     } catch (err) {
+      console.error(err);
       alert(err.message || "Upload failed");
       location.reload();
     }
