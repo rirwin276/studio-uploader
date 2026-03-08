@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.2.0")
+app = FastAPI(title="Studio Uploader", version="3.2.1")
 
 
 # ----------------------------
@@ -2371,6 +2371,7 @@ def ui(
       magicMode = 'remove';
       updateMobileMagicOnlyUI();
       setCanvasCursor('crosshair');
+      renderFromMask();
       showBanner("Quick mobile fix mode enabled. Desktop or laptop gives you finer editing.", 5);
       return;
     }
@@ -2387,7 +2388,7 @@ def ui(
 
     updateMagicModeUI();
     updateCursorSize();
-    renderFromMask(); // keep image visually identical when entering edit
+    renderFromMask();
     showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
   }
 
@@ -2494,7 +2495,7 @@ def ui(
       if (aiReady) return;
       i = (i + 1) % CYCLE_MESSAGES.length;
       overlayTitle.textContent = CYCLE_MESSAGES[i];
-    }, 1400);
+    }, 5000);
   }
 
   function stopStageCycle() {
@@ -2698,40 +2699,46 @@ def ui(
 
     const currentMask = maskCtx.getImageData(0, 0, 1000, 1000);
     const restoreMask = restoreMaskCtx.getImageData(0, 0, 1000, 1000);
-    const restoreSrc = restoreSrcCtx.getImageData(0, 0, 1000, 1000);
 
     const md = currentMask.data;
     const rd = restoreMask.data;
-    const sd = restoreSrc.data;
 
     const w = 1000;
     const h = 1000;
 
-    const startPos = (startY * w + startX) * 4;
-    if (rd[startPos + 3] <= md[startPos + 3]) return;
+    const startIdx = startY * w + startX;
+    const startPos = startIdx * 4;
 
-    const sr = sd[startPos];
-    const sg = sd[startPos + 1];
-    const sb = sd[startPos + 2];
+    const startDeficit = rd[startPos + 3] - md[startPos + 3];
+    if (startDeficit <= 6) return;
 
-    const stack = [startX, startY];
+    const deficit = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const p = i * 4;
+      const d = rd[p + 3] - md[p + 3];
+      deficit[i] = d > 6 ? 1 : 0;
+    }
+
     const seen = new Uint8Array(w * h);
     const region = new Uint8Array(w * h);
-    seen[startY * w + startX] = 1;
-
-    const tolerance = 82;
+    const stack = [startX, startY];
+    seen[startIdx] = 1;
 
     while (stack.length) {
       const y = stack.pop();
       const x = stack.pop();
       const idx = y * w + x;
-      const pos = idx * 4;
 
-      if (rd[pos + 3] <= md[pos + 3]) continue;
+      if (!deficit[idx]) continue;
+      region[idx] = 1;
 
-      region[idx] = 255;
+      const nbs = [
+        [x - 1, y],
+        [x + 1, y],
+        [x, y - 1],
+        [x, y + 1],
+      ];
 
-      const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
       for (let i = 0; i < nbs.length; i++) {
         const nx = nbs[i][0];
         const ny = nbs[i][1];
@@ -2739,10 +2746,8 @@ def ui(
           const nIdx = ny * w + nx;
           if (!seen[nIdx]) {
             seen[nIdx] = 1;
-            const p2 = nIdx * 4;
-            if (rd[p2 + 3] > md[p2 + 3]) {
-              const dist = colorDistance(sd, p2, sr, sg, sb);
-              if (dist <= tolerance) stack.push(nx, ny);
+            if (deficit[nIdx]) {
+              stack.push(nx, ny);
             }
           }
         }
@@ -2758,8 +2763,8 @@ def ui(
     const regionData = regionImg.data;
 
     for (let i = 0; i < region.length; i++) {
-      const a = region[i];
       const p = i * 4;
+      const a = region[i] ? 255 : 0;
       regionData[p] = 255;
       regionData[p + 1] = 255;
       regionData[p + 2] = 255;
@@ -2772,19 +2777,29 @@ def ui(
     featherCanvas.width = w;
     featherCanvas.height = h;
     const fCtx = featherCanvas.getContext('2d', { willReadFrequently: true });
-    fCtx.filter = 'blur(0.8px)';
+
+    fCtx.drawImage(regionCanvas, -1, 0);
+    fCtx.drawImage(regionCanvas, 1, 0);
+    fCtx.drawImage(regionCanvas, 0, -1);
+    fCtx.drawImage(regionCanvas, 0, 1);
     fCtx.drawImage(regionCanvas, 0, 0);
+
+    fCtx.filter = 'blur(1.2px)';
+    fCtx.drawImage(featherCanvas, 0, 0);
     fCtx.filter = 'none';
 
     const feather = fCtx.getImageData(0, 0, w, h).data;
 
-    for (let i = 0; i < region.length; i++) {
+    for (let i = 0; i < w * h; i++) {
       const p = i * 4;
       const blend = feather[p + 3] / 255;
-      if (blend <= 0) continue;
+      if (blend <= 0.02) continue;
 
       const restoreAlpha = rd[p + 3];
-      const targetAlpha = Math.round(restoreAlpha * blend);
+      const currentAlpha = md[p + 3];
+      if (restoreAlpha <= currentAlpha) continue;
+
+      const targetAlpha = Math.round(currentAlpha + ((restoreAlpha - currentAlpha) * blend));
       if (targetAlpha > md[p + 3]) {
         md[p + 3] = targetAlpha;
       }
