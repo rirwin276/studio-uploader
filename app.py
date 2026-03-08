@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + review-first editor UX
+# app.py — Studio Uploader (FastAPI) — review-first editor UX
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.2.0")
+app = FastAPI(title="Studio Uploader", version="2.3.0")
 
 
 # ----------------------------
@@ -151,10 +151,6 @@ def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
 
 
 def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.92) -> Image.Image:
-    """
-    Scale both up and down for the editor so small uploads don't look tiny.
-    This is editor-only convenience, not final output logic.
-    """
     w, h = img.size
     target = max(1, int(max_dim * fill_ratio))
     scale = min(target / w, target / h)
@@ -185,10 +181,6 @@ def _pil_to_png_bytes(img: Image.Image) -> bytes:
 # PhotoRoom BG removal
 # ----------------------------
 def _photoroom_remove_bg(img: Image.Image) -> Image.Image:
-    """
-    Uses PhotoRoom Remove Background API.
-    Returns RGBA image with transparency.
-    """
     if not PHOTOROOM_API_KEY:
         raise RuntimeError("PHOTOROOM_API_KEY not set")
 
@@ -376,7 +368,7 @@ def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int 
 
 
 # ----------------------------
-# Async “upload then process” worker
+# Async worker
 # ----------------------------
 def _bg_process_session(session_id: str):
     try:
@@ -445,11 +437,7 @@ def session_status(session_id: str):
     s = _sess_get(session_id)
     if not s:
         if _session_exists(session_id):
-            return {
-                "status": "ready",
-                "stage": "ready",
-                "quality_flags": [],
-            }
+            return {"status": "ready", "stage": "ready", "quality_flags": []}
         return {"status": "unknown"}
     return s
 
@@ -471,9 +459,6 @@ def session_info(session_id: str):
     }
 
 
-# --------
-# Editor upload pipeline (FAST response)
-# --------
 @app.post("/upload")
 async def upload_image(
     file: UploadFile = File(...),
@@ -594,16 +579,11 @@ def _run_shopify_provision_job(
     cmd = [
         "python",
         str(PROVISION_SCRIPT),
-        "--name",
-        storefront_name,
-        "--handle",
-        storefront_handle,
-        "--owner_customer_id",
-        owner_customer_id,
-        "--main_session_id",
-        main_session_id,
-        "--uploads_dir",
-        str(UPLOAD_DIR),
+        "--name", storefront_name,
+        "--handle", storefront_handle,
+        "--owner_customer_id", owner_customer_id,
+        "--main_session_id", main_session_id,
+        "--uploads_dir", str(UPLOAD_DIR),
     ]
 
     if secondary_session_id:
@@ -811,20 +791,11 @@ def ui(
       --bg0: #f6f8fb;
       --bg1: #eef3f8;
       --panel: rgba(255,255,255,0.78);
-      --panel-strong: rgba(255,255,255,0.92);
       --panel-border: rgba(15,23,42,0.07);
       --text: #0f172a;
       --muted: #667085;
-      --muted-2: #94a3b8;
-      --accent: #111827;
-      --green: #10b981;
-      --green-2: #22c55e;
       --shadow: 0 26px 70px rgba(15,23,42,0.12);
       --shadow-soft: 0 12px 30px rgba(15,23,42,0.07);
-      --radius-xl: 30px;
-      --radius-lg: 22px;
-      --radius-md: 16px;
-      --radius-sm: 12px;
     }
 
     * { box-sizing: border-box; }
@@ -894,8 +865,6 @@ def ui(
       letter-spacing: -0.01em;
       box-shadow: 0 10px 22px rgba(16,185,129,0.20);
       cursor: pointer;
-      position: sticky;
-      top: 0;
     }
 
     .btn-done:disabled {
@@ -915,10 +884,10 @@ def ui(
 
     .upload-card {
       width: min(560px, 100%);
-      background: var(--panel);
+      background: rgba(255,255,255,0.78);
       backdrop-filter: blur(18px) saturate(1.12);
       border: 1px solid var(--panel-border);
-      border-radius: var(--radius-xl);
+      border-radius: 30px;
       box-shadow: var(--shadow);
       padding: 16px;
     }
@@ -930,14 +899,7 @@ def ui(
       text-align: center;
       border: 1.5px dashed rgba(15,23,42,0.12);
       background: rgba(255,255,255,0.58);
-      transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
       overflow: hidden;
-    }
-
-    .upload-box:hover {
-      border-color: rgba(15,23,42,0.22);
-      background: rgba(255,255,255,0.76);
-      transform: translateY(-1px);
     }
 
     .upload-box input {
@@ -994,7 +956,7 @@ def ui(
       grid-template-rows: minmax(0,1fr) auto;
       gap: 10px;
       padding: 10px;
-      background: var(--panel);
+      background: rgba(255,255,255,0.78);
       backdrop-filter: blur(20px) saturate(1.14);
       border: 1px solid var(--panel-border);
       border-radius: 28px;
@@ -1005,9 +967,16 @@ def ui(
     .editor-top {
       min-height: 0;
       display: grid;
-      grid-template-columns: 72px minmax(0, 1fr) 72px;
       gap: 10px;
       align-items: stretch;
+    }
+
+    .editor-shell.review-mode .editor-top {
+      grid-template-columns: minmax(0,1fr) 72px;
+    }
+
+    .editor-shell.edit-mode .editor-top {
+      grid-template-columns: 72px minmax(0,1fr) 72px;
     }
 
     .canvas-panel {
@@ -1035,6 +1004,7 @@ def ui(
       border: 1px solid rgba(15,23,42,0.08);
       background: #ffffff;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
+      flex: 0 0 auto;
     }
 
     .canvas-stage.bg-checker {
@@ -1063,6 +1033,7 @@ def ui(
       inset: 0;
       overflow: hidden;
       touch-action: none;
+      cursor: default;
     }
 
     .canvas-inner {
@@ -1070,6 +1041,7 @@ def ui(
       inset: 0;
       transform-origin: center center;
       will-change: transform;
+      cursor: default;
     }
 
     canvas {
@@ -1079,7 +1051,7 @@ def ui(
       height: 100%;
       display: block;
       touch-action: none;
-      cursor: none;
+      cursor: default;
       z-index: 2;
     }
 
@@ -1141,6 +1113,10 @@ def ui(
       background: rgba(255,255,255,0.60);
       border: 1px solid rgba(15,23,42,0.08);
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.84);
+    }
+
+    .editor-shell.review-mode .tool-rail {
+      display: none;
     }
 
     .rail-tool-btn {
@@ -1210,11 +1186,6 @@ def ui(
       box-shadow: 0 8px 18px rgba(15,23,42,0.08);
       transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
       background: #fff;
-    }
-
-    .swatch-btn:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 10px 24px rgba(15,23,42,0.12);
     }
 
     .swatch-btn.active {
@@ -1335,48 +1306,10 @@ def ui(
       padding: 0 10px;
     }
 
-    .tool-btn:hover {
-      background: rgba(15,23,42,0.05);
-      color: #0f172a;
-    }
-
     .tool-btn.active {
       background: #0f172a;
       color: white;
       box-shadow: 0 10px 24px rgba(15,23,42,0.16);
-    }
-
-    .mini-segment {
-      display: none;
-      align-items: center;
-      gap: 4px;
-      padding: 4px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: var(--shadow-soft);
-      max-width: 100%;
-    }
-
-    .mini-segment.show { display: inline-flex; }
-
-    .mini-btn {
-      height: 30px;
-      min-width: 64px;
-      padding: 0 10px;
-      border: none;
-      border-radius: 999px;
-      background: transparent;
-      color: #475569;
-      font-size: 11px;
-      font-weight: 700;
-      cursor: pointer;
-    }
-
-    .mini-btn.active {
-      background: rgba(15,23,42,0.92);
-      color: white;
-      box-shadow: 0 8px 18px rgba(15,23,42,0.14);
     }
 
     .utility-row {
@@ -1414,11 +1347,6 @@ def ui(
       font-weight: 700;
       cursor: pointer;
       box-shadow: var(--shadow-soft);
-    }
-
-    .ghost-btn:hover {
-      background: rgba(255,255,255,0.88);
-      color: #0f172a;
     }
 
     .zoom-pill {
@@ -1552,19 +1480,11 @@ def ui(
       display: none;
     }
 
-    .desktop-tools {
-      display: flex;
-    }
-
     .mobile-tools {
       display: none;
     }
 
     .mobile-magic-sheet {
-      display: none;
-    }
-
-    .mobile-magic-sheet.show {
       display: none;
     }
 
@@ -1582,13 +1502,13 @@ def ui(
         gap: 10px;
       }
 
-      .editor-top {
+      .editor-shell.review-mode .editor-top,
+      .editor-shell.edit-mode .editor-top {
         grid-template-columns: 1fr;
-        gap: 10px;
       }
 
-      .desktop-tools {
-        display: none;
+      .tool-rail {
+        display: none !important;
       }
 
       .mobile-tools {
@@ -1601,8 +1521,8 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(92vw, 60vw, 540px);
-        height: min(92vw, 60vw, 540px);
+        width: min(92vw, 62vw, 540px);
+        height: min(92vw, 62vw, 540px);
       }
 
       .swatch-rail {
@@ -1626,10 +1546,6 @@ def ui(
     }
 
     @media (max-width: 640px) {
-      html, body {
-        overflow: hidden;
-      }
-
       .header {
         padding: 8px 10px;
       }
@@ -1662,11 +1578,6 @@ def ui(
         height: calc(100vh - 56px);
         gap: 6px;
         padding: 6px;
-        grid-template-rows: minmax(0,1fr) auto;
-      }
-
-      .editor-top {
-        gap: 6px;
       }
 
       .canvas-panel {
@@ -1717,18 +1628,13 @@ def ui(
         gap: 6px;
       }
 
-      .tool-segment,
-      .mini-segment {
-        width: 100%;
-        justify-content: center;
-      }
-
       .tool-segment {
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 6px;
         padding: 6px;
         border-radius: 18px;
+        width: 100%;
       }
 
       .tool-btn {
@@ -1737,10 +1643,6 @@ def ui(
         padding: 0 8px;
         font-size: 12px;
         border-radius: 14px;
-      }
-
-      .mini-segment {
-        display: none !important;
       }
 
       .utility-row {
@@ -1891,13 +1793,13 @@ def ui(
       <div class="status-row" id="statusline1"></div>
     </div>
 
-    <div class="editor-shell" id="step3" style="display:none;">
+    <div class="editor-shell review-mode" id="step3" style="display:none;">
       <div class="editor-top">
-        <div class="tool-rail desktop-tools" id="desktopToolRail" style="display:none;">
-          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
-          <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
-          <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
-          <button class="rail-tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around when zoomed in for precise edits.">Pan</button>
+        <div class="tool-rail" id="desktopToolRail">
+          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in.">Restore</button>
+          <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts manually.">Erase</button>
+          <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic removes or restores one connected area.">Magic</button>
+          <button class="rail-tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around while zoomed in.">Pan</button>
 
           <div class="mini-rail" id="magicModeWrapDesktop">
             <button class="mini-rail-btn active tip-target" id="magicRemoveModeDesktop" data-tip="Magic Remove removes one connected region based on color.">−</button>
@@ -1923,15 +1825,15 @@ def ui(
 
         <div class="swatch-rail">
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn checker active tip-target" id="bgChecker" data-tip="Grid shows transparency best. Use it to spot leftover background or holes." title="Grid"></button>
+            <button class="swatch-btn checker active tip-target" id="bgChecker" data-tip="Grid shows transparency best."></button>
             <div class="swatch-label">Grid</div>
           </div>
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn white tip-target" id="bgWhite" data-tip="White helps you check whether white details were removed by mistake." title="White"></button>
+            <button class="swatch-btn white tip-target" id="bgWhite" data-tip="White helps you spot missing white details."></button>
             <div class="swatch-label">White</div>
           </div>
           <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn dark tip-target" id="bgDark" data-tip="Dark helps you spot soft halos, haze, and missed transparent edges." title="Dark"></button>
+            <button class="swatch-btn dark tip-target" id="bgDark" data-tip="Dark helps you spot halos and haze."></button>
             <div class="swatch-label">Dark</div>
           </div>
         </div>
@@ -2117,34 +2019,48 @@ def ui(
   }
 
   function isMobile() {
-    return window.innerWidth <= 640;
+    return window.innerWidth <= 980;
+  }
+
+  function setCanvasCursor(cursorValue) {
+    cv.style.cursor = cursorValue;
+    canvasViewport.style.cursor = cursorValue;
+    canvasInner.style.cursor = cursorValue;
   }
 
   function syncTopDoneButton() {
     btnDone.style.display = 'inline-flex';
-    btnDone.textContent = editorUnlocked ? 'Done' : 'Done';
+    btnDone.textContent = 'Done';
   }
 
   function enterReviewMode() {
     editorUnlocked = false;
+    step3.classList.remove('edit-mode');
+    step3.classList.add('review-mode');
     reviewControls.style.display = 'grid';
     editorControls.classList.remove('show');
     desktopToolRail.style.display = 'none';
     mobileMagicSheet.classList.remove('show');
     fitView();
-    syncTopDoneButton();
+    setCanvasCursor('default');
     showBanner("Review your image first. If it looks good, hit Done. If not, tap Edit.", 4);
   }
 
   function enterEditMode() {
     editorUnlocked = true;
+    step3.classList.remove('review-mode');
+    step3.classList.add('edit-mode');
     reviewControls.style.display = 'none';
     editorControls.classList.add('show');
+
     if (!isMobile()) {
       desktopToolRail.style.display = 'flex';
+    } else {
+      desktopToolRail.style.display = 'none';
     }
+
     updateMagicSheetVisibility();
-    syncTopDoneButton();
+    updateCursorSize();
     showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
   }
 
@@ -2181,12 +2097,16 @@ def ui(
     updateViewportTransform();
   }
 
-  function zoomBy(delta) {
-    setZoom(viewScale + delta);
-  }
+  zoomIn.addEventListener('click', () => {
+    if (!editorUnlocked) return;
+    setZoom(viewScale + 0.25);
+  });
 
-  zoomIn.addEventListener('click', () => setZoom(editorUnlocked ? (viewScale + 0.25) : 1));
-  zoomOut.addEventListener('click', () => setZoom(editorUnlocked ? (viewScale - 0.25) : 1));
+  zoomOut.addEventListener('click', () => {
+    if (!editorUnlocked) return;
+    setZoom(viewScale - 0.25);
+  });
+
   zoomSlider.addEventListener('input', () => {
     if (!editorUnlocked) {
       fitView();
@@ -2194,13 +2114,17 @@ def ui(
     }
     setZoom(parseInt(zoomSlider.value, 10) / 100);
   });
-  btnFit.addEventListener('click', fitView);
+
+  btnFit.addEventListener('click', () => {
+    if (!editorUnlocked) return;
+    fitView();
+  });
 
   canvasViewport.addEventListener('wheel', (e) => {
     if (!editorUnlocked) return;
     e.preventDefault();
     const delta = e.deltaY < 0 ? 0.15 : -0.15;
-    zoomBy(delta);
+    setZoom(viewScale + delta);
   }, { passive: false });
 
   function setBgMode(mode) {
@@ -2274,10 +2198,24 @@ def ui(
   });
 
   function updateCursorSize() {
-    if (!editorUnlocked || mode === 'magic' || mode === 'pan') {
+    if (!editorUnlocked) {
       cursor.style.display = 'none';
       cursorDot.style.display = 'none';
-      cv.style.cursor = mode === 'pan' && editorUnlocked ? 'grab' : 'default';
+      setCanvasCursor('default');
+      return;
+    }
+
+    if (mode === 'magic') {
+      cursor.style.display = 'none';
+      cursorDot.style.display = 'none';
+      setCanvasCursor('crosshair');
+      return;
+    }
+
+    if (mode === 'pan') {
+      cursor.style.display = 'none';
+      cursorDot.style.display = 'none';
+      setCanvasCursor('grab');
       return;
     }
 
@@ -2286,7 +2224,7 @@ def ui(
     const visualSize = brushSlider.value * ratio;
     cursor.style.width = visualSize + 'px';
     cursor.style.height = visualSize + 'px';
-    cv.style.cursor = 'none';
+    setCanvasCursor('none');
   }
 
   brushSlider.addEventListener('input', updateCursorSize);
@@ -2466,7 +2404,7 @@ def ui(
   }
 
   function updateMagicSheetVisibility() {
-    if (isMobile() && editorUnlocked && mode === 'magic') {
+    if (window.innerWidth <= 640 && editorUnlocked && mode === 'magic') {
       mobileMagicSheet.classList.add('show');
     } else {
       mobileMagicSheet.classList.remove('show');
@@ -2504,11 +2442,6 @@ def ui(
     }
 
     updateMagicSheetVisibility();
-
-    if (mode === 'pan') {
-      cv.style.cursor = 'grab';
-    }
-
     updateCursorSize();
   }
 
@@ -2558,7 +2491,7 @@ def ui(
     panStartY = pointY;
     startPanX = panX;
     startPanY = panY;
-    cv.style.cursor = 'grabbing';
+    setCanvasCursor('grabbing');
   }
 
   function movePan(evt) {
@@ -2582,7 +2515,7 @@ def ui(
 
   function endPan() {
     isPanning = false;
-    if (mode === 'pan') cv.style.cursor = 'grab';
+    if (mode === 'pan') setCanvasCursor('grab');
   }
 
   function startDraw(e) {
@@ -2763,9 +2696,7 @@ def ui(
           enterReviewMode();
           return;
         }
-      } catch (e) {
-        // ignore transient polling errors
-      }
+      } catch (e) {}
 
       await new Promise(res => setTimeout(res, 800));
     }
@@ -2925,19 +2856,30 @@ def ui(
     }, "image/png");
   });
 
+  btnApprove.addEventListener('click', () => btnDone.click());
+  btnEnterEdit.addEventListener('click', () => enterEditMode());
+
   setBgMode('checker');
   fitView();
   updateMagicModeUI();
   bindHints();
+  syncTopDoneButton();
   enterReviewMode();
 
   window.addEventListener('resize', () => {
     updateViewportTransform();
     updateMagicSheetVisibility();
-    if (!isMobile() && editorUnlocked) {
-      desktopToolRail.style.display = 'flex';
-    } else if (!editorUnlocked) {
-      desktopToolRail.style.display = 'none';
+    if (!editorUnlocked) {
+      step3.classList.add('review-mode');
+      step3.classList.remove('edit-mode');
+    } else {
+      step3.classList.add('edit-mode');
+      step3.classList.remove('review-mode');
+      if (!isMobile()) {
+        desktopToolRail.style.display = 'flex';
+      } else {
+        desktopToolRail.style.display = 'none';
+      }
     }
   });
 
