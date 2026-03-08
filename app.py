@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — mask-based editor (non-destructive, dehalo, mobile-safe)
+# app.py — Studio Uploader (FastAPI) — dual-source restore editor
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.1.1")
+app = FastAPI(title="Studio Uploader", version="3.2.0")
 
 
 # ----------------------------
@@ -129,25 +129,21 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
-        "orig": UPLOAD_DIR / f"{session_id}_orig.png",              # editor-sized original aligned upload
-        "base": UPLOAD_DIR / f"{session_id}_base.png",              # editor-sized clean RGB base for editing/final preview
-        "editor": UPLOAD_DIR / f"{session_id}_editor.png",          # editor-sized composed preview (base + current mask)
-        "curr": UPLOAD_DIR / f"{session_id}_curr.png",              # final normalized output for downstream
-        "mask": UPLOAD_DIR / f"{session_id}_mask.png",              # editor-sized current editable alpha mask
-        "restore_mask": UPLOAD_DIR / f"{session_id}_restore_mask.png",  # editor-sized restore source alpha mask
+        "orig": UPLOAD_DIR / f"{session_id}_orig.png",
+        "base": UPLOAD_DIR / f"{session_id}_base.png",
+        "editor": UPLOAD_DIR / f"{session_id}_editor.png",
+        "curr": UPLOAD_DIR / f"{session_id}_curr.png",
+        "mask": UPLOAD_DIR / f"{session_id}_mask.png",
+        "restore_mask": UPLOAD_DIR / f"{session_id}_restore_mask.png",
+        "seed_mask": UPLOAD_DIR / f"{session_id}_seed_mask.png",
+        "restore_src": UPLOAD_DIR / f"{session_id}_restore_src.png",
     }
 
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    return (
-        p["orig"].exists()
-        and p["base"].exists()
-        and p["editor"].exists()
-        and p["curr"].exists()
-        and p["mask"].exists()
-        and p["restore_mask"].exists()
-    )
+    needed = ["orig", "base", "editor", "curr", "mask", "restore_mask", "seed_mask", "restore_src"]
+    return all(p[k].exists() for k in needed)
 
 
 def _save_png(img: Image.Image, path: Path):
@@ -194,12 +190,6 @@ def _alpha_to_rgba_mask(img: Image.Image) -> Image.Image:
     alpha = img.convert("RGBA").split()[-1]
     rgba = Image.new("RGBA", img.size, (255, 255, 255, 0))
     rgba.putalpha(alpha)
-    return rgba
-
-
-def _mask_rgba_from_alpha(alpha_img: Image.Image) -> Image.Image:
-    rgba = Image.new("RGBA", alpha_img.size, (255, 255, 255, 0))
-    rgba.putalpha(alpha_img.convert("L"))
     return rgba
 
 
@@ -299,10 +289,6 @@ def _cleanup_cutout(img: Image.Image) -> Image.Image:
 
 
 def _dehalo_cutout(img: Image.Image) -> Image.Image:
-    """
-    Remove white/light matte halos by rebuilding edge RGB from nearby solid pixels.
-    This keeps the clean cutout look instead of reintroducing a fringe when composited.
-    """
     arr = np.array(img.convert("RGBA")).astype(np.float32)
     rgb = arr[:, :, :3]
     alpha = arr[:, :, 3]
@@ -311,15 +297,12 @@ def _dehalo_cutout(img: Image.Image) -> Image.Image:
         return Image.fromarray(arr.astype(np.uint8), "RGBA")
 
     solid = (alpha >= float(DEHALO_SOLID_ALPHA)).astype(np.float32)
-
     if solid.max() <= 0:
         return Image.fromarray(arr.astype(np.uint8), "RGBA")
 
     weighted = rgb * solid[:, :, None]
-
     blur_weighted = cv2.GaussianBlur(weighted, (0, 0), sigmaX=2.0, sigmaY=2.0)
     blur_solid = cv2.GaussianBlur(solid, (0, 0), sigmaX=2.0, sigmaY=2.0)
-
     blur_solid_3 = np.repeat(np.maximum(blur_solid[:, :, None], 1e-5), 3, axis=2)
     rebuilt_rgb = blur_weighted / blur_solid_3
 
@@ -405,14 +388,6 @@ def _fit_cutout_into_reference_box(
     return out
 
 
-def _compose_base_with_alpha(base_rgba: Image.Image, alpha_rgba: Image.Image) -> Image.Image:
-    base_arr = np.array(base_rgba.convert("RGBA"))
-    alpha_arr = np.array(alpha_rgba.convert("RGBA"))
-    out = base_arr.copy()
-    out[:, :, 3] = alpha_arr[:, :, 3]
-    return Image.fromarray(out, "RGBA")
-
-
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
     img = _trim_transparent_padding(img.convert("RGBA"))
     canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
@@ -451,17 +426,47 @@ def _expand_alpha_mask(alpha_rgba: Image.Image, iterations: int = RESTORE_EXPAND
     return Image.fromarray(out, "RGBA")
 
 
+def _compose_dual_source_preview(
+    cleaned_rgba: Image.Image,
+    current_mask_rgba: Image.Image,
+    seed_mask_rgba: Image.Image,
+    restore_src_rgba: Image.Image,
+) -> Image.Image:
+    cleaned = np.array(cleaned_rgba.convert("RGBA")).astype(np.float32)
+    current_mask = np.array(current_mask_rgba.convert("RGBA")).astype(np.float32)
+    seed_mask = np.array(seed_mask_rgba.convert("RGBA")).astype(np.float32)
+    restore_src = np.array(restore_src_rgba.convert("RGBA")).astype(np.float32)
+
+    cleaned_rgb = cleaned[:, :, :3]
+    restore_rgb = restore_src[:, :, :3]
+
+    curr_a = current_mask[:, :, 3]
+    seed_a = seed_mask[:, :, 3]
+
+    base_w = np.minimum(curr_a, seed_a)
+    extra_w = np.maximum(0.0, curr_a - seed_a)
+    denom = np.maximum(curr_a, 1.0)
+
+    out_rgb = ((cleaned_rgb * base_w[:, :, None]) + (restore_rgb * extra_w[:, :, None])) / denom[:, :, None]
+    out_a = curr_a
+
+    out = np.dstack([np.clip(out_rgb, 0, 255), np.clip(out_a, 0, 255)]).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
 def _build_editor_assets(
     original_aligned: Image.Image,
     cleaned_removed: Image.Image,
     keep_original: bool = False,
-) -> Tuple[Image.Image, Image.Image, Image.Image, Image.Image]:
+) -> Tuple[Image.Image, Image.Image, Image.Image, Image.Image, Image.Image, Image.Image]:
     """
     Returns:
-    - base_rgba: clean RGB base used for display/final composition
-    - current_mask_rgba: editable current alpha mask
-    - restore_mask_rgba: restore source alpha mask
-    - editor_preview: base composed with current mask
+    - base_rgba: cleaned RGB source
+    - current_mask_rgba
+    - restore_mask_rgba
+    - seed_mask_rgba
+    - restore_src_rgba
+    - editor_preview
     """
     original_aligned = original_aligned.convert("RGBA")
 
@@ -469,23 +474,38 @@ def _build_editor_assets(
         base_rgba = original_aligned.copy()
         current_mask_rgba = _alpha_to_rgba_mask(original_aligned)
         restore_mask_rgba = current_mask_rgba.copy()
-        editor_preview = _compose_base_with_alpha(base_rgba, current_mask_rgba)
-        return base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview
+        seed_mask_rgba = current_mask_rgba.copy()
+        restore_src_rgba = original_aligned.copy()
+        editor_preview = _compose_dual_source_preview(
+            cleaned_rgba=base_rgba,
+            current_mask_rgba=current_mask_rgba,
+            seed_mask_rgba=seed_mask_rgba,
+            restore_src_rgba=restore_src_rgba,
+        )
+        return base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview
 
     cleaned_aligned = _fit_cutout_into_reference_box(cleaned_removed, original_aligned, EDITOR_PX).convert("RGBA")
     cleaned_aligned = _dehalo_cutout(cleaned_aligned)
 
     base_rgba = cleaned_aligned.copy()
-    current_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
+    seed_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
+    current_mask_rgba = seed_mask_rgba.copy()
 
     original_alpha_ratio = _alpha_coverage_ratio(original_aligned)
     if original_alpha_ratio < 0.98:
         restore_mask_rgba = _alpha_to_rgba_mask(original_aligned)
     else:
-        restore_mask_rgba = _expand_alpha_mask(current_mask_rgba, iterations=RESTORE_EXPAND_ITER)
+        restore_mask_rgba = _expand_alpha_mask(seed_mask_rgba, iterations=RESTORE_EXPAND_ITER)
 
-    editor_preview = _compose_base_with_alpha(base_rgba, current_mask_rgba)
-    return base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview
+    restore_src_rgba = original_aligned.copy()
+
+    editor_preview = _compose_dual_source_preview(
+        cleaned_rgba=base_rgba,
+        current_mask_rgba=current_mask_rgba,
+        seed_mask_rgba=seed_mask_rgba,
+        restore_src_rgba=restore_src_rgba,
+    )
+    return base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview
 
 
 # ----------------------------
@@ -513,7 +533,7 @@ def _bg_process_session(session_id: str):
         flags = _quality_flags(cleaned)
 
         _sess_set(session_id, stage="finishing_details")
-        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
             original_aligned=orig_sq,
             cleaned_removed=cleaned,
             keep_original=False,
@@ -524,6 +544,8 @@ def _bg_process_session(session_id: str):
         _save_png(editor_preview, p["editor"])
         _save_png(current_mask_rgba, p["mask"])
         _save_png(restore_mask_rgba, p["restore_mask"])
+        _save_png(seed_mask_rgba, p["seed_mask"])
+        _save_png(restore_src_rgba, p["restore_src"])
         _save_png(final_png, p["curr"])
 
         _sess_set(
@@ -544,6 +566,8 @@ def _bg_process_session(session_id: str):
                 _save_png(fallback, p["editor"])
                 _save_png(fallback_mask, p["mask"])
                 _save_png(fallback_mask, p["restore_mask"])
+                _save_png(fallback_mask, p["seed_mask"])
+                _save_png(fallback, p["restore_src"])
                 _save_png(_normalize_logo(fallback, target_size=TARGET_PX), p["curr"])
         except Exception:
             pass
@@ -596,6 +620,8 @@ def session_info(session_id: str):
         "base_url": f"/base/{session_id}",
         "mask_url": f"/mask/{session_id}",
         "restore_mask_url": f"/restore-mask/{session_id}",
+        "seed_mask_url": f"/seed-mask/{session_id}",
+        "restore_src_url": f"/restore-src/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -634,7 +660,7 @@ async def upload_image(
     _save_png(canvas_orig, p["orig"])
 
     if keep_original:
-        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
             original_aligned=canvas_orig,
             cleaned_removed=canvas_orig,
             keep_original=True,
@@ -643,6 +669,8 @@ async def upload_image(
         _save_png(editor_preview, p["editor"])
         _save_png(current_mask_rgba, p["mask"])
         _save_png(restore_mask_rgba, p["restore_mask"])
+        _save_png(seed_mask_rgba, p["seed_mask"])
+        _save_png(restore_src_rgba, p["restore_src"])
         _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
 
     _sess_set(
@@ -665,6 +693,8 @@ async def upload_image(
         "base_url": f"/base/{session_id}",
         "mask_url": f"/mask/{session_id}",
         "restore_mask_url": f"/restore-mask/{session_id}",
+        "seed_mask_url": f"/seed-mask/{session_id}",
+        "restore_src_url": f"/restore-src/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -704,6 +734,22 @@ def get_mask(session_id: str):
 @app.get("/restore-mask/{session_id}")
 def get_restore_mask(session_id: str):
     path = _paths(session_id)["restore_mask"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
+@app.get("/seed-mask/{session_id}")
+def get_seed_mask(session_id: str):
+    path = _paths(session_id)["seed_mask"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
+@app.get("/restore-src/{session_id}")
+def get_restore_src(session_id: str):
+    path = _paths(session_id)["restore_src"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -886,7 +932,7 @@ async def storefront_request(
 
         _save_png(canvas, p["orig"])
 
-        base_rgba, current_mask_rgba, restore_mask_rgba, editor_preview = _build_editor_assets(
+        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
             original_aligned=canvas,
             cleaned_removed=canvas,
             keep_original=True,
@@ -895,6 +941,8 @@ async def storefront_request(
         _save_png(editor_preview, p["editor"])
         _save_png(current_mask_rgba, p["mask"])
         _save_png(restore_mask_rgba, p["restore_mask"])
+        _save_png(seed_mask_rgba, p["seed_mask"])
+        _save_png(restore_src_rgba, p["restore_src"])
         _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
 
         if storefront_logo_secondary:
@@ -923,7 +971,7 @@ async def storefront_request(
 
                 _save_png(canvas2, sp["orig"])
 
-                base2, mask2, restore2, editor2 = _build_editor_assets(
+                base2, mask2, restore2, seed2, restore_src2, editor2 = _build_editor_assets(
                     original_aligned=canvas2,
                     cleaned_removed=canvas2,
                     keep_original=True,
@@ -932,6 +980,8 @@ async def storefront_request(
                 _save_png(editor2, sp["editor"])
                 _save_png(mask2, sp["mask"])
                 _save_png(restore2, sp["restore_mask"])
+                _save_png(seed2, sp["seed_mask"])
+                _save_png(restore_src2, sp["restore_src"])
                 _save_png(_normalize_logo(editor2, target_size=TARGET_PX), sp["curr"])
 
             except Exception as e:
@@ -2147,6 +2197,16 @@ def ui(
   restoreMaskCanvas.height = 1000;
   const restoreMaskCtx = restoreMaskCanvas.getContext('2d', { willReadFrequently: true });
 
+  const seedMaskCanvas = document.createElement('canvas');
+  seedMaskCanvas.width = 1000;
+  seedMaskCanvas.height = 1000;
+  const seedMaskCtx = seedMaskCanvas.getContext('2d', { willReadFrequently: true });
+
+  const restoreSrcCanvas = document.createElement('canvas');
+  restoreSrcCanvas.width = 1000;
+  restoreSrcCanvas.height = 1000;
+  const restoreSrcCtx = restoreSrcCanvas.getContext('2d', { willReadFrequently: true });
+
   const offCanvas = document.createElement('canvas');
   offCanvas.width = 1000;
   offCanvas.height = 1000;
@@ -2160,6 +2220,8 @@ def ui(
   const baseImg = new Image();
   const maskImg = new Image();
   const restoreMaskImg = new Image();
+  const seedMaskImg = new Image();
+  const restoreSrcImg = new Image();
 
   const btnDone = document.getElementById('btnDone');
   const btnApprove = document.getElementById('btnApprove');
@@ -2274,6 +2336,8 @@ def ui(
     baseCtx.clearRect(0, 0, 1000, 1000);
     maskCtx.clearRect(0, 0, 1000, 1000);
     restoreMaskCtx.clearRect(0, 0, 1000, 1000);
+    seedMaskCtx.clearRect(0, 0, 1000, 1000);
+    restoreSrcCtx.clearRect(0, 0, 1000, 1000);
     ctx.clearRect(0, 0, 1000, 1000);
   }
 
@@ -2323,6 +2387,7 @@ def ui(
 
     updateMagicModeUI();
     updateCursorSize();
+    renderFromMask(); // keep image visually identical when entering edit
     showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
   }
 
@@ -2535,19 +2600,34 @@ def ui(
   }
 
   function renderFromMask() {
-    const base = baseCtx.getImageData(0, 0, 1000, 1000);
-    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
+    const base = baseCtx.getImageData(0, 0, 1000, 1000).data;
+    const current = maskCtx.getImageData(0, 0, 1000, 1000).data;
+    const seed = seedMaskCtx.getImageData(0, 0, 1000, 1000).data;
+    const restoreSrc = restoreSrcCtx.getImageData(0, 0, 1000, 1000).data;
 
     const out = ctx.createImageData(1000, 1000);
-    const bd = base.data;
-    const md = mask.data;
     const od = out.data;
 
-    for (let i = 0; i < bd.length; i += 4) {
-      od[i] = bd[i];
-      od[i + 1] = bd[i + 1];
-      od[i + 2] = bd[i + 2];
-      od[i + 3] = md[i + 3];
+    for (let i = 0; i < base.length; i += 4) {
+      const currA = current[i + 3];
+      const seedA = seed[i + 3];
+
+      if (currA <= 0) {
+        od[i] = 0;
+        od[i + 1] = 0;
+        od[i + 2] = 0;
+        od[i + 3] = 0;
+        continue;
+      }
+
+      const baseW = Math.min(currA, seedA);
+      const extraW = Math.max(0, currA - seedA);
+      const denom = Math.max(currA, 1);
+
+      od[i] = Math.round(((base[i] * baseW) + (restoreSrc[i] * extraW)) / denom);
+      od[i + 1] = Math.round(((base[i + 1] * baseW) + (restoreSrc[i + 1] * extraW)) / denom);
+      od[i + 2] = Math.round(((base[i + 2] * baseW) + (restoreSrc[i + 2] * extraW)) / denom);
+      od[i + 3] = currA;
     }
 
     ctx.putImageData(out, 0, 0);
@@ -2616,35 +2696,38 @@ def ui(
     startX = Math.floor(startX);
     startY = Math.floor(startY);
 
-    const base = baseCtx.getImageData(0, 0, 1000, 1000);
-    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
+    const currentMask = maskCtx.getImageData(0, 0, 1000, 1000);
     const restoreMask = restoreMaskCtx.getImageData(0, 0, 1000, 1000);
+    const restoreSrc = restoreSrcCtx.getImageData(0, 0, 1000, 1000);
 
-    const bd = base.data;
-    const md = mask.data;
+    const md = currentMask.data;
     const rd = restoreMask.data;
+    const sd = restoreSrc.data;
+
     const w = 1000;
     const h = 1000;
 
     const startPos = (startY * w + startX) * 4;
-    if (rd[startPos + 3] === 0) return;
+    if (rd[startPos + 3] <= md[startPos + 3]) return;
 
-    const sr = bd[startPos];
-    const sg = bd[startPos + 1];
-    const sb = bd[startPos + 2];
+    const sr = sd[startPos];
+    const sg = sd[startPos + 1];
+    const sb = sd[startPos + 2];
 
     const stack = [startX, startY];
     const seen = new Uint8Array(w * h);
     const region = new Uint8Array(w * h);
     seen[startY * w + startX] = 1;
 
-    const tolerance = 110;
+    const tolerance = 82;
 
     while (stack.length) {
       const y = stack.pop();
       const x = stack.pop();
       const idx = y * w + x;
       const pos = idx * 4;
+
+      if (rd[pos + 3] <= md[pos + 3]) continue;
 
       region[idx] = 255;
 
@@ -2657,8 +2740,8 @@ def ui(
           if (!seen[nIdx]) {
             seen[nIdx] = 1;
             const p2 = nIdx * 4;
-            if (rd[p2 + 3] > 0) {
-              const dist = colorDistance(bd, p2, sr, sg, sb);
+            if (rd[p2 + 3] > md[p2 + 3]) {
+              const dist = colorDistance(sd, p2, sr, sg, sb);
               if (dist <= tolerance) stack.push(nx, ny);
             }
           }
@@ -2689,7 +2772,7 @@ def ui(
     featherCanvas.width = w;
     featherCanvas.height = h;
     const fCtx = featherCanvas.getContext('2d', { willReadFrequently: true });
-    fCtx.filter = 'blur(1.0px)';
+    fCtx.filter = 'blur(0.8px)';
     fCtx.drawImage(regionCanvas, 0, 0);
     fCtx.filter = 'none';
 
@@ -2707,7 +2790,7 @@ def ui(
       }
     }
 
-    maskCtx.putImageData(mask, 0, 0);
+    maskCtx.putImageData(currentMask, 0, 0);
     renderFromMask();
   }
 
@@ -3019,7 +3102,7 @@ def ui(
     });
   }
 
-  async function loadBaseMaskAndRestore(existingId) {
+  async function loadEditorAssets(existingId) {
     await loadImageEl(baseImg, `${API_BASE}/base/${existingId}?t=${Date.now()}`);
     baseCtx.clearRect(0, 0, 1000, 1000);
     baseCtx.drawImage(baseImg, 0, 0, 1000, 1000);
@@ -3031,6 +3114,14 @@ def ui(
     await loadImageEl(restoreMaskImg, `${API_BASE}/restore-mask/${existingId}?t=${Date.now()}`);
     restoreMaskCtx.clearRect(0, 0, 1000, 1000);
     restoreMaskCtx.drawImage(restoreMaskImg, 0, 0, 1000, 1000);
+
+    await loadImageEl(seedMaskImg, `${API_BASE}/seed-mask/${existingId}?t=${Date.now()}`);
+    seedMaskCtx.clearRect(0, 0, 1000, 1000);
+    seedMaskCtx.drawImage(seedMaskImg, 0, 0, 1000, 1000);
+
+    await loadImageEl(restoreSrcImg, `${API_BASE}/restore-src/${existingId}?t=${Date.now()}`);
+    restoreSrcCtx.clearRect(0, 0, 1000, 1000);
+    restoreSrcCtx.drawImage(restoreSrcImg, 0, 0, 1000, 1000);
 
     renderFromMask();
   }
@@ -3049,7 +3140,7 @@ def ui(
         if (j.status === 'ready') {
           aiReady = true;
           stopStageCycle();
-          await loadBaseMaskAndRestore(sessionId);
+          await loadEditorAssets(sessionId);
           hideOverlay();
           renderQualityFlags(j.quality_flags || []);
           fitView();
@@ -3062,7 +3153,7 @@ def ui(
           stopStageCycle();
           overlayTitle.textContent = "AI cutout failed";
           overlaySub.textContent = "You can still use the original image and make manual edits.";
-          await loadBaseMaskAndRestore(sessionId);
+          await loadEditorAssets(sessionId);
           setTimeout(() => hideOverlay(), 1400);
           statusline.textContent = "AI cutout failed — edit original instead.";
           fitView();
@@ -3096,7 +3187,7 @@ def ui(
     btnDone.style.display = 'inline-flex';
     hideOverlay();
 
-    await loadBaseMaskAndRestore(sessionId);
+    await loadEditorAssets(sessionId);
 
     renderQualityFlags(qualityFlags);
     fitView();
@@ -3152,7 +3243,7 @@ def ui(
 
       if (keepOriginalEl.checked) {
         aiReady = true;
-        await loadBaseMaskAndRestore(sessionId);
+        await loadEditorAssets(sessionId);
         hideOverlay();
         statusline.textContent = "Using original image";
         enterReviewMode();
