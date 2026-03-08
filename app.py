@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + polished editor UX
+# app.py — Studio Uploader (FastAPI) — PhotoRoom BG removal + review-first editor UX
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.1.0")
+app = FastAPI(title="Studio Uploader", version="2.2.0")
 
 
 # ----------------------------
@@ -237,12 +237,6 @@ def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional
 
 
 def _cleanup_cutout(img: Image.Image) -> Image.Image:
-    """
-    Cleans common AI cutout issues:
-    - low alpha haze
-    - small floating specks
-    - weak rectangle remnants / matte leftovers
-    """
     rgba = np.array(img.convert("RGBA"))
     alpha = rgba[:, :, 3].copy()
 
@@ -324,10 +318,6 @@ def _fit_cutout_into_reference_box(
     reference_canvas: Image.Image,
     canvas_size: int,
 ) -> Image.Image:
-    """
-    Place the cleaned cutout back into the SAME geometry footprint as the original upload.
-    This keeps restore aligned and avoids the nested/smaller-image bug.
-    """
     out = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
 
     ref_box = _nontransparent_bbox(reference_canvas, alpha_threshold=6)
@@ -1001,7 +991,7 @@ def ui(
       height: calc(100vh - 68px);
       min-height: 0;
       display: grid;
-      grid-template-rows: minmax(0,1fr) auto auto;
+      grid-template-rows: minmax(0,1fr) auto;
       gap: 10px;
       padding: 10px;
       background: var(--panel);
@@ -1259,6 +1249,52 @@ def ui(
       gap: 10px;
       justify-items: center;
       padding: 0 4px;
+    }
+
+    .review-controls {
+      display: grid;
+      gap: 10px;
+      width: 100%;
+      justify-items: center;
+    }
+
+    .review-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: center;
+      width: 100%;
+    }
+
+    .review-btn {
+      height: 40px;
+      min-width: 120px;
+      padding: 0 18px;
+      border: none;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.82);
+      color: #334155;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      border: 1px solid rgba(15,23,42,0.08);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .review-btn.primary {
+      background: #0f172a;
+      color: white;
+    }
+
+    .editor-controls {
+      display: none;
+      gap: 10px;
+      width: 100%;
+      justify-items: center;
+    }
+
+    .editor-controls.show {
+      display: grid;
     }
 
     .tool-row {
@@ -1565,8 +1601,8 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(94vw, 50vh, 560px);
-        height: min(94vw, 50vh, 560px);
+        width: min(92vw, 60vw, 540px);
+        height: min(92vw, 60vw, 540px);
       }
 
       .swatch-rail {
@@ -1639,8 +1675,8 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(96vw, 46vh, 460px);
-        height: min(96vw, 46vh, 460px);
+        width: min(94vw, 78vw, 430px);
+        height: min(94vw, 78vw, 430px);
         border-radius: 18px;
       }
 
@@ -1659,6 +1695,21 @@ def ui(
       .controls-shell {
         gap: 6px;
         padding: 0;
+      }
+
+      .review-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        width: 100%;
+      }
+
+      .review-btn {
+        width: 100%;
+        min-width: 0;
+        height: 38px;
+        font-size: 12px;
+        border-radius: 16px;
       }
 
       .tool-row,
@@ -1842,7 +1893,7 @@ def ui(
 
     <div class="editor-shell" id="step3" style="display:none;">
       <div class="editor-top">
-        <div class="tool-rail desktop-tools">
+        <div class="tool-rail desktop-tools" id="desktopToolRail" style="display:none;">
           <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
           <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
           <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
@@ -1887,37 +1938,46 @@ def ui(
       </div>
 
       <div class="controls-shell">
-        <div class="tool-row mobile-tools">
-          <div class="tool-segment">
-            <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
-            <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
-            <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
-            <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
+        <div class="review-controls" id="reviewControls">
+          <div class="review-actions">
+            <button class="review-btn primary" id="btnApprove">Done</button>
+            <button class="review-btn" id="btnEnterEdit">Edit</button>
           </div>
         </div>
 
-        <div class="utility-row">
-          <div class="utility-pill">
-            <span>Brush</span>
-            <input type="range" id="brushSize" min="8" max="140" value="44">
+        <div class="editor-controls" id="editorControls">
+          <div class="tool-row mobile-tools">
+            <div class="tool-segment">
+              <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
+              <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
+              <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
+              <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
+            </div>
           </div>
 
-          <div class="zoom-pill">
-            <button class="zoom-btn" id="zoomOut" type="button">−</button>
-            <span class="zoom-readout" id="zoomReadout">100%</span>
-            <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
-            <button class="zoom-btn" id="zoomIn" type="button">+</button>
-          </div>
+          <div class="utility-row">
+            <div class="utility-pill">
+              <span>Brush</span>
+              <input type="range" id="brushSize" min="8" max="140" value="44">
+            </div>
 
-          <div class="utility-actions">
-            <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
-            <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-            <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+            <div class="zoom-pill">
+              <button class="zoom-btn" id="zoomOut" type="button">−</button>
+              <span class="zoom-readout" id="zoomReadout">100%</span>
+              <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
+              <button class="zoom-btn" id="zoomIn" type="button">+</button>
+            </div>
+
+            <div class="utility-actions">
+              <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
+              <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
+              <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+            </div>
           </div>
         </div>
+
+        <div class="status-row" id="statusline"></div>
       </div>
-
-      <div class="status-row" id="statusline"></div>
     </div>
   </div>
 
@@ -1936,6 +1996,7 @@ def ui(
   let qualityFlags = [];
   let hintTimer = null;
   let introBannerTimer = null;
+  let editorUnlocked = false;
 
   let viewScale = 1;
   let panX = 0;
@@ -1969,6 +2030,12 @@ def ui(
   const currImg = new Image();
 
   const btnDone = document.getElementById('btnDone');
+  const btnApprove = document.getElementById('btnApprove');
+  const btnEnterEdit = document.getElementById('btnEnterEdit');
+
+  const reviewControls = document.getElementById('reviewControls');
+  const editorControls = document.getElementById('editorControls');
+  const desktopToolRail = document.getElementById('desktopToolRail');
 
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
@@ -2053,6 +2120,34 @@ def ui(
     return window.innerWidth <= 640;
   }
 
+  function syncTopDoneButton() {
+    btnDone.style.display = 'inline-flex';
+    btnDone.textContent = editorUnlocked ? 'Done' : 'Done';
+  }
+
+  function enterReviewMode() {
+    editorUnlocked = false;
+    reviewControls.style.display = 'grid';
+    editorControls.classList.remove('show');
+    desktopToolRail.style.display = 'none';
+    mobileMagicSheet.classList.remove('show');
+    fitView();
+    syncTopDoneButton();
+    showBanner("Review your image first. If it looks good, hit Done. If not, tap Edit.", 4);
+  }
+
+  function enterEditMode() {
+    editorUnlocked = true;
+    reviewControls.style.display = 'none';
+    editorControls.classList.add('show');
+    if (!isMobile()) {
+      desktopToolRail.style.display = 'flex';
+    }
+    updateMagicSheetVisibility();
+    syncTopDoneButton();
+    showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
+  }
+
   function updateViewportTransform() {
     canvasInner.style.transform = `translate(${panX}px, ${panY}px) scale(${viewScale})`;
     zoomSlider.value = Math.round(viewScale * 100);
@@ -2090,12 +2185,19 @@ def ui(
     setZoom(viewScale + delta);
   }
 
-  zoomIn.addEventListener('click', () => zoomBy(0.25));
-  zoomOut.addEventListener('click', () => zoomBy(-0.25));
-  zoomSlider.addEventListener('input', () => setZoom(parseInt(zoomSlider.value, 10) / 100));
+  zoomIn.addEventListener('click', () => setZoom(editorUnlocked ? (viewScale + 0.25) : 1));
+  zoomOut.addEventListener('click', () => setZoom(editorUnlocked ? (viewScale - 0.25) : 1));
+  zoomSlider.addEventListener('input', () => {
+    if (!editorUnlocked) {
+      fitView();
+      return;
+    }
+    setZoom(parseInt(zoomSlider.value, 10) / 100);
+  });
   btnFit.addEventListener('click', fitView);
 
   canvasViewport.addEventListener('wheel', (e) => {
+    if (!editorUnlocked) return;
     e.preventDefault();
     const delta = e.deltaY < 0 ? 0.15 : -0.15;
     zoomBy(delta);
@@ -2157,22 +2259,25 @@ def ui(
   }
 
   document.getElementById('btnUndo').addEventListener('click', () => {
+    if (!editorUnlocked) return;
     if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
   });
 
   document.getElementById('btnRestart').addEventListener('click', async () => {
+    if (!editorUnlocked) return;
     if (sessionId) {
       await loadExistingSession(sessionId, false);
+      enterEditMode();
     } else {
       location.reload();
     }
   });
 
   function updateCursorSize() {
-    if (mode === 'magic' || mode === 'pan') {
+    if (!editorUnlocked || mode === 'magic' || mode === 'pan') {
       cursor.style.display = 'none';
       cursorDot.style.display = 'none';
-      cv.style.cursor = mode === 'pan' ? 'grab' : 'crosshair';
+      cv.style.cursor = mode === 'pan' && editorUnlocked ? 'grab' : 'default';
       return;
     }
 
@@ -2187,6 +2292,7 @@ def ui(
   brushSlider.addEventListener('input', updateCursorSize);
 
   canvasContainer.addEventListener('mousemove', (e) => {
+    if (!editorUnlocked) return;
     if (mode !== 'magic' && mode !== 'pan') {
       cursor.style.display = 'block';
       cursorDot.style.display = 'block';
@@ -2360,7 +2466,7 @@ def ui(
   }
 
   function updateMagicSheetVisibility() {
-    if (isMobile() && mode === 'magic') {
+    if (isMobile() && editorUnlocked && mode === 'magic') {
       mobileMagicSheet.classList.add('show');
     } else {
       mobileMagicSheet.classList.remove('show');
@@ -2368,6 +2474,8 @@ def ui(
   }
 
   function setMode(m) {
+    if (!editorUnlocked) return;
+
     mode = m;
 
     [
@@ -2434,6 +2542,14 @@ def ui(
   btnMagicMobile.addEventListener('click', () => setMode('magic'));
   btnPanMobile.addEventListener('click', () => setMode('pan'));
 
+  btnEnterEdit.addEventListener('click', () => {
+    enterEditMode();
+  });
+
+  btnApprove.addEventListener('click', async () => {
+    btnDone.click();
+  });
+
   function beginPan(evt) {
     isPanning = true;
     const pointX = evt.touches ? evt.touches[0].clientX : evt.clientX;
@@ -2470,6 +2586,7 @@ def ui(
   }
 
   function startDraw(e) {
+    if (!editorUnlocked) return;
     if (!aiReady && !keepOriginalEl.checked) return;
 
     if (mode === 'pan') {
@@ -2499,6 +2616,8 @@ def ui(
   }
 
   function moveDraw(e) {
+    if (!editorUnlocked) return;
+
     if (mode === 'pan') {
       movePan(e);
       return;
@@ -2627,7 +2746,7 @@ def ui(
             hideOverlay();
             renderQualityFlags(j.quality_flags || []);
             fitView();
-            showBanner("Tip: try Grid, White, and Dark to double-check your edges before you hit Done.", 6);
+            enterReviewMode();
           };
 
           currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
@@ -2641,6 +2760,7 @@ def ui(
           overlaySub.textContent = "You can still use the original image and make manual edits.";
           setTimeout(() => hideOverlay(), 1400);
           statusline.textContent = "AI cutout failed — edit original instead.";
+          enterReviewMode();
           return;
         }
       } catch (e) {
@@ -2688,10 +2808,10 @@ def ui(
 
     renderQualityFlags(qualityFlags);
     fitView();
-    updateMagicSheetVisibility();
+    enterReviewMode();
 
     if (showSavedBanner) {
-      showBanner("Loaded your saved image. You can keep editing right where you left off.", 5);
+      showBanner("Loaded your saved image. Review it, or tap Edit if you want to make changes.", 5);
     }
   }
 
@@ -2742,7 +2862,6 @@ def ui(
       ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
 
       fitView();
-      updateMagicSheetVisibility();
 
       if (!keepOriginalEl.checked) {
         showOverlay("Uploading image…", "Please wait while we prepare your logo.");
@@ -2752,7 +2871,7 @@ def ui(
       } else {
         hideOverlay();
         statusline.textContent = "Using original";
-        showBanner("Tip: use Grid, White, and Dark to check for missing details before you finish.", 6);
+        enterReviewMode();
       }
 
       updateCursorSize();
@@ -2810,11 +2929,16 @@ def ui(
   fitView();
   updateMagicModeUI();
   bindHints();
-  updateMagicSheetVisibility();
+  enterReviewMode();
 
   window.addEventListener('resize', () => {
     updateViewportTransform();
     updateMagicSheetVisibility();
+    if (!isMobile() && editorUnlocked) {
+      desktopToolRail.style.display = 'flex';
+    } else if (!editorUnlocked) {
+      desktopToolRail.style.display = 'none';
+    }
   });
 
   (async function boot() {
