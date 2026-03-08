@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.4.0")
+app = FastAPI(title="Studio Uploader", version="2.5.0")
 
 
 # ----------------------------
@@ -129,6 +129,7 @@ def _paths(session_id: str) -> Dict[str, Path]:
     return {
         "orig": UPLOAD_DIR / f"{session_id}_orig.png",
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",
+        "restore": UPLOAD_DIR / f"{session_id}_restore.png",
     }
 
 
@@ -347,6 +348,27 @@ def _fit_cutout_into_reference_box(
     return out
 
 
+def _build_restore_source(reference_canvas: Image.Image, removed_rgba: Image.Image, canvas_size: int) -> Image.Image:
+    """
+    Create a subject-only restore source:
+    - colors come from the original uploaded image
+    - alpha comes from the AI removed image
+    - result is aligned to the editor canvas
+    """
+    ref = reference_canvas.convert("RGBA")
+    rem = removed_rgba.convert("RGBA")
+
+    aligned_removed = _fit_cutout_into_reference_box(rem, ref, canvas_size).convert("RGBA")
+
+    ref_arr = np.array(ref)
+    rem_arr = np.array(aligned_removed)
+
+    out = ref_arr.copy()
+    out[:, :, 3] = rem_arr[:, :, 3]
+
+    return Image.fromarray(out, "RGBA")
+
+
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
     img = _trim_transparent_padding(img.convert("RGBA"))
     canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
@@ -392,8 +414,11 @@ def _bg_process_session(session_id: str):
 
         _sess_set(session_id, stage="finishing_details")
         editor_ready = _fit_cutout_into_reference_box(cleaned, orig_sq, EDITOR_PX)
+        restore_source = _build_restore_source(orig_sq, removed, EDITOR_PX)
 
         _save_png(editor_ready, p["curr"])
+        _save_png(restore_source, p["restore"])
+
         _sess_set(
             session_id,
             status="ready",
@@ -406,7 +431,9 @@ def _bg_process_session(session_id: str):
         try:
             p = _paths(session_id)
             if p["orig"].exists():
-                _save_png(Image.open(p["orig"]).convert("RGBA"), p["curr"])
+                fallback = Image.open(p["orig"]).convert("RGBA")
+                _save_png(fallback, p["curr"])
+                _save_png(fallback, p["restore"])
         except Exception:
             pass
 
@@ -455,6 +482,7 @@ def session_info(session_id: str):
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
+        "restore_url": f"/restore-source/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -492,6 +520,7 @@ async def upload_image(
 
     _save_png(canvas_orig, p["orig"])
     _save_png(canvas_orig, p["curr"])
+    _save_png(canvas_orig, p["restore"])
 
     _sess_set(
         session_id,
@@ -510,6 +539,7 @@ async def upload_image(
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "original_url": f"/original/{session_id}",
+        "restore_url": f"/restore-source/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -525,6 +555,14 @@ def get_preview(session_id: str):
 @app.get("/original/{session_id}")
 def get_original(session_id: str):
     path = _paths(session_id)["orig"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
+@app.get("/restore-source/{session_id}")
+def get_restore_source(session_id: str):
+    path = _paths(session_id)["restore"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -695,6 +733,7 @@ async def storefront_request(
 
         _save_png(canvas, p["orig"])
         _save_png(_normalize_logo(canvas, target_size=TARGET_PX), p["curr"])
+        _save_png(canvas, p["restore"])
 
         if storefront_logo_secondary:
             try:
@@ -722,6 +761,7 @@ async def storefront_request(
 
                 _save_png(canvas2, sp["orig"])
                 _save_png(_normalize_logo(canvas2, target_size=TARGET_PX), sp["curr"])
+                _save_png(canvas2, sp["restore"])
 
             except Exception as e:
                 print("⚠️ Secondary logo skipped:", str(e))
@@ -790,7 +830,6 @@ def ui(
     :root {
       --bg0: #f6f8fb;
       --bg1: #eef3f8;
-      --panel: rgba(255,255,255,0.78);
       --panel-border: rgba(15,23,42,0.07);
       --text: #0f172a;
       --muted: #667085;
@@ -1594,10 +1633,16 @@ def ui(
         height: calc(100vh - 56px);
         gap: 6px;
         padding: 6px;
-        grid-template-rows: minmax(0,1fr) auto;
+        grid-template-rows: auto auto;
+      }
+
+      .editor-top {
+        flex: 0 0 auto;
+        min-height: auto;
       }
 
       .canvas-panel {
+        min-height: auto;
         padding: 6px;
         border-radius: 20px;
       }
@@ -1606,6 +1651,7 @@ def ui(
         width: min(94vw, 78vw, 430px);
         height: min(94vw, 78vw, 430px);
         border-radius: 18px;
+        flex: 0 0 auto;
       }
 
       .swatch-rail {
@@ -1655,7 +1701,7 @@ def ui(
       .mobile-magic-controls.show {
         display: grid;
         width: 100%;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1fr 1fr;
         gap: 8px;
       }
 
@@ -1787,6 +1833,7 @@ def ui(
           <div class="mobile-magic-controls" id="mobileMagicControls">
             <button class="mobile-magic-btn active" id="btnMagicRemoveOnlyMobile">Magic Remove</button>
             <button class="mobile-magic-btn" id="btnMagicRestoreOnlyMobile">Magic Restore</button>
+            <button class="mobile-magic-btn" id="btnUndoMobile">Undo</button>
           </div>
 
           <div class="desktop-edit-controls" id="desktopEditControls">
@@ -1897,6 +1944,7 @@ def ui(
 
   const btnMagicRemoveOnlyMobile = document.getElementById('btnMagicRemoveOnlyMobile');
   const btnMagicRestoreOnlyMobile = document.getElementById('btnMagicRestoreOnlyMobile');
+  const btnUndoMobile = document.getElementById('btnUndoMobile');
 
   const brushSlider = document.getElementById('brushSize');
 
@@ -2152,6 +2200,12 @@ def ui(
   document.getElementById('btnUndo').addEventListener('click', () => {
     if (!editorUnlocked || isMobile()) return;
     if (history.length > 0) ctx.putImageData(history.pop(), 0, 0);
+  });
+
+  btnUndoMobile.addEventListener('click', () => {
+    if (history.length > 0) {
+      ctx.putImageData(history.pop(), 0, 0);
+    }
   });
 
   document.getElementById('btnRestart').addEventListener('click', async () => {
@@ -2495,14 +2549,14 @@ def ui(
     if (!editorUnlocked) return;
     if (!aiReady && !keepOriginalEl.checked) return;
 
+    saveState();
+
     if (!isMobile() && mode === 'pan') {
       beginPan(e);
       if (e.cancelable) e.preventDefault();
       return;
     }
 
-    saveState();
-    isDown = true;
     const c = getCoords(e);
 
     if (mode === 'magic' || isMobile()) {
@@ -2512,11 +2566,14 @@ def ui(
         magicRestore(c.x, c.y);
       }
       isDown = false;
-    } else {
-      lastX = c.x;
-      lastY = c.y;
-      drawBrush(c.x, c.y);
+      if (e.cancelable) e.preventDefault();
+      return;
     }
+
+    isDown = true;
+    lastX = c.x;
+    lastY = c.y;
+    drawBrush(c.x, c.y);
 
     if (e.cancelable) e.preventDefault();
   }
@@ -2681,6 +2738,16 @@ def ui(
     statusline.textContent = "AI cutout taking longer than usual.";
   }
 
+  async function loadRestoreSource(existingId) {
+    await new Promise(res => {
+      origImg.onload = res;
+      origImg.src = `${API_BASE}/restore-source/${existingId}?t=${Date.now()}`;
+    });
+
+    origBaseCtx.clearRect(0, 0, 1000, 1000);
+    origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
+  }
+
   async function loadExistingSession(existingId, showSavedBanner = true) {
     const r = await fetch(`${API_BASE}/session-info/${existingId}?t=${Date.now()}`, { cache: "no-store" });
     const j = await r.json();
@@ -2695,13 +2762,7 @@ def ui(
     btnDone.style.display = 'inline-flex';
     hideOverlay();
 
-    await new Promise(res => {
-      origImg.onload = res;
-      origImg.src = `${API_BASE}/original/${sessionId}?t=${Date.now()}`;
-    });
-
-    origBaseCtx.clearRect(0, 0, 1000, 1000);
-    origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
+    await loadRestoreSource(sessionId);
 
     await new Promise(res => {
       currImg.onload = res;
@@ -2755,16 +2816,15 @@ def ui(
       aiReady = keepOriginalEl.checked;
       qualityFlags = [];
 
+      await loadRestoreSource(sessionId);
+
       await new Promise(res => {
-        origImg.onload = res;
-        origImg.src = `${API_BASE}/original/${sessionId}?t=${Date.now()}`;
+        currImg.onload = res;
+        currImg.src = `${API_BASE}/preview/${sessionId}?t=${Date.now()}`;
       });
 
-      origBaseCtx.clearRect(0, 0, 1000, 1000);
-      origBaseCtx.drawImage(origImg, 0, 0, 1000, 1000);
-
       ctx.clearRect(0, 0, cv.width, cv.height);
-      ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
+      ctx.drawImage(currImg, 0, 0, cv.width, cv.height);
 
       fitView();
 
