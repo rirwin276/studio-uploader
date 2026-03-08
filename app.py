@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="1.9.0")
+app = FastAPI(title="Studio Uploader", version="2.0.0")
 
 
 # ----------------------------
@@ -1015,9 +1015,9 @@ def ui(
     .editor-top {
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 82px;
+      grid-template-columns: 72px minmax(0, 1fr) 72px;
       gap: 10px;
-      align-items: center;
+      align-items: stretch;
     }
 
     .canvas-panel {
@@ -1034,8 +1034,8 @@ def ui(
     }
 
     .canvas-stage {
-      width: min(78vw, 74vh, 920px);
-      height: min(78vw, 74vh, 920px);
+      width: min(70vw, 68vh, 840px);
+      height: min(70vw, 68vh, 840px);
       max-width: 100%;
       max-height: 100%;
       aspect-ratio: 1 / 1;
@@ -1138,12 +1138,13 @@ def ui(
       line-height: 1.45;
     }
 
+    .tool-rail,
     .swatch-rail {
       display: flex;
       flex-direction: column;
       justify-content: center;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       align-self: stretch;
       padding: 10px 0;
       border-radius: 22px;
@@ -1152,9 +1153,66 @@ def ui(
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.84);
     }
 
+    .rail-tool-btn {
+      width: 50px;
+      min-height: 38px;
+      padding: 7px 4px;
+      border: none;
+      border-radius: 14px;
+      background: transparent;
+      color: #475569;
+      font-size: 10px;
+      line-height: 1.05;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+      text-align: center;
+      cursor: pointer;
+      transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+    }
+
+    .rail-tool-btn:hover {
+      background: rgba(15,23,42,0.05);
+      color: #0f172a;
+      transform: translateY(-1px);
+    }
+
+    .rail-tool-btn.active {
+      background: #0f172a;
+      color: white;
+      box-shadow: 0 10px 24px rgba(15,23,42,0.16);
+    }
+
+    .mini-rail {
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .mini-rail.show {
+      display: flex;
+    }
+
+    .mini-rail-btn {
+      width: 34px;
+      height: 34px;
+      border: none;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.08);
+      color: #334155;
+      font-size: 15px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .mini-rail-btn.active {
+      background: rgba(15,23,42,0.92);
+      color: white;
+    }
+
     .swatch-btn {
-      width: 42px;
-      height: 42px;
+      width: 40px;
+      height: 40px;
       border-radius: 999px;
       border: 1px solid rgba(15,23,42,0.10);
       cursor: pointer;
@@ -1189,7 +1247,7 @@ def ui(
     .swatch-btn.dark { background: #111827; }
 
     .swatch-label {
-      font-size: 11px;
+      font-size: 10px;
       color: #64748b;
       font-weight: 700;
       letter-spacing: -0.01em;
@@ -1207,7 +1265,7 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 10px;
+      gap: 8px;
       flex-wrap: wrap;
       max-width: 100%;
     }
@@ -1215,8 +1273,8 @@ def ui(
     .tool-segment {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px;
+      gap: 4px;
+      padding: 4px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
@@ -1227,18 +1285,18 @@ def ui(
     }
 
     .tool-btn {
-      min-width: 82px;
-      height: 40px;
+      min-width: 0;
+      height: 34px;
       border: none;
       border-radius: 999px;
       background: transparent;
       color: #475569;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
       letter-spacing: -0.01em;
       cursor: pointer;
       transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
-      padding: 0 14px;
+      padding: 0 10px;
     }
 
     .tool-btn:hover {
@@ -1255,8 +1313,8 @@ def ui(
     .mini-segment {
       display: none;
       align-items: center;
-      gap: 6px;
-      padding: 5px;
+      gap: 4px;
+      padding: 4px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
@@ -1267,14 +1325,14 @@ def ui(
     .mini-segment.show { display: inline-flex; }
 
     .mini-btn {
-      height: 34px;
-      min-width: 74px;
-      padding: 0 12px;
+      height: 30px;
+      min-width: 64px;
+      padding: 0 10px;
       border: none;
       border-radius: 999px;
       background: transparent;
       color: #475569;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 700;
       cursor: pointer;
     }
@@ -1289,7 +1347,7 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 12px;
+      gap: 8px;
       flex-wrap: wrap;
       max-width: 100%;
     }
@@ -1297,26 +1355,26 @@ def ui(
     .utility-pill {
       display: inline-flex;
       align-items: center;
-      gap: 10px;
-      height: 42px;
-      padding: 0 14px;
+      gap: 8px;
+      height: 38px;
+      padding: 0 12px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
       box-shadow: var(--shadow-soft);
       color: #334155;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 600;
     }
 
     .ghost-btn {
-      height: 42px;
-      padding: 0 16px;
+      height: 38px;
+      padding: 0 12px;
       border: 1px solid rgba(15,23,42,0.08);
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       color: #334155;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
       cursor: pointer;
       box-shadow: var(--shadow-soft);
@@ -1330,21 +1388,21 @@ def ui(
     .zoom-pill {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      height: 42px;
-      padding: 0 10px;
+      gap: 6px;
+      height: 38px;
+      padding: 0 8px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
       box-shadow: var(--shadow-soft);
       color: #334155;
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 700;
     }
 
     .zoom-btn {
-      width: 32px;
-      height: 32px;
+      width: 28px;
+      height: 28px;
       border: none;
       border-radius: 999px;
       background: rgba(15,23,42,0.06);
@@ -1354,18 +1412,18 @@ def ui(
     }
 
     .zoom-readout {
-      min-width: 52px;
+      min-width: 44px;
       text-align: center;
       font-variant-numeric: tabular-nums;
     }
 
     input[type=range] {
-      width: min(250px, 50vw);
+      width: min(180px, 34vw);
       accent-color: #0f172a;
     }
 
     .zoom-range {
-      width: min(170px, 36vw);
+      width: min(120px, 22vw);
     }
 
     .status-row {
@@ -1458,6 +1516,14 @@ def ui(
       display: none;
     }
 
+    .desktop-tools {
+      display: flex;
+    }
+
+    .mobile-tools {
+      display: none;
+    }
+
     @media (max-width: 980px) {
       .main {
         align-items: stretch;
@@ -1477,32 +1543,41 @@ def ui(
         gap: 10px;
       }
 
+      .desktop-tools {
+        display: none;
+      }
+
+      .mobile-tools {
+        display: flex;
+        width: 100%;
+      }
+
       .canvas-panel {
         padding: 10px;
       }
 
       .canvas-stage {
-        width: min(94vw, 52vh, 620px);
-        height: min(94vw, 52vh, 620px);
+        width: min(92vw, 48vh, 520px);
+        height: min(92vw, 48vh, 520px);
       }
 
       .swatch-rail {
         flex-direction: row;
         justify-content: center;
-        padding: 10px;
-        gap: 12px;
+        padding: 8px 10px;
+        gap: 10px;
       }
 
       .swatch-label {
         display: none;
       }
 
-      input[type=range] {
-        width: min(220px, 54vw);
+      .zoom-range {
+        width: min(130px, 24vw);
       }
 
-      .zoom-range {
-        width: min(180px, 42vw);
+      input[type=range] {
+        width: min(180px, 36vw);
       }
     }
 
@@ -1545,14 +1620,14 @@ def ui(
       }
 
       .canvas-stage {
-        width: min(96vw, 48vh, 500px);
-        height: min(96vw, 48vh, 500px);
+        width: min(94vw, 41vh, 390px);
+        height: min(94vw, 41vh, 390px);
         border-radius: 20px;
       }
 
       .tool-row,
       .utility-row {
-        gap: 8px;
+        gap: 6px;
       }
 
       .tool-segment,
@@ -1564,30 +1639,49 @@ def ui(
       .tool-btn {
         flex: 1 1 0;
         min-width: 0;
-        padding: 0 10px;
+        padding: 0 8px;
+        font-size: 11px;
+        height: 32px;
       }
 
       .mini-btn {
         flex: 1 1 0;
         min-width: 0;
+        height: 28px;
+        font-size: 10px;
       }
 
       .utility-pill,
       .zoom-pill {
         width: 100%;
         justify-content: center;
+        height: 34px;
+        font-size: 11px;
       }
 
       .ghost-btn {
         flex: 1 1 auto;
+        height: 34px;
+        padding: 0 10px;
+        font-size: 11px;
       }
 
       input[type=range] {
-        width: min(190px, 55vw);
+        width: min(128px, 30vw);
       }
 
       .zoom-range {
-        width: min(160px, 44vw);
+        width: min(104px, 26vw);
+      }
+
+      .zoom-readout {
+        min-width: 38px;
+        font-size: 11px;
+      }
+
+      .zoom-btn {
+        width: 26px;
+        height: 26px;
       }
 
       .hint-banner {
@@ -1630,6 +1724,18 @@ def ui(
 
     <div class="editor-shell" id="step3" style="display:none;">
       <div class="editor-top">
+        <div class="tool-rail desktop-tools">
+          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
+          <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
+          <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
+          <button class="rail-tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around when zoomed in for precise edits.">Pan</button>
+
+          <div class="mini-rail" id="magicModeWrapDesktop">
+            <button class="mini-rail-btn active tip-target" id="magicRemoveModeDesktop" data-tip="Magic Remove removes one connected region based on color.">−</button>
+            <button class="mini-rail-btn tip-target" id="magicRestoreModeDesktop" data-tip="Magic Restore brings back one connected region from the original image.">+</button>
+          </div>
+        </div>
+
         <div class="canvas-panel">
           <div class="canvas-stage bg-checker" id="canvasContainer">
             <div class="canvas-viewport" id="canvasViewport">
@@ -1663,17 +1769,17 @@ def ui(
       </div>
 
       <div class="controls-shell">
-        <div class="tool-row">
+        <div class="tool-row mobile-tools">
           <div class="tool-segment">
-            <button class="tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the original image back in. Use this if the AI removed part of your logo.">Restore</button>
-            <button class="tool-btn tip-target" id="btnErase" data-tip="Erase removes parts of the image manually. Use this for extra background cleanup.">Erase</button>
-            <button class="tool-btn tip-target" id="btnMagic" data-tip="Magic can remove or restore one connected area with a single tap. Great for quick cleanup.">Magic</button>
-            <button class="tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around when zoomed in for precise edits.">Pan</button>
+            <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the original image back in.">Restore</button>
+            <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
+            <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
+            <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
           </div>
 
-          <div class="mini-segment" id="magicModeWrap">
-            <button class="mini-btn active tip-target" id="magicRemoveMode" data-tip="Magic Remove removes one connected region based on color.">Remove</button>
-            <button class="mini-btn tip-target" id="magicRestoreMode" data-tip="Magic Restore brings back one connected region from the original image.">Restore</button>
+          <div class="mini-segment" id="magicModeWrapMobile">
+            <button class="mini-btn active tip-target" id="magicRemoveModeMobile" data-tip="Magic Remove removes one connected region based on color.">Remove</button>
+            <button class="mini-btn tip-target" id="magicRestoreModeMobile" data-tip="Magic Restore brings back one connected region from the original image.">Restore</button>
           </div>
         </div>
 
@@ -1748,15 +1854,26 @@ def ui(
   const currImg = new Image();
 
   const btnDone = document.getElementById('btnDone');
+
   const btnErase = document.getElementById('btnErase');
   const btnRestore = document.getElementById('btnRestore');
   const btnMagic = document.getElementById('btnMagic');
   const btnPan = document.getElementById('btnPan');
+
+  const btnEraseMobile = document.getElementById('btnEraseMobile');
+  const btnRestoreMobile = document.getElementById('btnRestoreMobile');
+  const btnMagicMobile = document.getElementById('btnMagicMobile');
+  const btnPanMobile = document.getElementById('btnPanMobile');
+
   const brushSlider = document.getElementById('brushSize');
 
-  const magicModeWrap = document.getElementById('magicModeWrap');
-  const magicRemoveMode = document.getElementById('magicRemoveMode');
-  const magicRestoreMode = document.getElementById('magicRestoreMode');
+  const magicModeWrapDesktop = document.getElementById('magicModeWrapDesktop');
+  const magicRemoveModeDesktop = document.getElementById('magicRemoveModeDesktop');
+  const magicRestoreModeDesktop = document.getElementById('magicRestoreModeDesktop');
+
+  const magicModeWrapMobile = document.getElementById('magicModeWrapMobile');
+  const magicRemoveModeMobile = document.getElementById('magicRemoveModeMobile');
+  const magicRestoreModeMobile = document.getElementById('magicRestoreModeMobile');
 
   const cursor = document.getElementById('cursor');
   const cursorDot = document.getElementById('cursorDot');
@@ -2117,32 +2234,40 @@ def ui(
   }
 
   function updateMagicModeUI() {
-    magicRemoveMode.classList.toggle('active', magicMode === 'remove');
-    magicRestoreMode.classList.toggle('active', magicMode === 'restore');
+    magicRemoveModeDesktop.classList.toggle('active', magicMode === 'remove');
+    magicRestoreModeDesktop.classList.toggle('active', magicMode === 'restore');
+    magicRemoveModeMobile.classList.toggle('active', magicMode === 'remove');
+    magicRestoreModeMobile.classList.toggle('active', magicMode === 'restore');
   }
 
-  magicRemoveMode.addEventListener('click', () => {
-    magicMode = 'remove';
-    updateMagicModeUI();
-  });
-
-  magicRestoreMode.addEventListener('click', () => {
-    magicMode = 'restore';
-    updateMagicModeUI();
-  });
-
-  function setMode(m, btn) {
+  function setMode(m) {
     mode = m;
-    btnErase.classList.remove('active');
-    btnRestore.classList.remove('active');
-    btnMagic.classList.remove('active');
-    btnPan.classList.remove('active');
-    btn.classList.add('active');
+
+    [
+      btnErase, btnRestore, btnMagic, btnPan,
+      btnEraseMobile, btnRestoreMobile, btnMagicMobile, btnPanMobile
+    ].forEach(btn => btn.classList.remove('active'));
+
+    if (mode === 'remove') {
+      btnErase.classList.add('active');
+      btnEraseMobile.classList.add('active');
+    } else if (mode === 'restore') {
+      btnRestore.classList.add('active');
+      btnRestoreMobile.classList.add('active');
+    } else if (mode === 'magic') {
+      btnMagic.classList.add('active');
+      btnMagicMobile.classList.add('active');
+    } else if (mode === 'pan') {
+      btnPan.classList.add('active');
+      btnPanMobile.classList.add('active');
+    }
 
     if (mode === 'magic') {
-      magicModeWrap.classList.add('show');
+      magicModeWrapDesktop.classList.add('show');
+      magicModeWrapMobile.classList.add('show');
     } else {
-      magicModeWrap.classList.remove('show');
+      magicModeWrapDesktop.classList.remove('show');
+      magicModeWrapMobile.classList.remove('show');
     }
 
     if (mode === 'pan') {
@@ -2152,10 +2277,35 @@ def ui(
     updateCursorSize();
   }
 
-  btnErase.addEventListener('click', () => setMode('remove', btnErase));
-  btnRestore.addEventListener('click', () => setMode('restore', btnRestore));
-  btnMagic.addEventListener('click', () => setMode('magic', btnMagic));
-  btnPan.addEventListener('click', () => setMode('pan', btnPan));
+  magicRemoveModeDesktop.addEventListener('click', () => {
+    magicMode = 'remove';
+    updateMagicModeUI();
+  });
+
+  magicRestoreModeDesktop.addEventListener('click', () => {
+    magicMode = 'restore';
+    updateMagicModeUI();
+  });
+
+  magicRemoveModeMobile.addEventListener('click', () => {
+    magicMode = 'remove';
+    updateMagicModeUI();
+  });
+
+  magicRestoreModeMobile.addEventListener('click', () => {
+    magicMode = 'restore';
+    updateMagicModeUI();
+  });
+
+  btnErase.addEventListener('click', () => setMode('remove'));
+  btnRestore.addEventListener('click', () => setMode('restore'));
+  btnMagic.addEventListener('click', () => setMode('magic'));
+  btnPan.addEventListener('click', () => setMode('pan'));
+
+  btnEraseMobile.addEventListener('click', () => setMode('remove'));
+  btnRestoreMobile.addEventListener('click', () => setMode('restore'));
+  btnMagicMobile.addEventListener('click', () => setMode('magic'));
+  btnPanMobile.addEventListener('click', () => setMode('pan'));
 
   function beginPan(evt) {
     isPanning = true;
