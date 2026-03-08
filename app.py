@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="2.0.0")
+app = FastAPI(title="Studio Uploader", version="2.1.0")
 
 
 # ----------------------------
@@ -1524,6 +1524,14 @@ def ui(
       display: none;
     }
 
+    .mobile-magic-sheet {
+      display: none;
+    }
+
+    .mobile-magic-sheet.show {
+      display: none;
+    }
+
     @media (max-width: 980px) {
       .main {
         align-items: stretch;
@@ -1553,12 +1561,12 @@ def ui(
       }
 
       .canvas-panel {
-        padding: 10px;
+        padding: 8px;
       }
 
       .canvas-stage {
-        width: min(92vw, 48vh, 520px);
-        height: min(92vw, 48vh, 520px);
+        width: min(94vw, 50vh, 560px);
+        height: min(94vw, 50vh, 560px);
       }
 
       .swatch-rail {
@@ -1582,6 +1590,10 @@ def ui(
     }
 
     @media (max-width: 640px) {
+      html, body {
+        overflow: hidden;
+      }
+
       .header {
         padding: 8px 10px;
       }
@@ -1596,7 +1608,8 @@ def ui(
       }
 
       .main {
-        padding: 6px;
+        padding: 4px;
+        align-items: stretch;
       }
 
       .upload-card {
@@ -1611,18 +1624,41 @@ def ui(
 
       .editor-shell {
         height: calc(100vh - 56px);
-        gap: 8px;
-        padding: 8px;
+        gap: 6px;
+        padding: 6px;
+        grid-template-rows: minmax(0,1fr) auto;
+      }
+
+      .editor-top {
+        gap: 6px;
       }
 
       .canvas-panel {
-        padding: 8px;
+        padding: 6px;
+        border-radius: 20px;
       }
 
       .canvas-stage {
-        width: min(94vw, 41vh, 390px);
-        height: min(94vw, 41vh, 390px);
-        border-radius: 20px;
+        width: min(96vw, 46vh, 460px);
+        height: min(96vw, 46vh, 460px);
+        border-radius: 18px;
+      }
+
+      .swatch-rail {
+        width: 100%;
+        padding: 8px;
+        gap: 14px;
+        border-radius: 18px;
+      }
+
+      .swatch-btn {
+        width: 42px;
+        height: 42px;
+      }
+
+      .controls-shell {
+        gap: 6px;
+        padding: 0;
       }
 
       .tool-row,
@@ -1636,42 +1672,61 @@ def ui(
         justify-content: center;
       }
 
-      .tool-btn {
-        flex: 1 1 0;
-        min-width: 0;
-        padding: 0 8px;
-        font-size: 11px;
-        height: 32px;
+      .tool-segment {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        padding: 6px;
+        border-radius: 18px;
       }
 
-      .mini-btn {
-        flex: 1 1 0;
-        min-width: 0;
-        height: 28px;
-        font-size: 10px;
+      .tool-btn {
+        width: 100%;
+        height: 38px;
+        padding: 0 8px;
+        font-size: 12px;
+        border-radius: 14px;
+      }
+
+      .mini-segment {
+        display: none !important;
+      }
+
+      .utility-row {
+        display: grid;
+        grid-template-columns: 1fr;
+        width: 100%;
       }
 
       .utility-pill,
       .zoom-pill {
         width: 100%;
         justify-content: center;
-        height: 34px;
+        height: 36px;
         font-size: 11px;
+        border-radius: 18px;
       }
 
       .ghost-btn {
-        flex: 1 1 auto;
-        height: 34px;
+        height: 36px;
         padding: 0 10px;
         font-size: 11px;
+        border-radius: 18px;
+      }
+
+      .utility-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 6px;
+        width: 100%;
       }
 
       input[type=range] {
-        width: min(128px, 30vw);
+        width: min(150px, 38vw);
       }
 
       .zoom-range {
-        width: min(104px, 26vw);
+        width: min(118px, 28vw);
       }
 
       .zoom-readout {
@@ -1684,9 +1739,64 @@ def ui(
         height: 26px;
       }
 
+      .status-row {
+        min-height: 18px;
+        font-size: 11px;
+      }
+
       .hint-banner {
         bottom: 12px;
         padding: 10px 14px;
+      }
+
+      .mobile-magic-sheet {
+        position: fixed;
+        left: 12px;
+        right: 12px;
+        bottom: 22px;
+        z-index: 13000;
+        display: none;
+        padding: 10px;
+        border-radius: 22px;
+        background: rgba(255,255,255,0.96);
+        border: 1px solid rgba(15,23,42,0.08);
+        box-shadow: 0 24px 50px rgba(15,23,42,0.18);
+        backdrop-filter: blur(18px) saturate(1.15);
+      }
+
+      .mobile-magic-sheet.show {
+        display: block;
+      }
+
+      .mobile-magic-title {
+        font-size: 12px;
+        font-weight: 800;
+        color: #475569;
+        text-align: center;
+        margin-bottom: 8px;
+      }
+
+      .mobile-magic-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .mobile-magic-btn {
+        height: 42px;
+        border: none;
+        border-radius: 16px;
+        background: rgba(15,23,42,0.06);
+        color: #334155;
+        font-size: 13px;
+        font-weight: 800;
+        cursor: pointer;
+      }
+
+      .mobile-magic-btn.active {
+        background: #0f172a;
+        color: white;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.16);
       }
     }
   </style>
@@ -1696,6 +1806,14 @@ def ui(
   <div class="cursor-dot" id="cursorDot"></div>
   <div class="hint-banner" id="hintBanner"></div>
   <div class="hint-pop" id="hintPop"></div>
+
+  <div class="mobile-magic-sheet" id="mobileMagicSheet">
+    <div class="mobile-magic-title">Magic mode</div>
+    <div class="mobile-magic-actions">
+      <button class="mobile-magic-btn active" id="magicRemoveModeMobileSheet">Remove</button>
+      <button class="mobile-magic-btn" id="magicRestoreModeMobileSheet">Restore</button>
+    </div>
+  </div>
 
   <div class="header">
     <div class="brand">
@@ -1776,11 +1894,6 @@ def ui(
             <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
             <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
           </div>
-
-          <div class="mini-segment" id="magicModeWrapMobile">
-            <button class="mini-btn active tip-target" id="magicRemoveModeMobile" data-tip="Magic Remove removes one connected region based on color.">Remove</button>
-            <button class="mini-btn tip-target" id="magicRestoreModeMobile" data-tip="Magic Restore brings back one connected region from the original image.">Restore</button>
-          </div>
         </div>
 
         <div class="utility-row">
@@ -1796,9 +1909,11 @@ def ui(
             <button class="zoom-btn" id="zoomIn" type="button">+</button>
           </div>
 
-          <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
-          <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-          <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+          <div class="utility-actions">
+            <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
+            <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
+            <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset starts over with the current uploaded image or reloads the saved session.">Reset</button>
+          </div>
         </div>
       </div>
 
@@ -1871,9 +1986,9 @@ def ui(
   const magicRemoveModeDesktop = document.getElementById('magicRemoveModeDesktop');
   const magicRestoreModeDesktop = document.getElementById('magicRestoreModeDesktop');
 
-  const magicModeWrapMobile = document.getElementById('magicModeWrapMobile');
-  const magicRemoveModeMobile = document.getElementById('magicRemoveModeMobile');
-  const magicRestoreModeMobile = document.getElementById('magicRestoreModeMobile');
+  const mobileMagicSheet = document.getElementById('mobileMagicSheet');
+  const magicRemoveModeMobileSheet = document.getElementById('magicRemoveModeMobileSheet');
+  const magicRestoreModeMobileSheet = document.getElementById('magicRestoreModeMobileSheet');
 
   const cursor = document.getElementById('cursor');
   const cursorDot = document.getElementById('cursorDot');
@@ -1932,6 +2047,10 @@ def ui(
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function isMobile() {
+    return window.innerWidth <= 640;
   }
 
   function updateViewportTransform() {
@@ -2236,8 +2355,16 @@ def ui(
   function updateMagicModeUI() {
     magicRemoveModeDesktop.classList.toggle('active', magicMode === 'remove');
     magicRestoreModeDesktop.classList.toggle('active', magicMode === 'restore');
-    magicRemoveModeMobile.classList.toggle('active', magicMode === 'remove');
-    magicRestoreModeMobile.classList.toggle('active', magicMode === 'restore');
+    magicRemoveModeMobileSheet.classList.toggle('active', magicMode === 'remove');
+    magicRestoreModeMobileSheet.classList.toggle('active', magicMode === 'restore');
+  }
+
+  function updateMagicSheetVisibility() {
+    if (isMobile() && mode === 'magic') {
+      mobileMagicSheet.classList.add('show');
+    } else {
+      mobileMagicSheet.classList.remove('show');
+    }
   }
 
   function setMode(m) {
@@ -2264,11 +2391,11 @@ def ui(
 
     if (mode === 'magic') {
       magicModeWrapDesktop.classList.add('show');
-      magicModeWrapMobile.classList.add('show');
     } else {
       magicModeWrapDesktop.classList.remove('show');
-      magicModeWrapMobile.classList.remove('show');
     }
+
+    updateMagicSheetVisibility();
 
     if (mode === 'pan') {
       cv.style.cursor = 'grab';
@@ -2287,12 +2414,12 @@ def ui(
     updateMagicModeUI();
   });
 
-  magicRemoveModeMobile.addEventListener('click', () => {
+  magicRemoveModeMobileSheet.addEventListener('click', () => {
     magicMode = 'remove';
     updateMagicModeUI();
   });
 
-  magicRestoreModeMobile.addEventListener('click', () => {
+  magicRestoreModeMobileSheet.addEventListener('click', () => {
     magicMode = 'restore';
     updateMagicModeUI();
   });
@@ -2561,6 +2688,7 @@ def ui(
 
     renderQualityFlags(qualityFlags);
     fitView();
+    updateMagicSheetVisibility();
 
     if (showSavedBanner) {
       showBanner("Loaded your saved image. You can keep editing right where you left off.", 5);
@@ -2614,6 +2742,7 @@ def ui(
       ctx.drawImage(origImg, 0, 0, cv.width, cv.height);
 
       fitView();
+      updateMagicSheetVisibility();
 
       if (!keepOriginalEl.checked) {
         showOverlay("Uploading image…", "Please wait while we prepare your logo.");
@@ -2681,9 +2810,11 @@ def ui(
   fitView();
   updateMagicModeUI();
   bindHints();
+  updateMagicSheetVisibility();
 
   window.addEventListener('resize', () => {
     updateViewportTransform();
+    updateMagicSheetVisibility();
   });
 
   (async function boot() {
