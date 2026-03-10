@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — dual-source restore editor
+# app.py — Studio Uploader (FastAPI) — safer cleanup + true upscale + larger editor
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.2.1")
+app = FastAPI(title="Studio Uploader", version="3.4.0")
 
 
 # ----------------------------
@@ -58,18 +58,30 @@ MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
 PHOTOROOM_ENDPOINT = (os.getenv("PHOTOROOM_ENDPOINT") or "https://sdk.photoroom.com/v1/segment").strip()
 PHOTOROOM_TIMEOUT = int(os.getenv("PHOTOROOM_TIMEOUT", "60"))
-PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "preview").strip()  # preview | hd
+PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "hd").strip()  # preview | hd
 PHOTOROOM_CROP = os.getenv("PHOTOROOM_CROP", "false").strip().lower() in ("1", "true", "yes", "y")
 PHOTOROOM_FORMAT = (os.getenv("PHOTOROOM_FORMAT") or "png").strip()
-PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "1024"))
+PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "1800"))
 
-# Cleanup tuning
-AI_ALPHA_CUTOFF = int(os.getenv("AI_ALPHA_CUTOFF", "14"))
-AI_KEEP_COMPONENT_MIN_AREA = int(os.getenv("AI_KEEP_COMPONENT_MIN_AREA", "36"))
+# Safer cleanup tuning
+AI_ALPHA_CUTOFF = int(os.getenv("AI_ALPHA_CUTOFF", "8"))
 AI_LOW_ALPHA_RATIO_WARN = float(os.getenv("AI_LOW_ALPHA_RATIO_WARN", "0.22"))
 AI_TINY_SUBJECT_RATIO_WARN = float(os.getenv("AI_TINY_SUBJECT_RATIO_WARN", "0.08"))
+DEHALO_ENABLED = os.getenv("DEHALO_ENABLED", "false").strip().lower() in ("1", "true", "yes", "y")
 DEHALO_SOLID_ALPHA = int(os.getenv("DEHALO_SOLID_ALPHA", "210"))
 RESTORE_EXPAND_ITER = int(os.getenv("RESTORE_EXPAND_ITER", "1"))
+
+# True upscale
+UPSCALE_ENABLED = os.getenv("UPSCALE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
+UPSCALE_ENGINE = (os.getenv("UPSCALE_ENGINE") or "realesrgan").strip().lower()
+UPSCALE_TARGET_PX = int(os.getenv("UPSCALE_TARGET_PX", str(TARGET_PX)))
+
+# Real-ESRGAN external runner
+REALESRGAN_BIN = (os.getenv("REALESRGAN_BIN") or "").strip()
+REALESRGAN_MODEL = (os.getenv("REALESRGAN_MODEL") or "realesrgan-x4plus").strip()
+REALESRGAN_SCALE = int(os.getenv("REALESRGAN_SCALE", "4"))
+REALESRGAN_TILE = int(os.getenv("REALESRGAN_TILE", "0"))
+REALESRGAN_TIMEOUT = int(os.getenv("REALESRGAN_TIMEOUT", "180"))
 
 PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
 
@@ -129,6 +141,7 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
+        "orig_master": UPLOAD_DIR / f"{session_id}_orig_master.png",
         "orig": UPLOAD_DIR / f"{session_id}_orig.png",
         "base": UPLOAD_DIR / f"{session_id}_base.png",
         "editor": UPLOAD_DIR / f"{session_id}_editor.png",
@@ -142,7 +155,7 @@ def _paths(session_id: str) -> Dict[str, Path]:
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    needed = ["orig", "base", "editor", "curr", "mask", "restore_mask", "seed_mask", "restore_src"]
+    needed = ["orig_master", "orig", "base", "editor", "curr", "mask", "restore_mask", "seed_mask", "restore_src"]
     return all(p[k].exists() for k in needed)
 
 
@@ -159,7 +172,7 @@ def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
     return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 
-def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.92) -> Image.Image:
+def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.94) -> Image.Image:
     w, h = img.size
     target = max(1, int(max_dim * fill_ratio))
     scale = min(target / w, target / h)
@@ -244,45 +257,19 @@ def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional
     return a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
 
 
-def _cleanup_cutout(img: Image.Image) -> Image.Image:
+def _cleanup_cutout_light(img: Image.Image) -> Image.Image:
     rgba = np.array(img.convert("RGBA"))
     alpha = rgba[:, :, 3].copy()
 
+    # Only kill extremely faint junk
     alpha[alpha < AI_ALPHA_CUTOFF] = 0
 
     mask = (alpha > 0).astype(np.uint8) * 255
-    if mask.max() == 0:
-        rgba[:, :, 3] = alpha
-        return Image.fromarray(rgba, "RGBA")
-
-    kernel3 = np.ones((3, 3), np.uint8)
-    kernel5 = np.ones((5, 5), np.uint8)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel3, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel3, iterations=1)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-    keep = np.zeros_like(mask)
-    component_areas: List[int] = []
-
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        component_areas.append(area)
-
-    largest_area = max(component_areas) if component_areas else 0
-
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area >= AI_KEEP_COMPONENT_MIN_AREA or (largest_area > 0 and area >= int(largest_area * 0.015)):
-            keep[labels == i] = 255
-
-    if keep.max() == 0:
-        keep = mask
-
-    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel5, iterations=1)
-    alpha = np.where(keep > 0, alpha, 0).astype(np.uint8)
-    alpha[alpha < AI_ALPHA_CUTOFF] = 0
+    if mask.max() > 0:
+        # Very light close only; avoids chewing up lettering/detail
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        alpha = np.where(mask > 0, alpha, 0).astype(np.uint8)
 
     rgba[:, :, 3] = alpha
     return Image.fromarray(rgba, "RGBA")
@@ -311,6 +298,16 @@ def _dehalo_cutout(img: Image.Image) -> Image.Image:
 
     out = np.dstack([np.clip(rgb, 0, 255), np.clip(alpha, 0, 255)]).astype(np.uint8)
     return Image.fromarray(out, "RGBA")
+
+
+def _apply_cutout_alpha_to_original(original_rgba: Image.Image, cutout_rgba: Image.Image) -> Image.Image:
+    original_rgba = original_rgba.convert("RGBA")
+    cutout_rgba = cutout_rgba.convert("RGBA")
+    cutout_alpha = cutout_rgba.split()[-1].resize(original_rgba.size, Image.LANCZOS)
+
+    out = original_rgba.copy()
+    out.putalpha(cutout_alpha)
+    return out
 
 
 def _quality_flags(img: Image.Image) -> List[str]:
@@ -485,7 +482,8 @@ def _build_editor_assets(
         return base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview
 
     cleaned_aligned = _fit_cutout_into_reference_box(cleaned_removed, original_aligned, EDITOR_PX).convert("RGBA")
-    cleaned_aligned = _dehalo_cutout(cleaned_aligned)
+    if DEHALO_ENABLED:
+        cleaned_aligned = _dehalo_cutout(cleaned_aligned)
 
     base_rgba = cleaned_aligned.copy()
     seed_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
@@ -509,6 +507,91 @@ def _build_editor_assets(
 
 
 # ----------------------------
+# True upscale helpers
+# ----------------------------
+def _needs_upscale(img: Image.Image, target_px: int) -> bool:
+    w, h = img.size
+    return max(w, h) < target_px
+
+
+def _resize_to_max_dim(img: Image.Image, target_px: int) -> Image.Image:
+    w, h = img.size
+    if max(w, h) == target_px:
+        return img
+    scale = target_px / float(max(w, h))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    return img.resize((nw, nh), Image.LANCZOS)
+
+
+def _upscale_with_realesrgan(img: Image.Image, target_px: int) -> Image.Image:
+    if not REALESRGAN_BIN:
+        raise RuntimeError("REALESRGAN_BIN not set")
+
+    temp_id = str(uuid.uuid4())
+    in_path = UPLOAD_DIR / f"{temp_id}_sr_in.png"
+    out_dir = UPLOAD_DIR / f"{temp_id}_sr_out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _save_png(img.convert("RGBA"), in_path)
+
+    cmd = [
+        REALESRGAN_BIN,
+        "-i", str(in_path),
+        "-o", str(out_dir),
+        "-n", REALESRGAN_MODEL,
+        "-s", str(REALESRGAN_SCALE),
+    ]
+
+    if REALESRGAN_TILE > 0:
+        cmd += ["-t", str(REALESRGAN_TILE)]
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=REALESRGAN_TIMEOUT,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"Real-ESRGAN failed: {(proc.stderr or proc.stdout or '').strip()[:500]}")
+
+    candidates = list(out_dir.glob("*.png"))
+    if not candidates:
+        raise RuntimeError("Real-ESRGAN did not produce an output file")
+
+    sr = Image.open(candidates[0]).convert("RGBA")
+
+    if max(sr.size) > target_px:
+        sr = _resize_to_max_dim(sr, target_px)
+
+    try:
+        in_path.unlink(missing_ok=True)
+        for f in out_dir.glob("*"):
+            f.unlink(missing_ok=True)
+        out_dir.rmdir()
+    except Exception:
+        pass
+
+    return sr
+
+
+def _true_upscale_if_needed(img: Image.Image, target_px: int) -> Image.Image:
+    img = img.convert("RGBA")
+
+    if not _needs_upscale(img, target_px):
+        return img
+
+    if UPSCALE_ENABLED and UPSCALE_ENGINE == "realesrgan":
+        try:
+            return _upscale_with_realesrgan(img, target_px)
+        except Exception as e:
+            print("⚠️ True upscale failed, falling back to Lanczos:", e)
+
+    return _resize_to_max_dim(img, target_px)
+
+
+# ----------------------------
 # Async worker
 # ----------------------------
 def _bg_process_session(session_id: str):
@@ -526,8 +609,10 @@ def _bg_process_session(session_id: str):
         removed = _photoroom_remove_bg(orig_sq)
 
         _sess_set(session_id, stage="cleaning_edges")
-        cleaned = _cleanup_cutout(removed)
-        cleaned = _dehalo_cutout(cleaned)
+        cleaned = _apply_cutout_alpha_to_original(orig_sq, removed)
+        cleaned = _cleanup_cutout_light(cleaned)
+        if DEHALO_ENABLED:
+            cleaned = _dehalo_cutout(cleaned)
 
         _sess_set(session_id, stage="checking_quality")
         flags = _quality_flags(cleaned)
@@ -650,6 +735,9 @@ async def upload_image(
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
+    # Save full-res master for final true output
+    _save_png(img, p["orig_master"])
+
     img_fit = _scale_to_editor_bounds(img, EDITOR_PX)
 
     canvas_orig = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
@@ -771,17 +859,41 @@ async def save_edit(session_id: str, file: UploadFile = File(...)):
 
     editor_img = browser_img.resize((EDITOR_PX, EDITOR_PX), Image.LANCZOS).convert("RGBA")
     current_mask = _alpha_to_rgba_mask(editor_img)
-    final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
 
     _save_png(editor_img, p["editor"])
     _save_png(current_mask, p["mask"])
+
+    if not p["orig_master"].exists():
+        final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
+        _save_png(final_img, p["curr"])
+        _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
+        return {"status": "ok", "upscale": "fallback_editor_only"}
+
+    master = Image.open(p["orig_master"]).convert("RGBA")
+
+    # Use editor alpha and project it back to the master
+    editor_alpha = editor_img.split()[-1]
+    master_alpha = editor_alpha.resize(master.size, Image.LANCZOS)
+
+    master_cut = master.copy()
+    master_cut.putalpha(master_alpha)
+
+    master_trimmed = _trim_transparent_padding(master_cut, alpha_threshold=6)
+
+    did_need_upscale = _needs_upscale(master_trimmed, UPSCALE_TARGET_PX)
+    final_subject = _true_upscale_if_needed(master_trimmed, UPSCALE_TARGET_PX)
+    final_img = _normalize_logo(final_subject, target_size=TARGET_PX)
+
     _save_png(final_img, p["curr"])
 
     _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "upscale": "true_model" if (did_need_upscale and UPSCALE_ENABLED and UPSCALE_ENGINE == "realesrgan") else "not_needed_or_fallback"
+    }
 
 
-@app.post("/finalize/{session_id}")
+@app.get("/finalize/{session_id}")
 def finalize(session_id: str):
     path = _paths(session_id)["curr"]
     if not path.exists():
@@ -925,6 +1037,8 @@ async def storefront_request(
         main_session_id = str(uuid.uuid4())
         p = _paths(main_session_id)
 
+        _save_png(img_main, p["orig_master"])
+
         canvas = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
         x = (EDITOR_PX - img_main_fit.width) // 2
         y = (EDITOR_PX - img_main_fit.height) // 2
@@ -963,6 +1077,8 @@ async def storefront_request(
 
                 secondary_session_id = str(uuid.uuid4())
                 sp = _paths(secondary_session_id)
+
+                _save_png(img_sec, sp["orig_master"])
 
                 canvas2 = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
                 x2 = (EDITOR_PX - img_sec_fit.width) // 2
@@ -1237,7 +1353,7 @@ def ui(
     }
 
     .editor-shell {
-      width: min(1400px, 100%);
+      width: min(1560px, 100%);
       height: calc(100vh - 68px);
       min-height: 0;
       display: grid;
@@ -1255,16 +1371,16 @@ def ui(
     .editor-top {
       min-height: 0;
       display: grid;
-      gap: 10px;
+      gap: 12px;
       align-items: stretch;
     }
 
     .editor-shell.review-mode .editor-top {
-      grid-template-columns: minmax(0,1fr) 72px;
+      grid-template-columns: 76px minmax(0,1fr) 76px;
     }
 
     .editor-shell.edit-mode .editor-top {
-      grid-template-columns: 72px minmax(0,1fr) 72px;
+      grid-template-columns: 76px minmax(0,1fr) 76px;
     }
 
     .canvas-panel {
@@ -1276,13 +1392,13 @@ def ui(
       background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.58));
       border: 1px solid rgba(15,23,42,0.08);
       overflow: hidden;
-      padding: 10px;
+      padding: 6px;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
     }
 
     .canvas-stage {
-      width: min(70vw, 68vh, 840px);
-      height: min(70vw, 68vh, 840px);
+      width: min(84vw, 82vh, 1120px);
+      height: min(84vw, 82vh, 1120px);
       max-width: 100%;
       max-height: 100%;
       aspect-ratio: 1 / 1;
@@ -1403,14 +1519,10 @@ def ui(
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.84);
     }
 
-    .editor-shell.review-mode .tool-rail {
-      display: none;
-    }
-
     .rail-tool-btn {
-      width: 50px;
-      min-height: 38px;
-      padding: 7px 4px;
+      width: 54px;
+      min-height: 40px;
+      padding: 8px 4px;
       border: none;
       border-radius: 14px;
       background: transparent;
@@ -1465,8 +1577,8 @@ def ui(
     }
 
     .swatch-btn {
-      width: 40px;
-      height: 40px;
+      width: 44px;
+      height: 44px;
       border-radius: 999px;
       border: 1px solid rgba(15,23,42,0.10);
       cursor: pointer;
@@ -1816,12 +1928,12 @@ def ui(
       }
 
       .canvas-panel {
-        padding: 8px;
+        padding: 6px;
       }
 
       .canvas-stage {
-        width: min(92vw, 62vw, 540px);
-        height: min(92vw, 62vw, 540px);
+        width: min(96vw, 74vh, 760px);
+        height: min(96vw, 74vh, 760px);
       }
 
       .swatch-rail {
@@ -1892,13 +2004,13 @@ def ui(
 
       .canvas-panel {
         min-height: auto;
-        padding: 6px;
+        padding: 4px;
         border-radius: 20px;
       }
 
       .canvas-stage {
-        width: min(94vw, 78vw, 430px);
-        height: min(94vw, 78vw, 430px);
+        width: min(97vw, 82vw, 560px);
+        height: min(97vw, 82vw, 560px);
         border-radius: 18px;
         flex: 0 0 auto;
       }
@@ -2347,7 +2459,7 @@ def ui(
     step3.classList.add('review-mode');
     reviewControls.style.display = 'grid';
     editorControls.classList.remove('show');
-    desktopToolRail.style.display = 'none';
+    desktopToolRail.style.display = !isTabletOrMobile() ? 'flex' : 'none';
     mobileEditorNote.classList.remove('show');
     mobileMagicControls.classList.remove('show');
     fitView();
@@ -3339,7 +3451,7 @@ def ui(
     if (!editorUnlocked) {
       step3.classList.add('review-mode');
       step3.classList.remove('edit-mode');
-      desktopToolRail.style.display = 'none';
+      desktopToolRail.style.display = !isTabletOrMobile() ? 'flex' : 'none';
       return;
     }
 
