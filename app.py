@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — simple upload + background removal + upscale
+# app.py — Studio Uploader (FastAPI) — fixed finalize/save flow + stronger guidance
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="4.0.0")
+app = FastAPI(title="Studio Uploader", version="4.1.0")
 
 
 # ----------------------------
@@ -143,6 +143,7 @@ def _paths(session_id: str) -> Dict[str, Path]:
         "orig_master": UPLOAD_DIR / f"{session_id}_orig_master.png",
         "preview": UPLOAD_DIR / f"{session_id}_preview.png",
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",
+        "final": UPLOAD_DIR / f"{session_id}_final.png",
     }
 
 
@@ -195,12 +196,6 @@ def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Ima
     if not bbox:
         return img
     return img.crop(bbox)
-
-
-def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional[Tuple[int, int, int, int]]:
-    img = img.convert("RGBA")
-    a = img.split()[-1]
-    return a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
 
 
 def _center_preview(img: Image.Image, canvas_size: int = PREVIEW_PX, fill_ratio: float = 0.92) -> Image.Image:
@@ -443,6 +438,36 @@ def _true_upscale_if_needed(img: Image.Image, target_px: int) -> Image.Image:
 
 
 # ----------------------------
+# Final save helper
+# ----------------------------
+def _finalize_session_image(session_id: str) -> Dict[str, Any]:
+    p = _paths(session_id)
+    curr = p["curr"]
+    final = p["final"]
+
+    if not curr.exists():
+        raise FileNotFoundError("Final image not found for session")
+
+    if not final.exists():
+        final.write_bytes(curr.read_bytes())
+
+    _sess_set(
+        session_id,
+        finalized=True,
+        finalized_at=time.time(),
+        final_path=str(final),
+    )
+
+    return {
+        "status": "ok",
+        "saved": True,
+        "session_id": session_id,
+        "finalize_url": f"/finalize/{session_id}",
+        "final_image_url": f"/final-file/{session_id}",
+    }
+
+
+# ----------------------------
 # Core processing
 # ----------------------------
 def _process_session(session_id: str, keep_original: bool):
@@ -555,7 +580,9 @@ def session_info(session_id: str):
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "finalize_url": f"/finalize/{session_id}",
+        "final_image_url": f"/final-file/{session_id}",
         "status_url": f"/status/{session_id}",
+        "finalized": bool(s.get("finalized")),
     }
 
 
@@ -591,6 +618,7 @@ async def upload_image(
         stage="queued",
         created_at=time.time(),
         quality_flags=[],
+        finalized=False,
     )
 
     t = threading.Thread(target=_process_session, args=(session_id, keep_original), daemon=True)
@@ -601,6 +629,7 @@ async def upload_image(
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
         "finalize_url": f"/finalize/{session_id}",
+        "final_image_url": f"/final-file/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -614,8 +643,28 @@ def get_preview(session_id: str):
 
 
 @app.get("/finalize/{session_id}")
-def finalize(session_id: str):
+def finalize_get(session_id: str):
     path = _paths(session_id)["curr"]
+    if not path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png")
+
+
+@app.post("/finalize/{session_id}")
+def finalize_post(session_id: str):
+    try:
+        result = _finalize_session_image(session_id)
+        return result
+    except FileNotFoundError:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/final-file/{session_id}")
+def final_file(session_id: str):
+    p = _paths(session_id)
+    path = p["final"] if p["final"].exists() else p["curr"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
@@ -762,6 +811,7 @@ async def storefront_request(
             stage="ready",
             created_at=time.time(),
             quality_flags=[],
+            finalized=False,
         )
 
         final_main = _trim_transparent_padding(img_main, alpha_threshold=6)
@@ -798,6 +848,7 @@ async def storefront_request(
                     stage="ready",
                     created_at=time.time(),
                     quality_flags=[],
+                    finalized=False,
                 )
 
                 final_sec = _trim_transparent_padding(img_sec, alpha_threshold=6)
@@ -1201,7 +1252,7 @@ def ui(
     }
 
     .overlay-sub {
-      max-width: 340px;
+      max-width: 420px;
       font-size: 13px;
       color: #64748b;
       line-height: 1.45;
@@ -1250,7 +1301,7 @@ def ui(
         <div style="font-size:30px;">✨</div>
         <div class="title">Upload logo</div>
         <div class="muted" style="margin-top:6px;">
-          We can remove the background and prepare your image for print.
+          We can sharpen, upscale, and remove the background for most simple logos.
         </div>
       </div>
 
@@ -1258,21 +1309,28 @@ def ui(
         <div class="guide-card">
           <div class="guide-title">Best results</div>
           <div class="guide-text">
-            Use a PNG with the background already removed and no extra transparent padding whenever possible.
+            For the best results, use an image that is already prepped with the background removed and scaled up if possible.
           </div>
         </div>
 
         <div class="guide-card">
-          <div class="guide-title">Use original image</div>
+          <div class="guide-title">Built-in background removal</div>
           <div class="guide-text">
-            If your image is already cleaned up, check <strong>Use original image</strong>. We will skip background removal and still prepare it for the final print workflow.
+            If you need simple image sharpening, upscaling, or background removal, our built-in background removal works well for most images.
           </div>
         </div>
 
         <div class="guide-card">
-          <div class="guide-title">Need more editing first?</div>
+          <div class="guide-title">If the removal looks wrong</div>
           <div class="guide-text">
-            We recommend PhotoRoom for easy background removal, Canva for simple cleanup and spacing, Photoshop for detailed manual edits, or Remove.bg for quick cutouts. Once your image is cleaned, come back and check <strong>Use original image</strong>.
+            If your image does not look correct after background removal, please edit it elsewhere and come back and click <strong>Use original image</strong>. That will skip background removal and help preserve the result you want.
+          </div>
+        </div>
+
+        <div class="guide-card">
+          <div class="guide-title">Double-check before saving</div>
+          <div class="guide-text">
+            On the next screen, check your image on different background colors to make sure the background removal was aggressive enough, or not too aggressive. If everything looks good, click <strong>Done</strong> and then submit the form.
           </div>
         </div>
       </div>
@@ -1411,7 +1469,7 @@ def ui(
   function startStageCycle() {
     stopStageCycle();
     let i = 0;
-    showOverlay(CYCLE_MESSAGES[0]);
+    showOverlay(CYCLE_MESSAGES[0], "Please wait while we prepare your file.");
     stageCycleTimer = setInterval(() => {
       i = (i + 1) % CYCLE_MESSAGES.length;
       overlayTitle.textContent = CYCLE_MESSAGES[i];
@@ -1478,13 +1536,17 @@ def ui(
           await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
           renderQualityFlags(j.quality_flags || []);
           hideOverlay();
-          previewStatus.textContent = previewStatus.textContent || "Image ready ✓";
+          if (!previewStatus.textContent.trim()) {
+            previewStatus.textContent = "Image ready ✓";
+          }
           return;
         }
 
         if (j.status === 'failed') {
           stopStageCycle();
-          await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
+          try {
+            await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
+          } catch (e) {}
           hideOverlay();
           previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — fallback image ready</span>`;
           return;
@@ -1551,15 +1613,33 @@ def ui(
   fileEl.addEventListener('input', handlePickedFile);
 
   btnDone.addEventListener('click', async () => {
+    if (!sessionId) {
+      alert("No image session found.");
+      return;
+    }
+
     btnDone.textContent = "Saving…";
     btnDone.disabled = true;
 
     try {
+      const saveResp = await fetch(`${API_BASE}/finalize/${sessionId}`, {
+        method: "POST",
+        headers: { "Accept": "application/json" },
+        cache: "no-store"
+      });
+
+      const saveJson = await saveResp.json().catch(() => ({}));
+      if (!saveResp.ok) {
+        throw new Error(saveJson.error || "Save failed");
+      }
+
       const payload = {
         type: "studio-uploader:done",
         slot: SLOT,
         session_id: sessionId,
-        finalize_url: `${API_BASE}/finalize/${sessionId}`
+        finalize_url: `${API_BASE}/finalize/${sessionId}`,
+        final_image_url: `${API_BASE}/final-file/${sessionId}`,
+        saved: true
       };
 
       const sent = notifyDone(payload);
@@ -1569,13 +1649,18 @@ def ui(
           url.searchParams.set("slot", SLOT);
           url.searchParams.set("session_id", sessionId);
           url.searchParams.set("finalize_url", payload.finalize_url);
+          url.searchParams.set("final_image_url", payload.final_image_url);
+          url.searchParams.set("saved", "1");
           window.location.href = url.toString();
         } else {
           btnDone.textContent = "Saved ✓";
         }
+      } else {
+        btnDone.textContent = "Saved ✓";
       }
     } catch (e) {
-      alert("Done failed — try again.");
+      console.error(e);
+      alert(e.message || "Done failed — try again.");
       btnDone.textContent = "Done";
       btnDone.disabled = false;
     }
