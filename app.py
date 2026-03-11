@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — safer cleanup + true upscale + larger editor
+# app.py — Studio Uploader (FastAPI) — simple upload + background removal + upscale
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import threading
 import subprocess
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple
 
 import cv2
 import numpy as np
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="3.4.0")
+app = FastAPI(title="Studio Uploader", version="4.0.0")
 
 
 # ----------------------------
@@ -49,7 +49,7 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(ROOT / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_PX = int(os.getenv("TARGET_PX", "3000"))
-EDITOR_PX = int(os.getenv("EDITOR_PX", "1200"))
+PREVIEW_PX = int(os.getenv("PREVIEW_PX", "1400"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
@@ -61,15 +61,14 @@ PHOTOROOM_TIMEOUT = int(os.getenv("PHOTOROOM_TIMEOUT", "60"))
 PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "hd").strip()  # preview | hd
 PHOTOROOM_CROP = os.getenv("PHOTOROOM_CROP", "false").strip().lower() in ("1", "true", "yes", "y")
 PHOTOROOM_FORMAT = (os.getenv("PHOTOROOM_FORMAT") or "png").strip()
-PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "1800"))
+PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "2000"))
 
-# Safer cleanup tuning
+# Cleanup
 AI_ALPHA_CUTOFF = int(os.getenv("AI_ALPHA_CUTOFF", "8"))
 AI_LOW_ALPHA_RATIO_WARN = float(os.getenv("AI_LOW_ALPHA_RATIO_WARN", "0.22"))
 AI_TINY_SUBJECT_RATIO_WARN = float(os.getenv("AI_TINY_SUBJECT_RATIO_WARN", "0.08"))
 DEHALO_ENABLED = os.getenv("DEHALO_ENABLED", "false").strip().lower() in ("1", "true", "yes", "y")
 DEHALO_SOLID_ALPHA = int(os.getenv("DEHALO_SOLID_ALPHA", "210"))
-RESTORE_EXPAND_ITER = int(os.getenv("RESTORE_EXPAND_ITER", "1"))
 
 # True upscale
 UPSCALE_ENABLED = os.getenv("UPSCALE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
@@ -121,7 +120,7 @@ def _sess_get(session_id: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Helpers: file read (stream + cap)
+# Helpers: file read
 # ----------------------------
 async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
     buf = bytearray()
@@ -137,46 +136,28 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 
 
 # ----------------------------
-# Helpers: image IO + scaling
+# Helpers: paths
 # ----------------------------
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
         "orig_master": UPLOAD_DIR / f"{session_id}_orig_master.png",
-        "orig": UPLOAD_DIR / f"{session_id}_orig.png",
-        "base": UPLOAD_DIR / f"{session_id}_base.png",
-        "editor": UPLOAD_DIR / f"{session_id}_editor.png",
+        "preview": UPLOAD_DIR / f"{session_id}_preview.png",
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",
-        "mask": UPLOAD_DIR / f"{session_id}_mask.png",
-        "restore_mask": UPLOAD_DIR / f"{session_id}_restore_mask.png",
-        "seed_mask": UPLOAD_DIR / f"{session_id}_seed_mask.png",
-        "restore_src": UPLOAD_DIR / f"{session_id}_restore_src.png",
     }
 
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    needed = ["orig_master", "orig", "base", "editor", "curr", "mask", "restore_mask", "seed_mask", "restore_src"]
+    needed = ["orig_master", "preview", "curr"]
     return all(p[k].exists() for k in needed)
 
 
+# ----------------------------
+# Helpers: image IO
+# ----------------------------
 def _save_png(img: Image.Image, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(path), "PNG", optimize=True)
-
-
-def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
-    w, h = img.size
-    if w <= max_dim and h <= max_dim:
-        return img
-    scale = min(max_dim / w, max_dim / h)
-    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-
-
-def _scale_to_editor_bounds(img: Image.Image, max_dim: int, fill_ratio: float = 0.94) -> Image.Image:
-    w, h = img.size
-    target = max(1, int(max_dim * fill_ratio))
-    scale = min(target / w, target / h)
-    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
 
 def _pil_open_safe(data: bytes) -> Image.Image:
@@ -199,11 +180,62 @@ def _pil_to_png_bytes(img: Image.Image) -> bytes:
     return out.getvalue()
 
 
-def _alpha_to_rgba_mask(img: Image.Image) -> Image.Image:
-    alpha = img.convert("RGBA").split()[-1]
-    rgba = Image.new("RGBA", img.size, (255, 255, 255, 0))
-    rgba.putalpha(alpha)
-    return rgba
+def _scale_to_fit(img: Image.Image, max_dim: int) -> Image.Image:
+    w, h = img.size
+    if w <= max_dim and h <= max_dim:
+        return img
+    scale = min(max_dim / w, max_dim / h)
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+
+def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
+    img = img.convert("RGBA")
+    a = img.split()[-1]
+    bbox = a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
+    if not bbox:
+        return img
+    return img.crop(bbox)
+
+
+def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional[Tuple[int, int, int, int]]:
+    img = img.convert("RGBA")
+    a = img.split()[-1]
+    return a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
+
+
+def _center_preview(img: Image.Image, canvas_size: int = PREVIEW_PX, fill_ratio: float = 0.92) -> Image.Image:
+    img = img.convert("RGBA")
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    w, h = img.size
+    target = max(1, int(canvas_size * fill_ratio))
+    scale = min(target / w, target / h)
+    nw = max(1, int(w * scale))
+    nh = max(1, int(h * scale))
+    fitted = img.resize((nw, nh), Image.LANCZOS)
+    x = (canvas_size - nw) // 2
+    y = (canvas_size - nh) // 2
+    canvas.alpha_composite(fitted, (x, y))
+    return canvas
+
+
+def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
+    img = _trim_transparent_padding(img.convert("RGBA"))
+    canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
+
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return canvas
+
+    max_dim = int(target_size * (1.0 - pad_ratio * 2.0))
+    scale = min(max_dim / w, max_dim / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    img2 = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (target_size - new_w) // 2
+    y = (target_size - new_h) // 2
+    canvas.alpha_composite(img2, (x, y))
+    return canvas
 
 
 # ----------------------------
@@ -242,31 +274,14 @@ def _photoroom_remove_bg(img: Image.Image) -> Image.Image:
 # ----------------------------
 # Cleanup / QC
 # ----------------------------
-def _trim_transparent_padding(img: Image.Image, alpha_threshold: int = 6) -> Image.Image:
-    img = img.convert("RGBA")
-    a = img.split()[-1]
-    bbox = a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
-    if not bbox:
-        return img
-    return img.crop(bbox)
-
-
-def _nontransparent_bbox(img: Image.Image, alpha_threshold: int = 6) -> Optional[Tuple[int, int, int, int]]:
-    img = img.convert("RGBA")
-    a = img.split()[-1]
-    return a.point(lambda p: 255 if p > alpha_threshold else 0).getbbox()
-
-
 def _cleanup_cutout_light(img: Image.Image) -> Image.Image:
     rgba = np.array(img.convert("RGBA"))
     alpha = rgba[:, :, 3].copy()
 
-    # Only kill extremely faint junk
     alpha[alpha < AI_ALPHA_CUTOFF] = 0
 
     mask = (alpha > 0).astype(np.uint8) * 255
     if mask.max() > 0:
-        # Very light close only; avoids chewing up lettering/detail
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
         alpha = np.where(mask > 0, alpha, 0).astype(np.uint8)
@@ -304,14 +319,13 @@ def _apply_cutout_alpha_to_original(original_rgba: Image.Image, cutout_rgba: Ima
     original_rgba = original_rgba.convert("RGBA")
     cutout_rgba = cutout_rgba.convert("RGBA")
     cutout_alpha = cutout_rgba.split()[-1].resize(original_rgba.size, Image.LANCZOS)
-
     out = original_rgba.copy()
     out.putalpha(cutout_alpha)
     return out
 
 
-def _quality_flags(img: Image.Image) -> List[str]:
-    flags: List[str] = []
+def _quality_flags(img: Image.Image) -> list[str]:
+    flags: list[str] = []
     rgba = np.array(img.convert("RGBA"))
     alpha = rgba[:, :, 3]
 
@@ -341,169 +355,6 @@ def _quality_flags(img: Image.Image) -> List[str]:
             flags.append("possible_matte_box")
 
     return flags
-
-
-def _fit_cutout_into_reference_box(
-    cutout: Image.Image,
-    reference_canvas: Image.Image,
-    canvas_size: int,
-) -> Image.Image:
-    out = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-
-    ref_box = _nontransparent_bbox(reference_canvas, alpha_threshold=6)
-    trimmed = _trim_transparent_padding(cutout.convert("RGBA"), alpha_threshold=6)
-
-    if not ref_box:
-        tw, th = trimmed.size
-        if tw <= 0 or th <= 0:
-            return out
-        scale = min(canvas_size / tw, canvas_size / th)
-        nw = max(1, int(tw * scale))
-        nh = max(1, int(th * scale))
-        fitted = trimmed.resize((nw, nh), Image.LANCZOS)
-        x = (canvas_size - nw) // 2
-        y = (canvas_size - nh) // 2
-        out.alpha_composite(fitted, (x, y))
-        return out
-
-    rx1, ry1, rx2, ry2 = ref_box
-    rw = max(1, rx2 - rx1)
-    rh = max(1, ry2 - ry1)
-
-    tw, th = trimmed.size
-    if tw <= 0 or th <= 0:
-        return out
-
-    scale = min(rw / tw, rh / th)
-    nw = max(1, int(tw * scale))
-    nh = max(1, int(th * scale))
-    fitted = trimmed.resize((nw, nh), Image.LANCZOS)
-
-    x = rx1 + (rw - nw) // 2
-    y = ry1 + (rh - nh) // 2
-    out.alpha_composite(fitted, (x, y))
-    return out
-
-
-def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
-    img = _trim_transparent_padding(img.convert("RGBA"))
-    canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
-
-    w, h = img.size
-    if w <= 0 or h <= 0:
-        return canvas
-
-    max_dim = int(target_size * (1.0 - pad_ratio * 2.0))
-    scale = min(max_dim / w, max_dim / h)
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-
-    img2 = img.resize((new_w, new_h), Image.LANCZOS)
-    x = (target_size - new_w) // 2
-    y = (target_size - new_h) // 2
-    canvas.alpha_composite(img2, (x, y))
-    return canvas
-
-
-def _alpha_coverage_ratio(img: Image.Image) -> float:
-    alpha = np.array(img.convert("RGBA"))[:, :, 3]
-    if alpha.size == 0:
-        return 0.0
-    return float((alpha > 0).sum()) / float(alpha.size)
-
-
-def _expand_alpha_mask(alpha_rgba: Image.Image, iterations: int = RESTORE_EXPAND_ITER) -> Image.Image:
-    rgba = np.array(alpha_rgba.convert("RGBA"))
-    alpha = rgba[:, :, 3]
-    kernel = np.ones((3, 3), np.uint8)
-    alpha = cv2.dilate(alpha, kernel, iterations=max(0, int(iterations)))
-    out = np.zeros_like(rgba)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = alpha
-    return Image.fromarray(out, "RGBA")
-
-
-def _compose_dual_source_preview(
-    cleaned_rgba: Image.Image,
-    current_mask_rgba: Image.Image,
-    seed_mask_rgba: Image.Image,
-    restore_src_rgba: Image.Image,
-) -> Image.Image:
-    cleaned = np.array(cleaned_rgba.convert("RGBA")).astype(np.float32)
-    current_mask = np.array(current_mask_rgba.convert("RGBA")).astype(np.float32)
-    seed_mask = np.array(seed_mask_rgba.convert("RGBA")).astype(np.float32)
-    restore_src = np.array(restore_src_rgba.convert("RGBA")).astype(np.float32)
-
-    cleaned_rgb = cleaned[:, :, :3]
-    restore_rgb = restore_src[:, :, :3]
-
-    curr_a = current_mask[:, :, 3]
-    seed_a = seed_mask[:, :, 3]
-
-    base_w = np.minimum(curr_a, seed_a)
-    extra_w = np.maximum(0.0, curr_a - seed_a)
-    denom = np.maximum(curr_a, 1.0)
-
-    out_rgb = ((cleaned_rgb * base_w[:, :, None]) + (restore_rgb * extra_w[:, :, None])) / denom[:, :, None]
-    out_a = curr_a
-
-    out = np.dstack([np.clip(out_rgb, 0, 255), np.clip(out_a, 0, 255)]).astype(np.uint8)
-    return Image.fromarray(out, "RGBA")
-
-
-def _build_editor_assets(
-    original_aligned: Image.Image,
-    cleaned_removed: Image.Image,
-    keep_original: bool = False,
-) -> Tuple[Image.Image, Image.Image, Image.Image, Image.Image, Image.Image, Image.Image]:
-    """
-    Returns:
-    - base_rgba: cleaned RGB source
-    - current_mask_rgba
-    - restore_mask_rgba
-    - seed_mask_rgba
-    - restore_src_rgba
-    - editor_preview
-    """
-    original_aligned = original_aligned.convert("RGBA")
-
-    if keep_original:
-        base_rgba = original_aligned.copy()
-        current_mask_rgba = _alpha_to_rgba_mask(original_aligned)
-        restore_mask_rgba = current_mask_rgba.copy()
-        seed_mask_rgba = current_mask_rgba.copy()
-        restore_src_rgba = original_aligned.copy()
-        editor_preview = _compose_dual_source_preview(
-            cleaned_rgba=base_rgba,
-            current_mask_rgba=current_mask_rgba,
-            seed_mask_rgba=seed_mask_rgba,
-            restore_src_rgba=restore_src_rgba,
-        )
-        return base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview
-
-    cleaned_aligned = _fit_cutout_into_reference_box(cleaned_removed, original_aligned, EDITOR_PX).convert("RGBA")
-    if DEHALO_ENABLED:
-        cleaned_aligned = _dehalo_cutout(cleaned_aligned)
-
-    base_rgba = cleaned_aligned.copy()
-    seed_mask_rgba = _alpha_to_rgba_mask(cleaned_aligned)
-    current_mask_rgba = seed_mask_rgba.copy()
-
-    original_alpha_ratio = _alpha_coverage_ratio(original_aligned)
-    if original_alpha_ratio < 0.98:
-        restore_mask_rgba = _alpha_to_rgba_mask(original_aligned)
-    else:
-        restore_mask_rgba = _expand_alpha_mask(seed_mask_rgba, iterations=RESTORE_EXPAND_ITER)
-
-    restore_src_rgba = original_aligned.copy()
-
-    editor_preview = _compose_dual_source_preview(
-        cleaned_rgba=base_rgba,
-        current_mask_rgba=current_mask_rgba,
-        seed_mask_rgba=seed_mask_rgba,
-        restore_src_rgba=restore_src_rgba,
-    )
-    return base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview
 
 
 # ----------------------------
@@ -592,46 +443,49 @@ def _true_upscale_if_needed(img: Image.Image, target_px: int) -> Image.Image:
 
 
 # ----------------------------
-# Async worker
+# Core processing
 # ----------------------------
-def _bg_process_session(session_id: str):
+def _process_session(session_id: str, keep_original: bool):
     try:
-        _sess_set(session_id, status="processing", stage="removing_background", started_at=time.time())
-
         p = _paths(session_id)
-        if not p["orig"].exists():
-            _sess_set(session_id, status="failed", stage="failed", error="orig missing")
+
+        _sess_set(session_id, status="processing", stage="loading_image", started_at=time.time())
+
+        if not p["orig_master"].exists():
+            _sess_set(session_id, status="failed", stage="failed", error="orig_master missing")
             return
 
-        orig_sq = Image.open(p["orig"]).convert("RGBA")
+        master = Image.open(p["orig_master"]).convert("RGBA")
 
-        _sess_set(session_id, stage="removing_background")
-        removed = _photoroom_remove_bg(orig_sq)
+        if keep_original:
+            _sess_set(session_id, stage="using_original")
+            result = master.copy()
+            flags = []
+        else:
+            _sess_set(session_id, stage="removing_background")
+            removed = _photoroom_remove_bg(master)
 
-        _sess_set(session_id, stage="cleaning_edges")
-        cleaned = _apply_cutout_alpha_to_original(orig_sq, removed)
-        cleaned = _cleanup_cutout_light(cleaned)
-        if DEHALO_ENABLED:
-            cleaned = _dehalo_cutout(cleaned)
+            _sess_set(session_id, stage="cleaning_edges")
+            result = _apply_cutout_alpha_to_original(master, removed)
+            result = _cleanup_cutout_light(result)
+            if DEHALO_ENABLED:
+                result = _dehalo_cutout(result)
 
-        _sess_set(session_id, stage="checking_quality")
-        flags = _quality_flags(cleaned)
+            _sess_set(session_id, stage="checking_quality")
+            flags = _quality_flags(result)
 
-        _sess_set(session_id, stage="finishing_details")
-        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
-            original_aligned=orig_sq,
-            cleaned_removed=cleaned,
-            keep_original=False,
-        )
-        final_png = _normalize_logo(editor_preview, target_size=TARGET_PX)
+        _sess_set(session_id, stage="trimming")
+        result = _trim_transparent_padding(result, alpha_threshold=6)
 
-        _save_png(base_rgba, p["base"])
-        _save_png(editor_preview, p["editor"])
-        _save_png(current_mask_rgba, p["mask"])
-        _save_png(restore_mask_rgba, p["restore_mask"])
-        _save_png(seed_mask_rgba, p["seed_mask"])
-        _save_png(restore_src_rgba, p["restore_src"])
-        _save_png(final_png, p["curr"])
+        _sess_set(session_id, stage="upscaling")
+        result = _true_upscale_if_needed(result, UPSCALE_TARGET_PX)
+
+        _sess_set(session_id, stage="building_final")
+        final_img = _normalize_logo(result, target_size=TARGET_PX)
+        preview_img = _center_preview(final_img, canvas_size=PREVIEW_PX)
+
+        _save_png(preview_img, p["preview"])
+        _save_png(final_img, p["curr"])
 
         _sess_set(
             session_id,
@@ -642,18 +496,17 @@ def _bg_process_session(session_id: str):
         )
 
     except Exception as e:
+        print("❌ process_session failed:", e)
         try:
             p = _paths(session_id)
-            if p["orig"].exists():
-                fallback = Image.open(p["orig"]).convert("RGBA")
-                fallback_mask = _alpha_to_rgba_mask(fallback)
-                _save_png(fallback, p["base"])
-                _save_png(fallback, p["editor"])
-                _save_png(fallback_mask, p["mask"])
-                _save_png(fallback_mask, p["restore_mask"])
-                _save_png(fallback_mask, p["seed_mask"])
-                _save_png(fallback, p["restore_src"])
-                _save_png(_normalize_logo(fallback, target_size=TARGET_PX), p["curr"])
+            if p["orig_master"].exists():
+                fallback = Image.open(p["orig_master"]).convert("RGBA")
+                fallback = _trim_transparent_padding(fallback, alpha_threshold=6)
+                fallback = _true_upscale_if_needed(fallback, UPSCALE_TARGET_PX)
+                final_img = _normalize_logo(fallback, target_size=TARGET_PX)
+                preview_img = _center_preview(final_img, canvas_size=PREVIEW_PX)
+                _save_png(preview_img, p["preview"])
+                _save_png(final_img, p["curr"])
         except Exception:
             pass
 
@@ -701,12 +554,7 @@ def session_info(session_id: str):
         "quality_flags": s.get("quality_flags", []),
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
-        "original_url": f"/original/{session_id}",
-        "base_url": f"/base/{session_id}",
-        "mask_url": f"/mask/{session_id}",
-        "restore_mask_url": f"/restore-mask/{session_id}",
-        "seed_mask_url": f"/seed-mask/{session_id}",
-        "restore_src_url": f"/restore-src/{session_id}",
+        "finalize_url": f"/finalize/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
@@ -735,162 +583,34 @@ async def upload_image(
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
 
-    # Save full-res master for final true output
     _save_png(img, p["orig_master"])
-
-    img_fit = _scale_to_editor_bounds(img, EDITOR_PX)
-
-    canvas_orig = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
-    x = (EDITOR_PX - img_fit.width) // 2
-    y = (EDITOR_PX - img_fit.height) // 2
-    canvas_orig.alpha_composite(img_fit, (x, y))
-
-    _save_png(canvas_orig, p["orig"])
-
-    if keep_original:
-        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
-            original_aligned=canvas_orig,
-            cleaned_removed=canvas_orig,
-            keep_original=True,
-        )
-        _save_png(base_rgba, p["base"])
-        _save_png(editor_preview, p["editor"])
-        _save_png(current_mask_rgba, p["mask"])
-        _save_png(restore_mask_rgba, p["restore_mask"])
-        _save_png(seed_mask_rgba, p["seed_mask"])
-        _save_png(restore_src_rgba, p["restore_src"])
-        _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
 
     _sess_set(
         session_id,
-        status="ready" if keep_original else "queued",
-        stage="ready" if keep_original else "queued",
+        status="queued",
+        stage="queued",
         created_at=time.time(),
         quality_flags=[],
     )
 
-    if not keep_original:
-        t = threading.Thread(target=_bg_process_session, args=(session_id,), daemon=True)
-        t.start()
+    t = threading.Thread(target=_process_session, args=(session_id, keep_original), daemon=True)
+    t.start()
 
     return {
         "status": "ok",
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
-        "original_url": f"/original/{session_id}",
-        "base_url": f"/base/{session_id}",
-        "mask_url": f"/mask/{session_id}",
-        "restore_mask_url": f"/restore-mask/{session_id}",
-        "seed_mask_url": f"/seed-mask/{session_id}",
-        "restore_src_url": f"/restore-src/{session_id}",
+        "finalize_url": f"/finalize/{session_id}",
         "status_url": f"/status/{session_id}",
     }
 
 
 @app.get("/preview/{session_id}")
 def get_preview(session_id: str):
-    path = _paths(session_id)["editor"]
+    path = _paths(session_id)["preview"]
     if not path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/original/{session_id}")
-def get_original(session_id: str):
-    path = _paths(session_id)["orig"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/base/{session_id}")
-def get_base(session_id: str):
-    path = _paths(session_id)["base"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/mask/{session_id}")
-def get_mask(session_id: str):
-    path = _paths(session_id)["mask"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/restore-mask/{session_id}")
-def get_restore_mask(session_id: str):
-    path = _paths(session_id)["restore_mask"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/seed-mask/{session_id}")
-def get_seed_mask(session_id: str):
-    path = _paths(session_id)["seed_mask"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.get("/restore-src/{session_id}")
-def get_restore_src(session_id: str):
-    path = _paths(session_id)["restore_src"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
-
-
-@app.post("/save-edit/{session_id}")
-async def save_edit(session_id: str, file: UploadFile = File(...)):
-    p = _paths(session_id)
-
-    try:
-        data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
-    except ValueError:
-        return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
-
-    try:
-        browser_img = _pil_open_safe(data)
-    except ValueError:
-        return JSONResponse({"error": "Bad image payload"}, status_code=400)
-
-    editor_img = browser_img.resize((EDITOR_PX, EDITOR_PX), Image.LANCZOS).convert("RGBA")
-    current_mask = _alpha_to_rgba_mask(editor_img)
-
-    _save_png(editor_img, p["editor"])
-    _save_png(current_mask, p["mask"])
-
-    if not p["orig_master"].exists():
-        final_img = _normalize_logo(editor_img, target_size=TARGET_PX)
-        _save_png(final_img, p["curr"])
-        _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
-        return {"status": "ok", "upscale": "fallback_editor_only"}
-
-    master = Image.open(p["orig_master"]).convert("RGBA")
-
-    # Use editor alpha and project it back to the master
-    editor_alpha = editor_img.split()[-1]
-    master_alpha = editor_alpha.resize(master.size, Image.LANCZOS)
-
-    master_cut = master.copy()
-    master_cut.putalpha(master_alpha)
-
-    master_trimmed = _trim_transparent_padding(master_cut, alpha_threshold=6)
-
-    did_need_upscale = _needs_upscale(master_trimmed, UPSCALE_TARGET_PX)
-    final_subject = _true_upscale_if_needed(master_trimmed, UPSCALE_TARGET_PX)
-    final_img = _normalize_logo(final_subject, target_size=TARGET_PX)
-
-    _save_png(final_img, p["curr"])
-
-    _sess_set(session_id, status="ready", stage="ready", saved_at=time.time())
-    return {
-        "status": "ok",
-        "upscale": "true_model" if (did_need_upscale and UPSCALE_ENABLED and UPSCALE_ENGINE == "realesrgan") else "not_needed_or_fallback"
-    }
 
 
 @app.get("/finalize/{session_id}")
@@ -1032,32 +752,25 @@ async def storefront_request(
                 return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
             return JSONResponse({"error": "Main logo is not a valid image"}, status_code=400)
 
-        img_main_fit = _scale_to_editor_bounds(img_main, EDITOR_PX)
-
         main_session_id = str(uuid.uuid4())
         p = _paths(main_session_id)
-
         _save_png(img_main, p["orig_master"])
 
-        canvas = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
-        x = (EDITOR_PX - img_main_fit.width) // 2
-        y = (EDITOR_PX - img_main_fit.height) // 2
-        canvas.alpha_composite(img_main_fit, (x, y))
-
-        _save_png(canvas, p["orig"])
-
-        base_rgba, current_mask_rgba, restore_mask_rgba, seed_mask_rgba, restore_src_rgba, editor_preview = _build_editor_assets(
-            original_aligned=canvas,
-            cleaned_removed=canvas,
-            keep_original=True,
+        _sess_set(
+            main_session_id,
+            status="ready",
+            stage="ready",
+            created_at=time.time(),
+            quality_flags=[],
         )
-        _save_png(base_rgba, p["base"])
-        _save_png(editor_preview, p["editor"])
-        _save_png(current_mask_rgba, p["mask"])
-        _save_png(restore_mask_rgba, p["restore_mask"])
-        _save_png(seed_mask_rgba, p["seed_mask"])
-        _save_png(restore_src_rgba, p["restore_src"])
-        _save_png(_normalize_logo(editor_preview, target_size=TARGET_PX), p["curr"])
+
+        final_main = _trim_transparent_padding(img_main, alpha_threshold=6)
+        final_main = _true_upscale_if_needed(final_main, UPSCALE_TARGET_PX)
+        final_main = _normalize_logo(final_main, target_size=TARGET_PX)
+        preview_main = _center_preview(final_main, canvas_size=PREVIEW_PX)
+
+        _save_png(preview_main, p["preview"])
+        _save_png(final_main, p["curr"])
 
         if storefront_logo_secondary:
             try:
@@ -1073,32 +786,27 @@ async def storefront_request(
                     raise ValueError("empty_bytes")
 
                 img_sec = _pil_open_safe(sec_bytes)
-                img_sec_fit = _scale_to_editor_bounds(img_sec, EDITOR_PX)
 
                 secondary_session_id = str(uuid.uuid4())
                 sp = _paths(secondary_session_id)
 
                 _save_png(img_sec, sp["orig_master"])
 
-                canvas2 = Image.new("RGBA", (EDITOR_PX, EDITOR_PX), (0, 0, 0, 0))
-                x2 = (EDITOR_PX - img_sec_fit.width) // 2
-                y2 = (EDITOR_PX - img_sec_fit.height) // 2
-                canvas2.alpha_composite(img_sec_fit, (x2, y2))
-
-                _save_png(canvas2, sp["orig"])
-
-                base2, mask2, restore2, seed2, restore_src2, editor2 = _build_editor_assets(
-                    original_aligned=canvas2,
-                    cleaned_removed=canvas2,
-                    keep_original=True,
+                _sess_set(
+                    secondary_session_id,
+                    status="ready",
+                    stage="ready",
+                    created_at=time.time(),
+                    quality_flags=[],
                 )
-                _save_png(base2, sp["base"])
-                _save_png(editor2, sp["editor"])
-                _save_png(mask2, sp["mask"])
-                _save_png(restore2, sp["restore_mask"])
-                _save_png(seed2, sp["seed_mask"])
-                _save_png(restore_src2, sp["restore_src"])
-                _save_png(_normalize_logo(editor2, target_size=TARGET_PX), sp["curr"])
+
+                final_sec = _trim_transparent_padding(img_sec, alpha_threshold=6)
+                final_sec = _true_upscale_if_needed(final_sec, UPSCALE_TARGET_PX)
+                final_sec = _normalize_logo(final_sec, target_size=TARGET_PX)
+                preview_sec = _center_preview(final_sec, canvas_size=PREVIEW_PX)
+
+                _save_png(preview_sec, sp["preview"])
+                _save_png(final_sec, sp["curr"])
 
             except Exception as e:
                 print("⚠️ Secondary logo skipped:", str(e))
@@ -1162,7 +870,7 @@ def ui(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0" />
-  <title>Logo Studio</title>
+  <title>Studio Uploader</title>
   <style>
     :root {
       --bg0: #f6f8fb;
@@ -1171,7 +879,6 @@ def ui(
       --text: #0f172a;
       --muted: #667085;
       --shadow: 0 26px 70px rgba(15,23,42,0.12);
-      --shadow-soft: 0 12px 30px rgba(15,23,42,0.07);
     }
 
     * { box-sizing: border-box; }
@@ -1230,6 +937,7 @@ def ui(
     }
 
     .btn-done {
+      display: none;
       border: none;
       border-radius: 999px;
       padding: 10px 16px;
@@ -1255,23 +963,23 @@ def ui(
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 8px;
+      padding: 10px;
     }
 
-    .upload-card {
-      width: min(620px, 100%);
+    .shell {
+      width: min(760px, 100%);
       background: rgba(255,255,255,0.78);
       backdrop-filter: blur(18px) saturate(1.12);
       border: 1px solid var(--panel-border);
       border-radius: 30px;
       box-shadow: var(--shadow);
-      padding: 16px;
+      padding: 18px;
     }
 
     .upload-box {
       position: relative;
       border-radius: 24px;
-      padding: 30px 18px;
+      padding: 34px 18px;
       text-align: center;
       border: 1.5px dashed rgba(15,23,42,0.12);
       background: rgba(255,255,255,0.58);
@@ -1288,8 +996,8 @@ def ui(
     }
 
     .title {
-      font-size: 16px;
-      font-weight: 700;
+      font-size: 18px;
+      font-weight: 800;
       letter-spacing: -0.02em;
       margin-top: 8px;
     }
@@ -1300,7 +1008,7 @@ def ui(
       line-height: 1.5;
     }
 
-    .upload-guidance {
+    .guidance {
       margin-top: 14px;
       display: grid;
       gap: 10px;
@@ -1311,7 +1019,6 @@ def ui(
       border-radius: 18px;
       background: rgba(255,255,255,0.72);
       border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: 0 6px 18px rgba(15,23,42,0.05);
       padding: 12px 14px;
     }
 
@@ -1324,7 +1031,7 @@ def ui(
 
     .guide-text {
       font-size: 12px;
-      line-height: 1.5;
+      line-height: 1.55;
       color: #475569;
     }
 
@@ -1349,69 +1056,39 @@ def ui(
       font-size: 13px;
       font-weight: 600;
       color: #334155;
-      box-shadow: 0 6px 18px rgba(15,23,42,0.05);
     }
 
-    .editor-shell {
-      width: min(1560px, 100%);
-      height: calc(100vh - 68px);
-      min-height: 0;
-      display: grid;
-      grid-template-rows: minmax(0,1fr) auto;
-      gap: 10px;
-      padding: 10px;
+    .preview-wrap {
+      display: none;
+      width: min(980px, 100%);
       background: rgba(255,255,255,0.78);
-      backdrop-filter: blur(20px) saturate(1.14);
+      backdrop-filter: blur(18px) saturate(1.12);
       border: 1px solid var(--panel-border);
-      border-radius: 28px;
-      box-shadow: 0 28px 70px rgba(15,23,42,0.14);
-      overflow: hidden;
+      border-radius: 30px;
+      box-shadow: var(--shadow);
+      padding: 18px;
     }
 
-    .editor-top {
-      min-height: 0;
-      display: grid;
-      gap: 12px;
-      align-items: stretch;
-    }
-
-    .editor-shell.review-mode .editor-top {
-      grid-template-columns: 76px minmax(0,1fr) 76px;
-    }
-
-    .editor-shell.edit-mode .editor-top {
-      grid-template-columns: 76px minmax(0,1fr) 76px;
-    }
-
-    .canvas-panel {
-      min-height: 0;
+    .preview-stage {
+      position: relative;
+      border-radius: 24px;
+      min-height: 420px;
       display: flex;
       align-items: center;
       justify-content: center;
-      border-radius: 24px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.58));
-      border: 1px solid rgba(15,23,42,0.08);
-      overflow: hidden;
-      padding: 6px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
-    }
-
-    .canvas-stage {
-      width: min(84vw, 82vh, 1120px);
-      height: min(84vw, 82vh, 1120px);
-      max-width: 100%;
-      max-height: 100%;
-      aspect-ratio: 1 / 1;
-      border-radius: 24px;
-      position: relative;
-      overflow: hidden;
       border: 1px solid rgba(15,23,42,0.08);
       background: #ffffff;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
-      flex: 0 0 auto;
+      overflow: hidden;
     }
 
-    .canvas-stage.bg-checker {
+    .preview-stage img {
+      width: min(92vw, 84vh, 820px);
+      height: min(92vw, 84vh, 820px);
+      object-fit: contain;
+      display: block;
+    }
+
+    .preview-stage.bg-checker {
       background-color: #fff;
       background-image:
         linear-gradient(45deg, #eceef2 25%, transparent 25%),
@@ -1422,48 +1099,74 @@ def ui(
       background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
     }
 
-    .canvas-stage.bg-white {
+    .preview-stage.bg-white {
       background: #ffffff;
       background-image: none;
     }
 
-    .canvas-stage.bg-dark {
-      background: #101828;
+    .preview-stage.bg-dark {
+      background: #0f172a;
       background-image: none;
     }
 
-    .canvas-viewport {
-      position: absolute;
-      inset: 0;
-      overflow: hidden;
-      touch-action: none;
-      cursor: default;
+    .preview-actions {
+      margin-top: 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      align-items: center;
     }
 
-    .canvas-inner {
-      position: absolute;
-      inset: 0;
-      transform-origin: center center;
-      will-change: transform;
-      cursor: default;
+    .ghost-btn {
+      height: 40px;
+      padding: 0 14px;
+      border: 1px solid rgba(15,23,42,0.08);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.82);
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
     }
 
-    canvas {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      display: block;
-      touch-action: none;
-      cursor: default;
-      z-index: 2;
+    .ghost-btn.active {
+      background: #0f172a;
+      color: white;
+    }
+
+    .status-row {
+      min-height: 24px;
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      color: #64748b;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+    }
+
+    .warn-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 11px;
+      border-radius: 999px;
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.24);
+      color: #b45309;
+      font-size: 12px;
+      font-weight: 700;
     }
 
     .processing-overlay {
       position: absolute;
       inset: 0;
       display: none;
-      z-index: 6;
+      z-index: 5;
       align-items: center;
       justify-content: center;
       flex-direction: column;
@@ -1498,764 +1201,106 @@ def ui(
     }
 
     .overlay-sub {
-      max-width: 320px;
+      max-width: 340px;
       font-size: 13px;
       color: #64748b;
       line-height: 1.45;
     }
 
-    .tool-rail,
-    .swatch-rail {
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      gap: 10px;
-      align-self: stretch;
-      padding: 10px 0;
-      border-radius: 22px;
-      background: rgba(255,255,255,0.60);
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.84);
-    }
-
-    .rail-tool-btn {
-      width: 54px;
-      min-height: 40px;
-      padding: 8px 4px;
-      border: none;
-      border-radius: 14px;
-      background: transparent;
-      color: #475569;
-      font-size: 10px;
-      line-height: 1.05;
-      font-weight: 800;
-      letter-spacing: -0.01em;
-      text-align: center;
-      cursor: pointer;
-      transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-    }
-
-    .rail-tool-btn:hover {
-      background: rgba(15,23,42,0.05);
-      color: #0f172a;
-      transform: translateY(-1px);
-    }
-
-    .rail-tool-btn.active {
-      background: #0f172a;
-      color: white;
-      box-shadow: 0 10px 24px rgba(15,23,42,0.16);
-    }
-
-    .mini-rail {
-      display: none;
-      flex-direction: column;
-      gap: 6px;
-      margin-top: 4px;
-    }
-
-    .mini-rail.show {
-      display: flex;
-    }
-
-    .mini-rail-btn {
-      width: 34px;
-      height: 34px;
-      border: none;
-      border-radius: 999px;
-      background: rgba(15,23,42,0.08);
-      color: #334155;
-      font-size: 15px;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    .mini-rail-btn.active {
-      background: rgba(15,23,42,0.92);
-      color: white;
-    }
-
-    .swatch-btn {
-      width: 44px;
-      height: 44px;
-      border-radius: 999px;
-      border: 1px solid rgba(15,23,42,0.10);
-      cursor: pointer;
-      position: relative;
-      box-shadow: 0 8px 18px rgba(15,23,42,0.08);
-      transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
-      background: #fff;
-    }
-
-    .swatch-btn.active {
-      box-shadow: 0 0 0 3px rgba(15,23,42,0.10), 0 14px 30px rgba(15,23,42,0.12);
-      border-color: rgba(15,23,42,0.24);
-    }
-
-    .swatch-btn.checker {
-      background-color: #fff;
-      background-image:
-        linear-gradient(45deg, #e5e7eb 25%, transparent 25%),
-        linear-gradient(-45deg, #e5e7eb 25%, transparent 25%),
-        linear-gradient(45deg, transparent 75%, #e5e7eb 75%),
-        linear-gradient(-45deg, transparent 75%, #e5e7eb 75%);
-      background-size: 12px 12px;
-      background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
-    }
-
-    .swatch-btn.white { background: #ffffff; }
-    .swatch-btn.dark { background: #111827; }
-
-    .swatch-label {
-      font-size: 10px;
-      color: #64748b;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      margin-top: -4px;
-    }
-
-    .controls-shell {
-      display: grid;
-      gap: 10px;
-      justify-items: center;
-      padding: 0 4px;
-    }
-
-    .review-controls {
-      display: grid;
-      gap: 10px;
-      width: 100%;
-      justify-items: center;
-    }
-
-    .review-actions {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      justify-content: center;
-      width: 100%;
-    }
-
-    .review-btn {
-      height: 40px;
-      min-width: 120px;
-      padding: 0 18px;
-      border: none;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.82);
-      color: #334155;
-      font-size: 13px;
-      font-weight: 800;
-      cursor: pointer;
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: var(--shadow-soft);
-    }
-
-    .review-btn.primary {
-      background: #0f172a;
-      color: white;
-    }
-
-    .editor-controls {
-      display: none;
-      gap: 10px;
-      width: 100%;
-      justify-items: center;
-    }
-
-    .editor-controls.show {
-      display: grid;
-    }
-
-    .tool-row {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      max-width: 100%;
-    }
-
-    .tool-segment {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 4px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: var(--shadow-soft);
-      flex-wrap: wrap;
-      justify-content: center;
-      max-width: 100%;
-    }
-
-    .tool-btn {
-      min-width: 0;
-      height: 34px;
-      border: none;
-      border-radius: 999px;
-      background: transparent;
-      color: #475569;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      cursor: pointer;
-      transition: background 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
-      padding: 0 10px;
-    }
-
-    .tool-btn.active {
-      background: #0f172a;
-      color: white;
-      box-shadow: 0 10px 24px rgba(15,23,42,0.16);
-    }
-
-    .utility-row {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      max-width: 100%;
-    }
-
-    .utility-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      height: 38px;
-      padding: 0 12px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: var(--shadow-soft);
-      color: #334155;
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    .ghost-btn {
-      height: 38px;
-      padding: 0 12px;
-      border: 1px solid rgba(15,23,42,0.08);
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      color: #334155;
-      font-size: 12px;
-      font-weight: 700;
-      cursor: pointer;
-      box-shadow: var(--shadow-soft);
-    }
-
-    .zoom-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      height: 38px;
-      padding: 0 8px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(15,23,42,0.08);
-      box-shadow: var(--shadow-soft);
-      color: #334155;
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .zoom-btn {
-      width: 28px;
-      height: 28px;
-      border: none;
-      border-radius: 999px;
-      background: rgba(15,23,42,0.06);
-      color: #0f172a;
-      font-weight: 800;
-      cursor: pointer;
-    }
-
-    .zoom-readout {
-      min-width: 44px;
-      text-align: center;
-      font-variant-numeric: tabular-nums;
-    }
-
-    input[type=range] {
-      width: min(180px, 34vw);
-      accent-color: #0f172a;
-    }
-
-    .zoom-range {
-      width: min(120px, 22vw);
-    }
-
-    .status-row {
-      min-height: 24px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      color: #64748b;
-      font-size: 13px;
-      font-weight: 600;
-      text-align: center;
-    }
-
-    .warn-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 7px 11px;
-      border-radius: 999px;
-      background: rgba(245,158,11,0.12);
-      border: 1px solid rgba(245,158,11,0.24);
-      color: #b45309;
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .hint-banner {
-      position: fixed;
-      left: 50%;
-      bottom: 16px;
-      transform: translateX(-50%);
-      z-index: 12000;
-      max-width: min(92vw, 520px);
-      padding: 12px 16px;
-      border-radius: 18px;
-      background: rgba(15,23,42,0.92);
-      color: white;
-      box-shadow: 0 24px 50px rgba(15,23,42,0.24);
-      font-size: 13px;
-      line-height: 1.4;
-      display: none;
-      text-align: center;
-    }
-
-    .hint-banner.show { display: block; }
-
-    .hint-pop {
-      position: fixed;
-      z-index: 12001;
-      max-width: 240px;
-      padding: 10px 12px;
-      border-radius: 14px;
-      background: rgba(15,23,42,0.94);
-      color: white;
-      box-shadow: 0 16px 32px rgba(15,23,42,0.24);
-      font-size: 12px;
-      line-height: 1.4;
-      display: none;
-      pointer-events: none;
-    }
-
-    .hint-pop.show { display: block; }
-
-    .mobile-editor-note {
-      display: none;
-      width: 100%;
-      max-width: 520px;
-      padding: 10px 12px;
-      border-radius: 16px;
-      background: rgba(15,23,42,0.92);
-      color: white;
-      font-size: 12px;
-      line-height: 1.4;
-      text-align: center;
-      box-shadow: 0 18px 40px rgba(15,23,42,0.20);
-    }
-
-    .mobile-editor-note.show {
-      display: block;
-    }
-
-    #cursor {
-      position: fixed;
-      width: 32px;
-      height: 32px;
-      border-radius: 999px;
-      border: 2px solid rgba(15,23,42,0.84);
-      box-shadow: 0 0 0 2px rgba(255,255,255,0.96);
-      background: rgba(255,255,255,0.08);
-      pointer-events: none;
-      transform: translate(-50%, -50%);
-      z-index: 9999;
-      display: none;
-    }
-
-    .cursor-dot {
-      position: fixed;
-      width: 4px;
-      height: 4px;
-      border-radius: 999px;
-      background: rgba(15,23,42,0.92);
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.92);
-      pointer-events: none;
-      transform: translate(-50%, -50%);
-      z-index: 10000;
-      display: none;
-    }
-
-    .mobile-tools,
-    .mobile-editor-note,
-    .mobile-magic-controls {
-      display: none;
-    }
-
-    @media (max-width: 980px) {
+    @media (max-width: 640px) {
       .main {
-        align-items: stretch;
-        padding: 8px;
-      }
-
-      .editor-shell {
-        width: 100%;
-        height: calc(100vh - 64px);
-        border-radius: 24px;
-        padding: 10px;
-        gap: 10px;
-      }
-
-      .editor-shell.review-mode .editor-top,
-      .editor-shell.edit-mode .editor-top {
-        grid-template-columns: 1fr;
-      }
-
-      .tool-rail {
-        display: none !important;
-      }
-
-      .canvas-panel {
         padding: 6px;
       }
 
-      .canvas-stage {
-        width: min(96vw, 74vh, 760px);
-        height: min(96vw, 74vh, 760px);
-      }
-
-      .swatch-rail {
-        flex-direction: row;
-        justify-content: center;
-        padding: 8px 10px;
-        gap: 10px;
-      }
-
-      .swatch-label {
-        display: none;
-      }
-
-      .zoom-range {
-        width: min(130px, 24vw);
-      }
-
-      input[type=range] {
-        width: min(180px, 36vw);
-      }
-
-      .mobile-tools {
-        display: flex;
-        width: 100%;
-      }
-    }
-
-    @media (max-width: 640px) {
-      .header {
-        padding: 8px 10px;
-      }
-
-      .brand h2 {
-        font-size: 14px;
-      }
-
-      .btn-done {
-        padding: 9px 14px;
-        min-width: 74px;
-      }
-
-      .main {
-        padding: 4px;
-        align-items: stretch;
-      }
-
-      .upload-card {
+      .shell, .preview-wrap {
         border-radius: 22px;
         padding: 14px;
       }
 
       .upload-box {
-        border-radius: 20px;
+        border-radius: 18px;
         padding: 28px 14px;
       }
 
-      .editor-shell {
-        height: calc(100vh - 56px);
-        gap: 6px;
-        padding: 6px;
-        grid-template-rows: auto auto;
-      }
-
-      .editor-top {
-        flex: 0 0 auto;
-        min-height: auto;
-      }
-
-      .canvas-panel {
-        min-height: auto;
-        padding: 4px;
-        border-radius: 20px;
-      }
-
-      .canvas-stage {
-        width: min(97vw, 82vw, 560px);
-        height: min(97vw, 82vw, 560px);
-        border-radius: 18px;
-        flex: 0 0 auto;
-      }
-
-      .swatch-rail {
-        width: 100%;
-        padding: 8px;
-        gap: 14px;
+      .preview-stage {
+        min-height: 320px;
         border-radius: 18px;
       }
 
-      .swatch-btn {
-        width: 42px;
-        height: 42px;
-      }
-
-      .controls-shell {
-        gap: 6px;
-        padding: 0;
-      }
-
-      .review-actions {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 6px;
-        width: 100%;
-      }
-
-      .review-btn {
-        width: 100%;
-        min-width: 0;
-        height: 38px;
-        font-size: 12px;
-        border-radius: 16px;
-      }
-
-      .editor-controls {
-        width: 100%;
-      }
-
-      .editor-controls.show {
-        display: grid;
-      }
-
-      .mobile-editor-note.show {
-        display: block;
-      }
-
-      .mobile-magic-controls.show {
-        display: grid;
-        width: 100%;
-        grid-template-columns: 1fr 1fr 1fr;
-        gap: 8px;
-      }
-
-      .mobile-magic-btn {
-        height: 42px;
-        border: none;
-        border-radius: 16px;
-        background: rgba(255,255,255,0.90);
-        color: #334155;
-        font-size: 13px;
-        font-weight: 800;
-        cursor: pointer;
-        border: 1px solid rgba(15,23,42,0.08);
-        box-shadow: var(--shadow-soft);
-      }
-
-      .mobile-magic-btn.active {
-        background: #0f172a;
-        color: white;
-        box-shadow: 0 10px 24px rgba(15,23,42,0.16);
-      }
-
-      .desktop-edit-controls {
-        display: none !important;
-      }
-
-      .status-row {
-        min-height: 18px;
-        font-size: 11px;
-      }
-
-      .hint-banner {
-        bottom: 12px;
-        padding: 10px 14px;
+      .preview-stage img {
+        width: min(95vw, 78vw, 520px);
+        height: min(95vw, 78vw, 520px);
       }
     }
   </style>
 </head>
 <body>
-  <div id="cursor"></div>
-  <div class="cursor-dot" id="cursorDot"></div>
-  <div class="hint-banner" id="hintBanner"></div>
-  <div class="hint-pop" id="hintPop"></div>
-
   <div class="header">
     <div class="brand">
       <h2>Studio Uploader</h2>
       <span class="brand-pill" id="slotPill">main</span>
     </div>
-    <button class="btn-done" id="btnDone" style="display:none;">Done</button>
+    <button class="btn-done" id="btnDone">Done</button>
   </div>
 
   <div class="main">
-    <div class="upload-card" id="step1">
+    <div class="shell" id="uploadShell">
       <div class="upload-box">
         <input id="file" type="file" accept="image/*" />
         <div style="font-size:30px;">✨</div>
         <div class="title">Upload logo</div>
         <div class="muted" style="margin-top:6px;">
-          Best results come from a logo that is already ready to print.
+          We can remove the background and prepare your image for print.
         </div>
       </div>
 
-      <div class="upload-guidance">
+      <div class="guidance">
         <div class="guide-card">
-          <div class="guide-title">Best option</div>
+          <div class="guide-title">Best results</div>
           <div class="guide-text">
-            Use a PNG with the background already removed, no extra transparent padding, and large enough for print. Preferred target is at least 3000 × 3000 pixels for a 10-inch print at 300 DPI.
+            Use a PNG with the background already removed and no extra transparent padding whenever possible.
           </div>
         </div>
 
         <div class="guide-card">
-          <div class="guide-title">If your file is already good to go</div>
+          <div class="guide-title">Use original image</div>
           <div class="guide-text">
-            Click <strong>Use original image</strong>. We will keep your original cutout and still normalize it for the final print workflow.
+            If your image is already cleaned up, check <strong>Use original image</strong>. We will skip background removal and still prepare it for the final print workflow.
           </div>
         </div>
 
         <div class="guide-card">
-          <div class="guide-title">If your file still needs help</div>
+          <div class="guide-title">Need more editing first?</div>
           <div class="guide-text">
-            Leave automatic cleanup on. We can remove the background, clean edges, let you review it, and make quick edits before it goes back to the form.
+            We recommend PhotoRoom for easy background removal, Canva for simple cleanup and spacing, Photoshop for detailed manual edits, or Remove.bg for quick cutouts. Once your image is cleaned, come back and check <strong>Use original image</strong>.
           </div>
         </div>
       </div>
 
       <div class="row">
         <label class="pill"><input type="checkbox" id="keepOriginal"> Use original image</label>
-        <label class="pill" style="opacity:.92;"><input type="checkbox" checked disabled> Automatic cleanup available</label>
       </div>
 
-      <div class="status-row" id="statusline1"></div>
+      <div class="status-row" id="uploadStatus"></div>
     </div>
 
-    <div class="editor-shell review-mode" id="step3" style="display:none;">
-      <div class="editor-top">
-        <div class="tool-rail" id="desktopToolRail">
-          <button class="rail-tool-btn active tip-target" id="btnRestore" data-tip="Restore paints the saved restore mask back in.">Restore</button>
-          <button class="rail-tool-btn tip-target" id="btnErase" data-tip="Erase removes parts manually.">Erase</button>
-          <button class="rail-tool-btn tip-target" id="btnMagic" data-tip="Magic removes or restores one connected area.">Magic</button>
-          <button class="rail-tool-btn tip-target" id="btnPan" data-tip="Pan lets you move around while zoomed in.">Pan</button>
-
-          <div class="mini-rail" id="magicModeWrapDesktop">
-            <button class="mini-rail-btn active tip-target" id="magicRemoveModeDesktop" data-tip="Magic Remove removes one connected region based on nearby color.">−</button>
-            <button class="mini-rail-btn tip-target" id="magicRestoreModeDesktop" data-tip="Magic Restore brings back one connected region from the restore mask.">+</button>
-          </div>
-        </div>
-
-        <div class="canvas-panel">
-          <div class="canvas-stage bg-checker" id="canvasContainer">
-            <div class="canvas-viewport" id="canvasViewport">
-              <div class="canvas-inner" id="canvasInner">
-                <canvas id="cv" width="1000" height="1000"></canvas>
-              </div>
-            </div>
-
-            <div class="processing-overlay" id="processingOverlay">
-              <div class="spinner"></div>
-              <div class="overlay-title" id="overlayTitle">Preparing your logo…</div>
-              <div class="overlay-sub" id="overlaySub">This usually takes 5–10 seconds.</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="swatch-rail">
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn checker active tip-target" id="bgChecker" data-tip="Grid shows transparency best."></button>
-            <div class="swatch-label">Grid</div>
-          </div>
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn white tip-target" id="bgWhite" data-tip="White helps you spot missing white details."></button>
-            <div class="swatch-label">White</div>
-          </div>
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <button class="swatch-btn dark tip-target" id="bgDark" data-tip="Dark helps you spot halos and haze."></button>
-            <div class="swatch-label">Dark</div>
-          </div>
+    <div class="preview-wrap" id="previewWrap">
+      <div class="preview-stage bg-checker" id="previewStage">
+        <img id="previewImg" alt="Processed preview" />
+        <div class="processing-overlay" id="processingOverlay">
+          <div class="spinner"></div>
+          <div class="overlay-title" id="overlayTitle">Preparing your image…</div>
+          <div class="overlay-sub" id="overlaySub">This usually takes a few seconds.</div>
         </div>
       </div>
 
-      <div class="controls-shell">
-        <div class="review-controls" id="reviewControls">
-          <div class="review-actions">
-            <button class="review-btn primary" id="btnApprove">Done</button>
-            <button class="review-btn" id="btnEnterEdit">Edit</button>
-          </div>
-        </div>
-
-        <div class="editor-controls" id="editorControls">
-          <div class="mobile-editor-note" id="mobileEditorNote">
-            Quick mobile fix mode: you can use Magic Remove or Magic Restore here. For finer edits and full tools, open this on a desktop or laptop.
-          </div>
-
-          <div class="mobile-magic-controls" id="mobileMagicControls">
-            <button class="mobile-magic-btn active" id="btnMagicRemoveOnlyMobile">Magic Remove</button>
-            <button class="mobile-magic-btn" id="btnMagicRestoreOnlyMobile">Magic Restore</button>
-            <button class="mobile-magic-btn" id="btnUndoMobile">Undo</button>
-          </div>
-
-          <div class="desktop-edit-controls" id="desktopEditControls">
-            <div class="tool-row">
-              <div class="tool-segment">
-                <button class="tool-btn active tip-target" id="btnRestoreMobile" data-tip="Restore paints the saved restore mask back in.">Restore</button>
-                <button class="tool-btn tip-target" id="btnEraseMobile" data-tip="Erase removes parts manually.">Erase</button>
-                <button class="tool-btn tip-target" id="btnMagicMobile" data-tip="Magic removes or restores one connected area.">Magic</button>
-                <button class="tool-btn tip-target" id="btnPanMobile" data-tip="Pan lets you move around while zoomed in.">Pan</button>
-              </div>
-            </div>
-
-            <div class="utility-row">
-              <div class="utility-pill">
-                <span>Brush</span>
-                <input type="range" id="brushSize" min="8" max="140" value="44">
-              </div>
-
-              <div class="zoom-pill">
-                <button class="zoom-btn" id="zoomOut" type="button">−</button>
-                <span class="zoom-readout" id="zoomReadout">100%</span>
-                <input class="zoom-range" type="range" id="zoomSlider" min="100" max="600" step="10" value="100">
-                <button class="zoom-btn" id="zoomIn" type="button">+</button>
-              </div>
-
-              <div class="utility-actions">
-                <button class="ghost-btn tip-target" id="btnFit" data-tip="Fit puts the logo back to centered view.">Fit</button>
-                <button class="ghost-btn tip-target" id="btnUndo" data-tip="Undo your last edit.">Undo</button>
-                <button class="ghost-btn tip-target" id="btnRestart" data-tip="Reset reloads the last saved version.">Reset</button>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="status-row" id="statusline"></div>
+      <div class="preview-actions">
+        <button class="ghost-btn active" id="bgChecker">Grid</button>
+        <button class="ghost-btn" id="bgWhite">White</button>
+        <button class="ghost-btn" id="bgDark">Dark</button>
       </div>
+
+      <div class="status-row" id="previewStatus"></div>
     </div>
   </div>
 
@@ -2263,891 +1308,57 @@ def ui(
   const API_BASE = window.location.origin;
 
   let sessionId = null;
-  let mode = 'restore';
-  let magicMode = 'remove';
-  let isDown = false;
-  let lastX = 0;
-  let lastY = 0;
-  let history = [];
-  let aiReady = false;
   let stageCycleTimer = null;
   let qualityFlags = [];
-  let hintTimer = null;
-  let introBannerTimer = null;
-  let editorUnlocked = false;
-
-  let viewScale = 1;
-  let panX = 0;
-  let panY = 0;
-  let isPanning = false;
-  let panStartX = 0;
-  let panStartY = 0;
-  let startPanX = 0;
-  let startPanY = 0;
 
   const fileEl = document.getElementById('file');
   const keepOriginalEl = document.getElementById('keepOriginal');
 
-  const step1 = document.getElementById('step1');
-  const step3 = document.getElementById('step3');
-
-  const cv = document.getElementById('cv');
-  const ctx = cv.getContext('2d', { willReadFrequently: true });
-
-  const baseCanvas = document.createElement('canvas');
-  baseCanvas.width = 1000;
-  baseCanvas.height = 1000;
-  const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
-
-  const maskCanvas = document.createElement('canvas');
-  maskCanvas.width = 1000;
-  maskCanvas.height = 1000;
-  const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
-
-  const restoreMaskCanvas = document.createElement('canvas');
-  restoreMaskCanvas.width = 1000;
-  restoreMaskCanvas.height = 1000;
-  const restoreMaskCtx = restoreMaskCanvas.getContext('2d', { willReadFrequently: true });
-
-  const seedMaskCanvas = document.createElement('canvas');
-  seedMaskCanvas.width = 1000;
-  seedMaskCanvas.height = 1000;
-  const seedMaskCtx = seedMaskCanvas.getContext('2d', { willReadFrequently: true });
-
-  const restoreSrcCanvas = document.createElement('canvas');
-  restoreSrcCanvas.width = 1000;
-  restoreSrcCanvas.height = 1000;
-  const restoreSrcCtx = restoreSrcCanvas.getContext('2d', { willReadFrequently: true });
-
-  const offCanvas = document.createElement('canvas');
-  offCanvas.width = 1000;
-  offCanvas.height = 1000;
-  const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
-
-  const tmpCanvas = document.createElement('canvas');
-  tmpCanvas.width = 1000;
-  tmpCanvas.height = 1000;
-  const tmpCtx = tmpCanvas.getContext('2d', { willReadFrequently: true });
-
-  const baseImg = new Image();
-  const maskImg = new Image();
-  const restoreMaskImg = new Image();
-  const seedMaskImg = new Image();
-  const restoreSrcImg = new Image();
+  const uploadShell = document.getElementById('uploadShell');
+  const previewWrap = document.getElementById('previewWrap');
+  const previewStage = document.getElementById('previewStage');
+  const previewImg = document.getElementById('previewImg');
 
   const btnDone = document.getElementById('btnDone');
-  const btnApprove = document.getElementById('btnApprove');
-  const btnEnterEdit = document.getElementById('btnEnterEdit');
+  const uploadStatus = document.getElementById('uploadStatus');
+  const previewStatus = document.getElementById('previewStatus');
 
-  const reviewControls = document.getElementById('reviewControls');
-  const editorControls = document.getElementById('editorControls');
-  const desktopToolRail = document.getElementById('desktopToolRail');
-  const mobileEditorNote = document.getElementById('mobileEditorNote');
-  const mobileMagicControls = document.getElementById('mobileMagicControls');
-  const desktopEditControls = document.getElementById('desktopEditControls');
-
-  const btnErase = document.getElementById('btnErase');
-  const btnRestore = document.getElementById('btnRestore');
-  const btnMagic = document.getElementById('btnMagic');
-  const btnPan = document.getElementById('btnPan');
-
-  const btnEraseMobile = document.getElementById('btnEraseMobile');
-  const btnRestoreMobile = document.getElementById('btnRestoreMobile');
-  const btnMagicMobile = document.getElementById('btnMagicMobile');
-  const btnPanMobile = document.getElementById('btnPanMobile');
-
-  const btnMagicRemoveOnlyMobile = document.getElementById('btnMagicRemoveOnlyMobile');
-  const btnMagicRestoreOnlyMobile = document.getElementById('btnMagicRestoreOnlyMobile');
-  const btnUndoMobile = document.getElementById('btnUndoMobile');
-
-  const brushSlider = document.getElementById('brushSize');
-
-  const magicModeWrapDesktop = document.getElementById('magicModeWrapDesktop');
-  const magicRemoveModeDesktop = document.getElementById('magicRemoveModeDesktop');
-  const magicRestoreModeDesktop = document.getElementById('magicRestoreModeDesktop');
-
-  const cursor = document.getElementById('cursor');
-  const cursorDot = document.getElementById('cursorDot');
-
-  const canvasContainer = document.getElementById('canvasContainer');
-  const canvasViewport = document.getElementById('canvasViewport');
-  const canvasInner = document.getElementById('canvasInner');
   const processingOverlay = document.getElementById('processingOverlay');
   const overlayTitle = document.getElementById('overlayTitle');
   const overlaySub = document.getElementById('overlaySub');
 
-  const statusline = document.getElementById('statusline');
-  const statusline1 = document.getElementById('statusline1');
-
-  const hintBanner = document.getElementById('hintBanner');
-  const hintPop = document.getElementById('hintPop');
-
   const bgChecker = document.getElementById('bgChecker');
   const bgWhite = document.getElementById('bgWhite');
   const bgDark = document.getElementById('bgDark');
-
-  const zoomSlider = document.getElementById('zoomSlider');
-  const zoomReadout = document.getElementById('zoomReadout');
-  const zoomIn = document.getElementById('zoomIn');
-  const zoomOut = document.getElementById('zoomOut');
-  const btnFit = document.getElementById('btnFit');
-  const slotPill = document.getElementById('slotPill');
 
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
   const RETURN_TO = params.get('return_to') || '';
   const EXISTING_SESSION_ID = (params.get('session_id') || '').trim();
 
-  slotPill.textContent = SLOT;
+  document.getElementById('slotPill').textContent = SLOT;
 
   const STAGE_LABELS = {
     queued: "Uploading image…",
-    processing: "Preparing your logo…",
+    loading_image: "Loading image…",
+    using_original: "Using original image…",
     removing_background: "Removing background…",
     cleaning_edges: "Cleaning edges…",
     checking_quality: "Checking quality…",
-    finishing_details: "Finishing details…",
-    ready: "AI cutout ready ✓",
-    failed: "AI cutout failed — edit original instead."
+    trimming: "Trimming spacing…",
+    upscaling: "Upscaling image…",
+    building_final: "Building final image…",
+    ready: "Ready ✓",
+    failed: "Processing failed"
   };
 
   const CYCLE_MESSAGES = [
     "Uploading image…",
     "Removing background…",
     "Cleaning edges…",
-    "Checking quality…",
-    "Finishing details…"
+    "Upscaling image…",
+    "Building final image…"
   ];
-
-  fileEl.addEventListener('click', () => { fileEl.value = ""; });
-
-  function clamp(value, min, max) {
-    return Math.min(max, Math.max(min, value));
-  }
-
-  function isMobile() {
-    return window.innerWidth <= 640;
-  }
-
-  function isTabletOrMobile() {
-    return window.innerWidth <= 980;
-  }
-
-  function setCanvasCursor(cursorValue) {
-    cv.style.cursor = cursorValue;
-    canvasViewport.style.cursor = cursorValue;
-    canvasInner.style.cursor = cursorValue;
-  }
-
-  function syncTopDoneButton() {
-    btnDone.style.display = 'inline-flex';
-    btnDone.textContent = 'Done';
-  }
-
-  function clearEditorCanvases() {
-    baseCtx.clearRect(0, 0, 1000, 1000);
-    maskCtx.clearRect(0, 0, 1000, 1000);
-    restoreMaskCtx.clearRect(0, 0, 1000, 1000);
-    seedMaskCtx.clearRect(0, 0, 1000, 1000);
-    restoreSrcCtx.clearRect(0, 0, 1000, 1000);
-    ctx.clearRect(0, 0, 1000, 1000);
-  }
-
-  function enterReviewMode() {
-    editorUnlocked = false;
-    step3.classList.remove('edit-mode');
-    step3.classList.add('review-mode');
-    reviewControls.style.display = 'grid';
-    editorControls.classList.remove('show');
-    desktopToolRail.style.display = !isTabletOrMobile() ? 'flex' : 'none';
-    mobileEditorNote.classList.remove('show');
-    mobileMagicControls.classList.remove('show');
-    fitView();
-    setCanvasCursor('default');
-    showBanner("Review your image first. If it looks good, hit Done. If not, tap Edit.", 4);
-  }
-
-  function enterEditMode() {
-    editorUnlocked = true;
-    step3.classList.remove('review-mode');
-    step3.classList.add('edit-mode');
-    reviewControls.style.display = 'none';
-    editorControls.classList.add('show');
-
-    if (isMobile()) {
-      desktopToolRail.style.display = 'none';
-      mobileEditorNote.classList.add('show');
-      mobileMagicControls.classList.add('show');
-      desktopEditControls.style.display = 'none';
-      mode = 'magic';
-      magicMode = 'remove';
-      updateMobileMagicOnlyUI();
-      setCanvasCursor('crosshair');
-      renderFromMask();
-      showBanner("Quick mobile fix mode enabled. Desktop or laptop gives you finer editing.", 5);
-      return;
-    }
-
-    mobileEditorNote.classList.remove('show');
-    mobileMagicControls.classList.remove('show');
-    desktopEditControls.style.display = 'grid';
-
-    if (!isTabletOrMobile()) {
-      desktopToolRail.style.display = 'flex';
-    } else {
-      desktopToolRail.style.display = 'none';
-    }
-
-    updateMagicModeUI();
-    updateCursorSize();
-    renderFromMask();
-    showBanner("Editor unlocked. Make any fixes, then hit Done.", 4);
-  }
-
-  function updateViewportTransform() {
-    canvasInner.style.transform = `translate(${panX}px, ${panY}px) scale(${viewScale})`;
-    zoomSlider.value = Math.round(viewScale * 100);
-    zoomReadout.textContent = `${Math.round(viewScale * 100)}%`;
-    updateCursorSize();
-  }
-
-  function fitView() {
-    viewScale = 1;
-    panX = 0;
-    panY = 0;
-    updateViewportTransform();
-  }
-
-  function setZoom(nextScale) {
-    const oldScale = viewScale;
-    viewScale = clamp(nextScale, 1, 6);
-
-    if (oldScale === viewScale) {
-      updateViewportTransform();
-      return;
-    }
-
-    const stageRect = canvasViewport.getBoundingClientRect();
-    const maxPanX = ((viewScale - 1) * stageRect.width) / 2;
-    const maxPanY = ((viewScale - 1) * stageRect.height) / 2;
-
-    panX = clamp(panX, -maxPanX, maxPanX);
-    panY = clamp(panY, -maxPanY, maxPanY);
-
-    updateViewportTransform();
-  }
-
-  zoomIn.addEventListener('click', () => {
-    if (!editorUnlocked || isMobile()) return;
-    setZoom(viewScale + 0.25);
-  });
-
-  zoomOut.addEventListener('click', () => {
-    if (!editorUnlocked || isMobile()) return;
-    setZoom(viewScale - 0.25);
-  });
-
-  zoomSlider.addEventListener('input', () => {
-    if (!editorUnlocked || isMobile()) {
-      fitView();
-      return;
-    }
-    setZoom(parseInt(zoomSlider.value, 10) / 100);
-  });
-
-  btnFit.addEventListener('click', () => {
-    if (!editorUnlocked || isMobile()) return;
-    fitView();
-  });
-
-  canvasViewport.addEventListener('wheel', (e) => {
-    if (!editorUnlocked || isMobile()) return;
-    e.preventDefault();
-    const delta = e.deltaY < 0 ? 0.15 : -0.15;
-    setZoom(viewScale + delta);
-  }, { passive: false });
-
-  function setBgMode(mode) {
-    canvasContainer.classList.remove('bg-checker', 'bg-white', 'bg-dark');
-    bgChecker.classList.remove('active');
-    bgWhite.classList.remove('active');
-    bgDark.classList.remove('active');
-
-    if (mode === 'checker') {
-      canvasContainer.classList.add('bg-checker');
-      bgChecker.classList.add('active');
-    } else if (mode === 'white') {
-      canvasContainer.classList.add('bg-white');
-      bgWhite.classList.add('active');
-    } else if (mode === 'dark') {
-      canvasContainer.classList.add('bg-dark');
-      bgDark.classList.add('active');
-    }
-  }
-
-  bgChecker.addEventListener('click', () => setBgMode('checker'));
-  bgWhite.addEventListener('click', () => setBgMode('white'));
-  bgDark.addEventListener('click', () => setBgMode('dark'));
-
-  function showOverlay(title, sub = "This usually takes 5–10 seconds.") {
-    processingOverlay.classList.add('show');
-    overlayTitle.textContent = title || "Preparing your logo…";
-    overlaySub.textContent = sub;
-  }
-
-  function hideOverlay() {
-    processingOverlay.classList.remove('show');
-  }
-
-  function startStageCycle() {
-    stopStageCycle();
-    let i = 0;
-    showOverlay(CYCLE_MESSAGES[0]);
-    stageCycleTimer = setInterval(() => {
-      if (aiReady) return;
-      i = (i + 1) % CYCLE_MESSAGES.length;
-      overlayTitle.textContent = CYCLE_MESSAGES[i];
-    }, 5000);
-  }
-
-  function stopStageCycle() {
-    if (stageCycleTimer) {
-      clearInterval(stageCycleTimer);
-      stageCycleTimer = null;
-    }
-  }
-
-  function setMaskFromImageData(imgData) {
-    maskCtx.putImageData(imgData, 0, 0);
-    renderFromMask();
-  }
-
-  function saveState() {
-    if (history.length > 20) history.shift();
-    history.push(maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height));
-  }
-
-  document.getElementById('btnUndo').addEventListener('click', () => {
-    if (!editorUnlocked || isMobile()) return;
-    if (history.length > 0) setMaskFromImageData(history.pop());
-  });
-
-  btnUndoMobile.addEventListener('click', () => {
-    if (history.length > 0) setMaskFromImageData(history.pop());
-  });
-
-  document.getElementById('btnRestart').addEventListener('click', async () => {
-    if (!editorUnlocked || isMobile()) return;
-    if (sessionId) {
-      await loadExistingSession(sessionId, false);
-      enterEditMode();
-    } else {
-      location.reload();
-    }
-  });
-
-  function updateCursorSize() {
-    if (!editorUnlocked) {
-      cursor.style.display = 'none';
-      cursorDot.style.display = 'none';
-      setCanvasCursor('default');
-      return;
-    }
-
-    if (isMobile()) {
-      cursor.style.display = 'none';
-      cursorDot.style.display = 'none';
-      setCanvasCursor('crosshair');
-      return;
-    }
-
-    if (mode === 'magic') {
-      cursor.style.display = 'none';
-      cursorDot.style.display = 'none';
-      setCanvasCursor('crosshair');
-      return;
-    }
-
-    if (mode === 'pan') {
-      cursor.style.display = 'none';
-      cursorDot.style.display = 'none';
-      setCanvasCursor('grab');
-      return;
-    }
-
-    const rect = cv.getBoundingClientRect();
-    const ratio = rect.width / 1000;
-    const visualSize = brushSlider.value * ratio;
-    cursor.style.width = visualSize + 'px';
-    cursor.style.height = visualSize + 'px';
-    setCanvasCursor('none');
-  }
-
-  brushSlider.addEventListener('input', updateCursorSize);
-
-  canvasContainer.addEventListener('mousemove', (e) => {
-    if (!editorUnlocked || isMobile()) return;
-    if (mode !== 'magic' && mode !== 'pan') {
-      cursor.style.display = 'block';
-      cursorDot.style.display = 'block';
-      cursor.style.left = e.clientX + 'px';
-      cursor.style.top = e.clientY + 'px';
-      cursorDot.style.left = e.clientX + 'px';
-      cursorDot.style.top = e.clientY + 'px';
-    }
-  });
-
-  canvasContainer.addEventListener('mouseleave', () => {
-    cursor.style.display = 'none';
-    cursorDot.style.display = 'none';
-  });
-
-  function getCoords(evt) {
-    const rect = cv.getBoundingClientRect();
-    const clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
-    const clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
-    return {
-      x: ((clientX - rect.left) / rect.width) * cv.width,
-      y: ((clientY - rect.top) / rect.height) * cv.height
-    };
-  }
-
-  function renderFromMask() {
-    const base = baseCtx.getImageData(0, 0, 1000, 1000).data;
-    const current = maskCtx.getImageData(0, 0, 1000, 1000).data;
-    const seed = seedMaskCtx.getImageData(0, 0, 1000, 1000).data;
-    const restoreSrc = restoreSrcCtx.getImageData(0, 0, 1000, 1000).data;
-
-    const out = ctx.createImageData(1000, 1000);
-    const od = out.data;
-
-    for (let i = 0; i < base.length; i += 4) {
-      const currA = current[i + 3];
-      const seedA = seed[i + 3];
-
-      if (currA <= 0) {
-        od[i] = 0;
-        od[i + 1] = 0;
-        od[i + 2] = 0;
-        od[i + 3] = 0;
-        continue;
-      }
-
-      const baseW = Math.min(currA, seedA);
-      const extraW = Math.max(0, currA - seedA);
-      const denom = Math.max(currA, 1);
-
-      od[i] = Math.round(((base[i] * baseW) + (restoreSrc[i] * extraW)) / denom);
-      od[i + 1] = Math.round(((base[i + 1] * baseW) + (restoreSrc[i + 1] * extraW)) / denom);
-      od[i + 2] = Math.round(((base[i + 2] * baseW) + (restoreSrc[i + 2] * extraW)) / denom);
-      od[i + 3] = currA;
-    }
-
-    ctx.putImageData(out, 0, 0);
-  }
-
-  function colorDistance(data, pos, r, g, b) {
-    return Math.abs(data[pos] - r) + Math.abs(data[pos + 1] - g) + Math.abs(data[pos + 2] - b);
-  }
-
-  function magicRemove(startX, startY) {
-    startX = Math.floor(startX);
-    startY = Math.floor(startY);
-
-    const base = baseCtx.getImageData(0, 0, 1000, 1000);
-    const mask = maskCtx.getImageData(0, 0, 1000, 1000);
-
-    const bd = base.data;
-    const md = mask.data;
-    const w = 1000;
-    const h = 1000;
-
-    const startPos = (startY * w + startX) * 4;
-    if (md[startPos + 3] === 0) return;
-
-    const sr = bd[startPos];
-    const sg = bd[startPos + 1];
-    const sb = bd[startPos + 2];
-
-    const stack = [startX, startY];
-    const seen = new Uint8Array(w * h);
-    seen[startY * w + startX] = 1;
-
-    const tolerance = 72;
-
-    while (stack.length) {
-      const y = stack.pop();
-      const x = stack.pop();
-      const idx = y * w + x;
-      const pos = idx * 4;
-
-      md[pos + 3] = 0;
-
-      const nbs = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
-      for (let i = 0; i < nbs.length; i++) {
-        const nx = nbs[i][0];
-        const ny = nbs[i][1];
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          const nIdx = ny * w + nx;
-          if (!seen[nIdx]) {
-            seen[nIdx] = 1;
-            const p2 = nIdx * 4;
-            if (md[p2 + 3] > 0) {
-              const dist = colorDistance(bd, p2, sr, sg, sb);
-              if (dist <= tolerance) stack.push(nx, ny);
-            }
-          }
-        }
-      }
-    }
-
-    maskCtx.putImageData(mask, 0, 0);
-    renderFromMask();
-  }
-
-  function magicRestore(startX, startY) {
-    startX = Math.floor(startX);
-    startY = Math.floor(startY);
-
-    const currentMask = maskCtx.getImageData(0, 0, 1000, 1000);
-    const restoreMask = restoreMaskCtx.getImageData(0, 0, 1000, 1000);
-
-    const md = currentMask.data;
-    const rd = restoreMask.data;
-
-    const w = 1000;
-    const h = 1000;
-
-    const startIdx = startY * w + startX;
-    const startPos = startIdx * 4;
-
-    const startDeficit = rd[startPos + 3] - md[startPos + 3];
-    if (startDeficit <= 6) return;
-
-    const deficit = new Uint8Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-      const p = i * 4;
-      const d = rd[p + 3] - md[p + 3];
-      deficit[i] = d > 6 ? 1 : 0;
-    }
-
-    const seen = new Uint8Array(w * h);
-    const region = new Uint8Array(w * h);
-    const stack = [startX, startY];
-    seen[startIdx] = 1;
-
-    while (stack.length) {
-      const y = stack.pop();
-      const x = stack.pop();
-      const idx = y * w + x;
-
-      if (!deficit[idx]) continue;
-      region[idx] = 1;
-
-      const nbs = [
-        [x - 1, y],
-        [x + 1, y],
-        [x, y - 1],
-        [x, y + 1],
-      ];
-
-      for (let i = 0; i < nbs.length; i++) {
-        const nx = nbs[i][0];
-        const ny = nbs[i][1];
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-          const nIdx = ny * w + nx;
-          if (!seen[nIdx]) {
-            seen[nIdx] = 1;
-            if (deficit[nIdx]) {
-              stack.push(nx, ny);
-            }
-          }
-        }
-      }
-    }
-
-    const regionCanvas = document.createElement('canvas');
-    regionCanvas.width = w;
-    regionCanvas.height = h;
-    const regionCtx = regionCanvas.getContext('2d', { willReadFrequently: true });
-
-    const regionImg = regionCtx.createImageData(w, h);
-    const regionData = regionImg.data;
-
-    for (let i = 0; i < region.length; i++) {
-      const p = i * 4;
-      const a = region[i] ? 255 : 0;
-      regionData[p] = 255;
-      regionData[p + 1] = 255;
-      regionData[p + 2] = 255;
-      regionData[p + 3] = a;
-    }
-
-    regionCtx.putImageData(regionImg, 0, 0);
-
-    const featherCanvas = document.createElement('canvas');
-    featherCanvas.width = w;
-    featherCanvas.height = h;
-    const fCtx = featherCanvas.getContext('2d', { willReadFrequently: true });
-
-    fCtx.drawImage(regionCanvas, -1, 0);
-    fCtx.drawImage(regionCanvas, 1, 0);
-    fCtx.drawImage(regionCanvas, 0, -1);
-    fCtx.drawImage(regionCanvas, 0, 1);
-    fCtx.drawImage(regionCanvas, 0, 0);
-
-    fCtx.filter = 'blur(1.2px)';
-    fCtx.drawImage(featherCanvas, 0, 0);
-    fCtx.filter = 'none';
-
-    const feather = fCtx.getImageData(0, 0, w, h).data;
-
-    for (let i = 0; i < w * h; i++) {
-      const p = i * 4;
-      const blend = feather[p + 3] / 255;
-      if (blend <= 0.02) continue;
-
-      const restoreAlpha = rd[p + 3];
-      const currentAlpha = md[p + 3];
-      if (restoreAlpha <= currentAlpha) continue;
-
-      const targetAlpha = Math.round(currentAlpha + ((restoreAlpha - currentAlpha) * blend));
-      if (targetAlpha > md[p + 3]) {
-        md[p + 3] = targetAlpha;
-      }
-    }
-
-    maskCtx.putImageData(currentMask, 0, 0);
-    renderFromMask();
-  }
-
-  function drawBrushMask(x, y) {
-    const bSize = parseInt(brushSlider.value, 10);
-
-    offCtx.clearRect(0, 0, 1000, 1000);
-    offCtx.globalCompositeOperation = 'source-over';
-    offCtx.lineWidth = bSize;
-    offCtx.lineCap = 'round';
-    offCtx.lineJoin = 'round';
-    offCtx.strokeStyle = 'rgba(255,255,255,1)';
-    offCtx.beginPath();
-    offCtx.moveTo(lastX, lastY);
-    offCtx.lineTo(x, y);
-    offCtx.stroke();
-
-    if (mode === 'remove') {
-      maskCtx.globalCompositeOperation = 'destination-out';
-      maskCtx.drawImage(offCanvas, 0, 0);
-      maskCtx.globalCompositeOperation = 'source-over';
-    } else if (mode === 'restore') {
-      tmpCtx.clearRect(0, 0, 1000, 1000);
-      tmpCtx.globalCompositeOperation = 'source-over';
-      tmpCtx.drawImage(restoreMaskCanvas, 0, 0);
-      tmpCtx.globalCompositeOperation = 'destination-in';
-      tmpCtx.drawImage(offCanvas, 0, 0);
-      tmpCtx.globalCompositeOperation = 'source-over';
-
-      maskCtx.globalCompositeOperation = 'source-over';
-      maskCtx.drawImage(tmpCanvas, 0, 0);
-    }
-
-    lastX = x;
-    lastY = y;
-    renderFromMask();
-  }
-
-  function updateMagicModeUI() {
-    magicRemoveModeDesktop.classList.toggle('active', magicMode === 'remove');
-    magicRestoreModeDesktop.classList.toggle('active', magicMode === 'restore');
-  }
-
-  function updateMobileMagicOnlyUI() {
-    btnMagicRemoveOnlyMobile.classList.toggle('active', magicMode === 'remove');
-    btnMagicRestoreOnlyMobile.classList.toggle('active', magicMode === 'restore');
-  }
-
-  function setMode(m) {
-    if (!editorUnlocked || isMobile()) return;
-
-    mode = m;
-
-    [
-      btnErase, btnRestore, btnMagic, btnPan,
-      btnEraseMobile, btnRestoreMobile, btnMagicMobile, btnPanMobile
-    ].forEach(btn => btn.classList.remove('active'));
-
-    if (mode === 'remove') {
-      btnErase.classList.add('active');
-      btnEraseMobile.classList.add('active');
-    } else if (mode === 'restore') {
-      btnRestore.classList.add('active');
-      btnRestoreMobile.classList.add('active');
-    } else if (mode === 'magic') {
-      btnMagic.classList.add('active');
-      btnMagicMobile.classList.add('active');
-    } else if (mode === 'pan') {
-      btnPan.classList.add('active');
-      btnPanMobile.classList.add('active');
-    }
-
-    if (mode === 'magic') {
-      magicModeWrapDesktop.classList.add('show');
-    } else {
-      magicModeWrapDesktop.classList.remove('show');
-    }
-
-    updateMagicModeUI();
-    updateCursorSize();
-  }
-
-  magicRemoveModeDesktop.addEventListener('click', () => {
-    magicMode = 'remove';
-    updateMagicModeUI();
-  });
-
-  magicRestoreModeDesktop.addEventListener('click', () => {
-    magicMode = 'restore';
-    updateMagicModeUI();
-  });
-
-  btnMagicRemoveOnlyMobile.addEventListener('click', () => {
-    magicMode = 'remove';
-    mode = 'magic';
-    updateMobileMagicOnlyUI();
-    updateCursorSize();
-  });
-
-  btnMagicRestoreOnlyMobile.addEventListener('click', () => {
-    magicMode = 'restore';
-    mode = 'magic';
-    updateMobileMagicOnlyUI();
-    updateCursorSize();
-  });
-
-  btnErase.addEventListener('click', () => setMode('remove'));
-  btnRestore.addEventListener('click', () => setMode('restore'));
-  btnMagic.addEventListener('click', () => setMode('magic'));
-  btnPan.addEventListener('click', () => setMode('pan'));
-
-  btnEraseMobile.addEventListener('click', () => setMode('remove'));
-  btnRestoreMobile.addEventListener('click', () => setMode('restore'));
-  btnMagicMobile.addEventListener('click', () => setMode('magic'));
-  btnPanMobile.addEventListener('click', () => setMode('pan'));
-
-  btnEnterEdit.addEventListener('click', () => {
-    enterEditMode();
-  });
-
-  btnApprove.addEventListener('click', async () => {
-    btnDone.click();
-  });
-
-  function beginPan(evt) {
-    isPanning = true;
-    const pointX = evt.touches ? evt.touches[0].clientX : evt.clientX;
-    const pointY = evt.touches ? evt.touches[0].clientY : evt.clientY;
-    panStartX = pointX;
-    panStartY = pointY;
-    startPanX = panX;
-    startPanY = panY;
-    setCanvasCursor('grabbing');
-  }
-
-  function movePan(evt) {
-    if (!isPanning) return;
-
-    const pointX = evt.touches ? evt.touches[0].clientX : evt.clientX;
-    const pointY = evt.touches ? evt.touches[0].clientY : evt.clientY;
-    const dx = pointX - panStartX;
-    const dy = pointY - panStartY;
-
-    const stageRect = canvasViewport.getBoundingClientRect();
-    const maxPanX = ((viewScale - 1) * stageRect.width) / 2;
-    const maxPanY = ((viewScale - 1) * stageRect.height) / 2;
-
-    panX = clamp(startPanX + dx, -maxPanX, maxPanX);
-    panY = clamp(startPanY + dy, -maxPanY, maxPanY);
-    updateViewportTransform();
-
-    if (evt.cancelable) evt.preventDefault();
-  }
-
-  function endPan() {
-    isPanning = false;
-    if (mode === 'pan') setCanvasCursor('grab');
-  }
-
-  function startDraw(e) {
-    if (!editorUnlocked) return;
-    if (!aiReady && !keepOriginalEl.checked) return;
-
-    saveState();
-
-    if (!isMobile() && mode === 'pan') {
-      beginPan(e);
-      if (e.cancelable) e.preventDefault();
-      return;
-    }
-
-    const c = getCoords(e);
-
-    if (mode === 'magic' || isMobile()) {
-      if (magicMode === 'remove') {
-        magicRemove(c.x, c.y);
-      } else {
-        magicRestore(c.x, c.y);
-      }
-      isDown = false;
-      if (e.cancelable) e.preventDefault();
-      return;
-    }
-
-    isDown = true;
-    lastX = c.x;
-    lastY = c.y;
-    drawBrushMask(c.x, c.y);
-
-    if (e.cancelable) e.preventDefault();
-  }
-
-  function moveDraw(e) {
-    if (!editorUnlocked) return;
-    if (isMobile()) return;
-
-    if (mode === 'pan') {
-      movePan(e);
-      return;
-    }
-
-    if (!isDown || mode === 'magic') return;
-
-    const c = getCoords(e);
-    drawBrushMask(c.x, c.y);
-
-    if (e.touches) {
-      cursor.style.display = 'block';
-      cursorDot.style.display = 'block';
-      cursor.style.left = e.touches[0].clientX + 'px';
-      cursor.style.top = e.touches[0].clientY + 'px';
-      cursorDot.style.left = e.touches[0].clientX + 'px';
-      cursorDot.style.top = e.touches[0].clientY + 'px';
-    }
-
-    if (e.cancelable) e.preventDefault();
-  }
-
-  function endDraw() {
-    isDown = false;
-    endPan();
-  }
-
-  cv.addEventListener('mousedown', startDraw);
-  cv.addEventListener('mousemove', moveDraw);
-  window.addEventListener('mouseup', endDraw);
-
-  cv.addEventListener('touchstart', startDraw, { passive: false });
-  cv.addEventListener('touchmove', moveDraw, { passive: false });
-  window.addEventListener('touchend', endDraw);
 
   function notifyDone(payload) {
     try {
@@ -3165,126 +1376,117 @@ def ui(
     return false;
   }
 
+  function setBgMode(mode) {
+    previewStage.classList.remove('bg-checker', 'bg-white', 'bg-dark');
+    bgChecker.classList.remove('active');
+    bgWhite.classList.remove('active');
+    bgDark.classList.remove('active');
+
+    if (mode === 'checker') {
+      previewStage.classList.add('bg-checker');
+      bgChecker.classList.add('active');
+    } else if (mode === 'white') {
+      previewStage.classList.add('bg-white');
+      bgWhite.classList.add('active');
+    } else if (mode === 'dark') {
+      previewStage.classList.add('bg-dark');
+      bgDark.classList.add('active');
+    }
+  }
+
+  bgChecker.addEventListener('click', () => setBgMode('checker'));
+  bgWhite.addEventListener('click', () => setBgMode('white'));
+  bgDark.addEventListener('click', () => setBgMode('dark'));
+
+  function showOverlay(title, sub = "This usually takes a few seconds.") {
+    processingOverlay.classList.add('show');
+    overlayTitle.textContent = title || "Preparing your image…";
+    overlaySub.textContent = sub;
+  }
+
+  function hideOverlay() {
+    processingOverlay.classList.remove('show');
+  }
+
+  function startStageCycle() {
+    stopStageCycle();
+    let i = 0;
+    showOverlay(CYCLE_MESSAGES[0]);
+    stageCycleTimer = setInterval(() => {
+      i = (i + 1) % CYCLE_MESSAGES.length;
+      overlayTitle.textContent = CYCLE_MESSAGES[i];
+    }, 5000);
+  }
+
+  function stopStageCycle() {
+    if (stageCycleTimer) {
+      clearInterval(stageCycleTimer);
+      stageCycleTimer = null;
+    }
+  }
+
   function renderQualityFlags(flags) {
     qualityFlags = Array.isArray(flags) ? flags : [];
     const warnings = [];
 
     if (qualityFlags.includes("possible_matte_box")) warnings.push("Possible edge artifact detected");
-    if (qualityFlags.includes("heavy_soft_edges")) warnings.push("Soft edges detected — review if needed");
-    if (qualityFlags.includes("subject_too_small")) warnings.push("Logo looks small — review spacing");
+    if (qualityFlags.includes("heavy_soft_edges")) warnings.push("Soft edges detected");
+    if (qualityFlags.includes("subject_too_small")) warnings.push("Logo looks small");
 
     if (warnings.length) {
-      statusline.innerHTML = warnings.map(w => `<span class="warn-badge">⚠ ${w}</span>`).join(" ");
+      previewStatus.innerHTML = warnings.map(w => `<span class="warn-badge">⚠ ${w}</span>`).join(" ");
     } else {
-      statusline.textContent = "AI cutout ready ✓";
+      previewStatus.textContent = "Image ready ✓";
     }
   }
 
-  function showBanner(message, seconds = 5) {
-    hintBanner.textContent = message;
-    hintBanner.classList.add('show');
-    if (introBannerTimer) clearTimeout(introBannerTimer);
-    introBannerTimer = setTimeout(() => {
-      hintBanner.classList.remove('show');
-    }, seconds * 1000);
-  }
-
-  function hideHintPop() {
-    hintPop.classList.remove('show');
-  }
-
-  function showHintPop(target, text, seconds = 5) {
-    if (!text) return;
-    hintPop.textContent = text;
-    const rect = target.getBoundingClientRect();
-    const popW = 230;
-    const x = Math.max(10, Math.min(window.innerWidth - popW - 10, rect.left + (rect.width / 2) - (popW / 2)));
-    const y = rect.top - 62 > 10 ? rect.top - 62 : rect.bottom + 10;
-
-    hintPop.style.left = x + 'px';
-    hintPop.style.top = y + 'px';
-    hintPop.classList.add('show');
-
-    if (hintTimer) clearTimeout(hintTimer);
-    hintTimer = setTimeout(() => {
-      hideHintPop();
-    }, seconds * 1000);
-  }
-
-  function bindHints() {
-    document.querySelectorAll('.tip-target').forEach(el => {
-      const tip = el.getAttribute('data-tip') || '';
-      el.addEventListener('mouseenter', () => showHintPop(el, tip, 5));
-      el.addEventListener('focus', () => showHintPop(el, tip, 5));
-      el.addEventListener('click', () => showHintPop(el, tip, 4));
-      el.addEventListener('touchstart', () => showHintPop(el, tip, 4), { passive: true });
-    });
-  }
-
-  function loadImageEl(imgEl, src) {
+  function loadPreviewImage(src) {
     return new Promise((resolve, reject) => {
-      imgEl.onload = () => resolve(imgEl);
-      imgEl.onerror = () => reject(new Error(`Failed to load image: ${src}`));
-      imgEl.src = src;
+      previewImg.onload = () => resolve();
+      previewImg.onerror = () => reject(new Error("Failed to load preview"));
+      previewImg.src = src;
     });
   }
 
-  async function loadEditorAssets(existingId) {
-    await loadImageEl(baseImg, `${API_BASE}/base/${existingId}?t=${Date.now()}`);
-    baseCtx.clearRect(0, 0, 1000, 1000);
-    baseCtx.drawImage(baseImg, 0, 0, 1000, 1000);
+  async function loadExistingSession(existingId) {
+    const r = await fetch(`${API_BASE}/session-info/${existingId}?t=${Date.now()}`, { cache: "no-store" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Saved session not found");
 
-    await loadImageEl(maskImg, `${API_BASE}/mask/${existingId}?t=${Date.now()}`);
-    maskCtx.clearRect(0, 0, 1000, 1000);
-    maskCtx.drawImage(maskImg, 0, 0, 1000, 1000);
+    sessionId = existingId;
 
-    await loadImageEl(restoreMaskImg, `${API_BASE}/restore-mask/${existingId}?t=${Date.now()}`);
-    restoreMaskCtx.clearRect(0, 0, 1000, 1000);
-    restoreMaskCtx.drawImage(restoreMaskImg, 0, 0, 1000, 1000);
+    uploadShell.style.display = 'none';
+    previewWrap.style.display = 'block';
+    btnDone.style.display = 'inline-flex';
 
-    await loadImageEl(seedMaskImg, `${API_BASE}/seed-mask/${existingId}?t=${Date.now()}`);
-    seedMaskCtx.clearRect(0, 0, 1000, 1000);
-    seedMaskCtx.drawImage(seedMaskImg, 0, 0, 1000, 1000);
-
-    await loadImageEl(restoreSrcImg, `${API_BASE}/restore-src/${existingId}?t=${Date.now()}`);
-    restoreSrcCtx.clearRect(0, 0, 1000, 1000);
-    restoreSrcCtx.drawImage(restoreSrcImg, 0, 0, 1000, 1000);
-
-    renderFromMask();
+    await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
+    renderQualityFlags(j.quality_flags || []);
+    hideOverlay();
   }
 
-  async function pollAIReady(statusUrl) {
-    for (let i = 0; i < 120; i++) {
+  async function pollReady(statusUrl) {
+    for (let i = 0; i < 180; i++) {
       try {
         const r = await fetch(statusUrl + '?t=' + Date.now(), { cache: "no-store" });
         const j = await r.json();
 
         const stage = j.stage || j.status || "processing";
-        if (!aiReady) {
-          overlayTitle.textContent = STAGE_LABELS[stage] || "Preparing your logo…";
-        }
+        overlayTitle.textContent = STAGE_LABELS[stage] || "Preparing your image…";
 
         if (j.status === 'ready') {
-          aiReady = true;
           stopStageCycle();
-          await loadEditorAssets(sessionId);
-          hideOverlay();
+          await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
           renderQualityFlags(j.quality_flags || []);
-          fitView();
-          enterReviewMode();
+          hideOverlay();
+          previewStatus.textContent = previewStatus.textContent || "Image ready ✓";
           return;
         }
 
         if (j.status === 'failed') {
-          aiReady = true;
           stopStageCycle();
-          overlayTitle.textContent = "AI cutout failed";
-          overlaySub.textContent = "You can still use the original image and make manual edits.";
-          await loadEditorAssets(sessionId);
-          setTimeout(() => hideOverlay(), 1400);
-          statusline.textContent = "AI cutout failed — edit original instead.";
-          fitView();
-          enterReviewMode();
+          await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
+          hideOverlay();
+          previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — fallback image ready</span>`;
           return;
         }
       } catch (e) {
@@ -3296,51 +1498,16 @@ def ui(
 
     stopStageCycle();
     overlayTitle.textContent = "Still processing…";
-    overlaySub.textContent = "This is taking longer than usual. You can wait a bit longer or restart.";
-    statusline.textContent = "AI cutout taking longer than usual.";
-  }
-
-  async function loadExistingSession(existingId, showSavedBanner = true) {
-    const r = await fetch(`${API_BASE}/session-info/${existingId}?t=${Date.now()}`, { cache: "no-store" });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || "Saved session not found");
-
-    sessionId = existingId;
-    aiReady = true;
-    qualityFlags = Array.isArray(j.quality_flags) ? j.quality_flags : [];
-
-    step1.style.display = 'none';
-    step3.style.display = 'grid';
-    btnDone.style.display = 'inline-flex';
-    hideOverlay();
-
-    await loadEditorAssets(sessionId);
-
-    renderQualityFlags(qualityFlags);
-    fitView();
-    enterReviewMode();
-
-    if (showSavedBanner) {
-      showBanner("Loaded your saved image. Review it, or tap Edit if you want to make changes.", 5);
-    }
+    overlaySub.textContent = "This is taking longer than usual. Please wait a little longer.";
   }
 
   async function handlePickedFile() {
     const f = fileEl.files && fileEl.files[0];
     if (!f) return;
 
-    statusline1.textContent = "Uploading…";
-
-    step1.style.display = 'none';
-    step3.style.display = 'grid';
-    btnDone.style.display = 'inline-flex';
-
-    clearEditorCanvases();
-    history = [];
-    aiReady = false;
-    qualityFlags = [];
-    hideOverlay();
-    statusline.textContent = "";
+    uploadStatus.textContent = "Uploading…";
+    previewStatus.textContent = "";
+    previewImg.removeAttribute("src");
 
     const fd = new FormData();
     fd.append('file', f);
@@ -3364,25 +1531,14 @@ def ui(
       if (!r.ok) throw new Error(j.error || 'Upload failed');
 
       sessionId = j.session_id;
-      qualityFlags = [];
 
-      fitView();
+      uploadShell.style.display = 'none';
+      previewWrap.style.display = 'block';
+      btnDone.style.display = 'inline-flex';
 
-      if (keepOriginalEl.checked) {
-        aiReady = true;
-        await loadEditorAssets(sessionId);
-        hideOverlay();
-        statusline.textContent = "Using original image";
-        enterReviewMode();
-      } else {
-        aiReady = false;
-        showOverlay("Uploading image…", "Please wait while we prepare your logo.");
-        startStageCycle();
-        statusline.textContent = "Preparing your logo…";
-        await pollAIReady(j.status_url);
-      }
+      startStageCycle();
+      await pollReady(j.status_url);
 
-      updateCursorSize();
     } catch (err) {
       console.error(err);
       alert(err.message || "Upload failed");
@@ -3390,6 +1546,7 @@ def ui(
     }
   }
 
+  fileEl.addEventListener('click', () => { fileEl.value = ""; });
   fileEl.addEventListener('change', handlePickedFile);
   fileEl.addEventListener('input', handlePickedFile);
 
@@ -3397,97 +1554,39 @@ def ui(
     btnDone.textContent = "Saving…";
     btnDone.disabled = true;
 
-    cv.toBlob(async (blob) => {
-      try {
-        const fd = new FormData();
-        fd.append("file", blob, "edited_logo.png");
-        await fetch(`${API_BASE}/save-edit/${sessionId}`, {
-          method: 'POST',
-          body: fd,
-          cache: "no-store"
-        });
+    try {
+      const payload = {
+        type: "studio-uploader:done",
+        slot: SLOT,
+        session_id: sessionId,
+        finalize_url: `${API_BASE}/finalize/${sessionId}`
+      };
 
-        const payload = {
-          type: "studio-uploader:done",
-          slot: SLOT,
-          session_id: sessionId,
-          finalize_url: `${API_BASE}/finalize/${sessionId}`
-        };
-
-        const sent = notifyDone(payload);
-        if (!sent) {
-          if (RETURN_TO) {
-            const url = new URL(RETURN_TO, API_BASE);
-            url.searchParams.set("slot", SLOT);
-            url.searchParams.set("session_id", sessionId);
-            url.searchParams.set("finalize_url", payload.finalize_url);
-            window.location.href = url.toString();
-          } else {
-            btnDone.textContent = "Saved ✓";
-          }
+      const sent = notifyDone(payload);
+      if (!sent) {
+        if (RETURN_TO) {
+          const url = new URL(RETURN_TO, API_BASE);
+          url.searchParams.set("slot", SLOT);
+          url.searchParams.set("session_id", sessionId);
+          url.searchParams.set("finalize_url", payload.finalize_url);
+          window.location.href = url.toString();
+        } else {
+          btnDone.textContent = "Saved ✓";
         }
-      } catch (e) {
-        alert("Save failed — try again.");
-        btnDone.textContent = "Done";
-        btnDone.disabled = false;
       }
-    }, "image/png");
+    } catch (e) {
+      alert("Done failed — try again.");
+      btnDone.textContent = "Done";
+      btnDone.disabled = false;
+    }
   });
-
-  btnApprove.addEventListener('click', () => btnDone.click());
-  btnEnterEdit.addEventListener('click', () => enterEditMode());
 
   setBgMode('checker');
-  fitView();
-  updateMagicModeUI();
-  updateMobileMagicOnlyUI();
-  bindHints();
-  syncTopDoneButton();
-  enterReviewMode();
-
-  window.addEventListener('resize', () => {
-    updateViewportTransform();
-
-    if (!editorUnlocked) {
-      step3.classList.add('review-mode');
-      step3.classList.remove('edit-mode');
-      desktopToolRail.style.display = !isTabletOrMobile() ? 'flex' : 'none';
-      return;
-    }
-
-    if (isMobile()) {
-      step3.classList.add('edit-mode');
-      step3.classList.remove('review-mode');
-      desktopToolRail.style.display = 'none';
-      mobileEditorNote.classList.add('show');
-      mobileMagicControls.classList.add('show');
-      desktopEditControls.style.display = 'none';
-      mode = 'magic';
-      updateMobileMagicOnlyUI();
-      updateCursorSize();
-      return;
-    }
-
-    mobileEditorNote.classList.remove('show');
-    mobileMagicControls.classList.remove('show');
-    desktopEditControls.style.display = 'grid';
-
-    step3.classList.add('edit-mode');
-    step3.classList.remove('review-mode');
-
-    if (!isTabletOrMobile()) {
-      desktopToolRail.style.display = 'flex';
-    } else {
-      desktopToolRail.style.display = 'none';
-    }
-
-    updateCursorSize();
-  });
 
   (async function boot() {
     try {
       if (EXISTING_SESSION_ID) {
-        await loadExistingSession(EXISTING_SESSION_ID, true);
+        await loadExistingSession(EXISTING_SESSION_ID);
       }
     } catch (e) {
       console.warn("Failed to load existing session:", e);
