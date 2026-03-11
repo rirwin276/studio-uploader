@@ -3,7 +3,6 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 pillow==11.1.0
 requests==2.32.3
-rembg==2.0.61
-onnxruntime==1.20.1
 opencv-python-headless==4.11.0.86
 numpy==2.1.3
+pydantic==2.10.4
