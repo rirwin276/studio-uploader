@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — fixed finalize/save flow + stronger guidance
+# app.py — Studio Uploader (FastAPI) — upload first, choose original vs AI after upload
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import threading
 import subprocess
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import cv2
 import numpy as np
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="4.1.0")
+app = FastAPI(title="Studio Uploader", version="5.0.0")
 
 
 # ----------------------------
@@ -141,7 +141,10 @@ async def _read_upload_limited(file: UploadFile, limit_bytes: int) -> bytes:
 def _paths(session_id: str) -> Dict[str, Path]:
     return {
         "orig_master": UPLOAD_DIR / f"{session_id}_orig_master.png",
-        "preview": UPLOAD_DIR / f"{session_id}_preview.png",
+        "orig_preview": UPLOAD_DIR / f"{session_id}_orig_preview.png",
+        "orig_curr": UPLOAD_DIR / f"{session_id}_orig_curr.png",
+        "ai_preview": UPLOAD_DIR / f"{session_id}_ai_preview.png",
+        "ai_curr": UPLOAD_DIR / f"{session_id}_ai_curr.png",
         "curr": UPLOAD_DIR / f"{session_id}_curr.png",
         "final": UPLOAD_DIR / f"{session_id}_final.png",
     }
@@ -149,8 +152,12 @@ def _paths(session_id: str) -> Dict[str, Path]:
 
 def _session_exists(session_id: str) -> bool:
     p = _paths(session_id)
-    needed = ["orig_master", "preview", "curr"]
-    return all(p[k].exists() for k in needed)
+    return p["orig_master"].exists() and p["orig_preview"].exists() and p["orig_curr"].exists()
+
+
+def _processed_exists(session_id: str) -> bool:
+    p = _paths(session_id)
+    return p["ai_preview"].exists() and p["ai_curr"].exists()
 
 
 # ----------------------------
@@ -215,6 +222,26 @@ def _center_preview(img: Image.Image, canvas_size: int = PREVIEW_PX, fill_ratio:
 
 def _normalize_logo(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
     img = _trim_transparent_padding(img.convert("RGBA"))
+    canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
+
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return canvas
+
+    max_dim = int(target_size * (1.0 - pad_ratio * 2.0))
+    scale = min(max_dim / w, max_dim / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+
+    img2 = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (target_size - new_w) // 2
+    y = (target_size - new_h) // 2
+    canvas.alpha_composite(img2, (x, y))
+    return canvas
+
+
+def _normalize_preserve_original(img: Image.Image, pad_ratio: float = 0.06, target_size: int = TARGET_PX) -> Image.Image:
+    img = img.convert("RGBA")
     canvas = Image.new("RGBA", (target_size, target_size), (0, 0, 0, 0))
 
     w, h = img.size
@@ -438,24 +465,92 @@ def _true_upscale_if_needed(img: Image.Image, target_px: int) -> Image.Image:
 
 
 # ----------------------------
+# Build original / AI assets
+# ----------------------------
+def _build_original_assets(session_id: str):
+    p = _paths(session_id)
+    master = Image.open(p["orig_master"]).convert("RGBA")
+    original_final = _normalize_preserve_original(master, target_size=TARGET_PX)
+    original_preview = _center_preview(original_final, canvas_size=PREVIEW_PX)
+
+    _save_png(original_preview, p["orig_preview"])
+    _save_png(original_final, p["orig_curr"])
+
+
+def _set_active_version(session_id: str, version: str):
+    p = _paths(session_id)
+    if version == "original":
+        if not p["orig_preview"].exists() or not p["orig_curr"].exists():
+            raise FileNotFoundError("Original version not found")
+        _save_png(Image.open(p["orig_preview"]).convert("RGBA"), p["curr"].with_name(p["curr"].name.replace("_curr", "_preview_placeholder")))  # unused placeholder safety
+        p["curr"].write_bytes(p["orig_curr"].read_bytes())
+        _save_png(Image.open(p["orig_preview"]).convert("RGBA"), p["orig_preview"])  # noop normalize save
+    elif version == "processed":
+        if not p["ai_preview"].exists() or not p["ai_curr"].exists():
+            raise FileNotFoundError("Processed version not found")
+        p["curr"].write_bytes(p["ai_curr"].read_bytes())
+    else:
+        raise ValueError("Invalid version")
+
+    _sess_set(
+        session_id,
+        active_version=version,
+        selected=True,
+        finalized=False,
+        final_path="",
+        final_version="",
+    )
+
+
+def _write_active_files(session_id: str, version: str):
+    p = _paths(session_id)
+    if version == "original":
+        p["curr"].write_bytes(p["orig_curr"].read_bytes())
+    elif version == "processed":
+        p["curr"].write_bytes(p["ai_curr"].read_bytes())
+    else:
+        raise ValueError("Invalid version")
+
+
+def _preview_bytes_for_version(session_id: str, version: str) -> bytes:
+    p = _paths(session_id)
+    if version == "original":
+        return p["orig_preview"].read_bytes()
+    if version == "processed":
+        return p["ai_preview"].read_bytes()
+    active = _sess_get(session_id).get("active_version", "")
+    if active == "processed" and p["ai_preview"].exists():
+        return p["ai_preview"].read_bytes()
+    return p["orig_preview"].read_bytes()
+
+
+# ----------------------------
 # Final save helper
 # ----------------------------
 def _finalize_session_image(session_id: str) -> Dict[str, Any]:
     p = _paths(session_id)
+    s = _sess_get(session_id)
+    active_version = s.get("active_version", "")
+
+    if active_version not in ("original", "processed"):
+        raise RuntimeError("Choose original or processed image before saving")
+
+    _write_active_files(session_id, active_version)
+
     curr = p["curr"]
     final = p["final"]
 
     if not curr.exists():
         raise FileNotFoundError("Final image not found for session")
 
-    if not final.exists():
-        final.write_bytes(curr.read_bytes())
+    final.write_bytes(curr.read_bytes())
 
     _sess_set(
         session_id,
         finalized=True,
         finalized_at=time.time(),
         final_path=str(final),
+        final_version=active_version,
     )
 
     return {
@@ -464,40 +559,47 @@ def _finalize_session_image(session_id: str) -> Dict[str, Any]:
         "session_id": session_id,
         "finalize_url": f"/finalize/{session_id}",
         "final_image_url": f"/final-file/{session_id}",
+        "active_version": active_version,
     }
 
 
 # ----------------------------
-# Core processing
+# Core AI processing
 # ----------------------------
-def _process_session(session_id: str, keep_original: bool):
+def _process_session_ai(session_id: str):
     try:
         p = _paths(session_id)
-
-        _sess_set(session_id, status="processing", stage="loading_image", started_at=time.time())
+        s = _sess_get(session_id)
 
         if not p["orig_master"].exists():
             _sess_set(session_id, status="failed", stage="failed", error="orig_master missing")
             return
 
+        if s.get("processing"):
+            return
+
+        _sess_set(
+            session_id,
+            processing=True,
+            status="processing",
+            stage="loading_image",
+            started_at=time.time(),
+            error="",
+        )
+
         master = Image.open(p["orig_master"]).convert("RGBA")
 
-        if keep_original:
-            _sess_set(session_id, stage="using_original")
-            result = master.copy()
-            flags = []
-        else:
-            _sess_set(session_id, stage="removing_background")
-            removed = _photoroom_remove_bg(master)
+        _sess_set(session_id, stage="removing_background")
+        removed = _photoroom_remove_bg(master)
 
-            _sess_set(session_id, stage="cleaning_edges")
-            result = _apply_cutout_alpha_to_original(master, removed)
-            result = _cleanup_cutout_light(result)
-            if DEHALO_ENABLED:
-                result = _dehalo_cutout(result)
+        _sess_set(session_id, stage="cleaning_edges")
+        result = _apply_cutout_alpha_to_original(master, removed)
+        result = _cleanup_cutout_light(result)
+        if DEHALO_ENABLED:
+            result = _dehalo_cutout(result)
 
-            _sess_set(session_id, stage="checking_quality")
-            flags = _quality_flags(result)
+        _sess_set(session_id, stage="checking_quality")
+        flags = _quality_flags(result)
 
         _sess_set(session_id, stage="trimming")
         result = _trim_transparent_padding(result, alpha_threshold=6)
@@ -509,34 +611,28 @@ def _process_session(session_id: str, keep_original: bool):
         final_img = _normalize_logo(result, target_size=TARGET_PX)
         preview_img = _center_preview(final_img, canvas_size=PREVIEW_PX)
 
-        _save_png(preview_img, p["preview"])
-        _save_png(final_img, p["curr"])
+        _save_png(preview_img, p["ai_preview"])
+        _save_png(final_img, p["ai_curr"])
+
+        _write_active_files(session_id, "processed")
 
         _sess_set(
             session_id,
+            processing=False,
+            processed_available=True,
             status="ready",
             stage="ready",
             quality_flags=flags,
+            active_version="processed",
+            selected=True,
             finished_at=time.time(),
         )
 
     except Exception as e:
-        print("❌ process_session failed:", e)
-        try:
-            p = _paths(session_id)
-            if p["orig_master"].exists():
-                fallback = Image.open(p["orig_master"]).convert("RGBA")
-                fallback = _trim_transparent_padding(fallback, alpha_threshold=6)
-                fallback = _true_upscale_if_needed(fallback, UPSCALE_TARGET_PX)
-                final_img = _normalize_logo(fallback, target_size=TARGET_PX)
-                preview_img = _center_preview(final_img, canvas_size=PREVIEW_PX)
-                _save_png(preview_img, p["preview"])
-                _save_png(final_img, p["curr"])
-        except Exception:
-            pass
-
+        print("❌ process_session_ai failed:", e)
         _sess_set(
             session_id,
+            processing=False,
             status="failed",
             stage="failed",
             error=str(e),
@@ -562,7 +658,15 @@ def session_status(session_id: str):
     s = _sess_get(session_id)
     if not s:
         if _session_exists(session_id):
-            return {"status": "ready", "stage": "ready", "quality_flags": []}
+            return {
+                "status": "uploaded",
+                "stage": "uploaded",
+                "session_id": session_id,
+                "processed_available": _processed_exists(session_id),
+                "active_version": "processed" if _processed_exists(session_id) else "",
+                "selected": False,
+                "quality_flags": [],
+            }
         return {"status": "unknown"}
     return s
 
@@ -573,24 +677,32 @@ def session_info(session_id: str):
         return JSONResponse({"error": "Not found"}, status_code=404)
 
     s = _sess_get(session_id)
+    active_version = s.get("active_version", "")
+    selected = bool(s.get("selected", False))
+    processed_available = _processed_exists(session_id) or bool(s.get("processed_available", False))
+
     return {
-        "status": s.get("status", "ready"),
-        "stage": s.get("stage", "ready"),
+        "status": s.get("status", "uploaded"),
+        "stage": s.get("stage", "uploaded"),
         "quality_flags": s.get("quality_flags", []),
         "session_id": session_id,
         "preview_url": f"/preview/{session_id}",
+        "preview_original_url": f"/preview/{session_id}?version=original",
+        "preview_processed_url": f"/preview/{session_id}?version=processed",
         "finalize_url": f"/finalize/{session_id}",
         "final_image_url": f"/final-file/{session_id}",
         "status_url": f"/status/{session_id}",
         "finalized": bool(s.get("finalized")),
+        "processed_available": processed_available,
+        "active_version": active_version,
+        "selected": selected,
+        "processing": bool(s.get("processing", False)),
+        "error": s.get("error", ""),
     }
 
 
 @app.post("/upload")
-async def upload_image(
-    file: UploadFile = File(...),
-    keep_original: bool = Query(False),
-):
+async def upload_image(file: UploadFile = File(...)):
     try:
         data = await _read_upload_limited(file, MAX_UPLOAD_BYTES)
     except ValueError as e:
@@ -611,43 +723,157 @@ async def upload_image(
     p = _paths(session_id)
 
     _save_png(img, p["orig_master"])
+    _build_original_assets(session_id)
 
     _sess_set(
         session_id,
-        status="queued",
-        stage="queued",
+        status="uploaded",
+        stage="uploaded",
         created_at=time.time(),
         quality_flags=[],
         finalized=False,
+        processing=False,
+        processed_available=False,
+        active_version="",
+        selected=False,
+        error="",
     )
 
-    t = threading.Thread(target=_process_session, args=(session_id, keep_original), daemon=True)
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "preview_url": f"/preview/{session_id}?version=original",
+        "preview_original_url": f"/preview/{session_id}?version=original",
+        "preview_processed_url": f"/preview/{session_id}?version=processed",
+        "finalize_url": f"/finalize/{session_id}",
+        "final_image_url": f"/final-file/{session_id}",
+        "status_url": f"/status/{session_id}",
+        "processed_available": False,
+        "active_version": "",
+        "selected": False,
+    }
+
+
+@app.post("/process/{session_id}")
+def process_session(session_id: str):
+    if not _session_exists(session_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    s = _sess_get(session_id)
+    if s.get("processing"):
+        return {"status": "ok", "session_id": session_id, "processing": True, "cached": False}
+
+    if _processed_exists(session_id):
+        _write_active_files(session_id, "processed")
+        _sess_set(
+            session_id,
+            status="ready",
+            stage="ready",
+            processing=False,
+            processed_available=True,
+            active_version="processed",
+            selected=True,
+            error="",
+        )
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "processing": False,
+            "cached": True,
+            "active_version": "processed",
+            "processed_available": True,
+        }
+
+    t = threading.Thread(target=_process_session_ai, args=(session_id,), daemon=True)
     t.start()
 
     return {
         "status": "ok",
         "session_id": session_id,
-        "preview_url": f"/preview/{session_id}",
-        "finalize_url": f"/finalize/{session_id}",
-        "final_image_url": f"/final-file/{session_id}",
-        "status_url": f"/status/{session_id}",
+        "processing": True,
+        "cached": False,
     }
 
 
-@app.get("/preview/{session_id}")
-def get_preview(session_id: str):
-    path = _paths(session_id)["preview"]
-    if not path.exists():
+@app.post("/set-active/{session_id}")
+def set_active_version(session_id: str, version: str = Query(...)):
+    if not _session_exists(session_id):
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
+
+    version = (version or "").strip().lower()
+    if version not in ("original", "processed"):
+        return JSONResponse({"error": "Invalid version"}, status_code=400)
+
+    if version == "processed" and not _processed_exists(session_id):
+        return JSONResponse({"error": "Processed image not available yet"}, status_code=409)
+
+    try:
+        _write_active_files(session_id, version)
+        _sess_set(
+            session_id,
+            active_version=version,
+            selected=True,
+            status="ready" if version == "processed" else "uploaded",
+            stage="ready" if version == "processed" else "uploaded",
+            error="",
+        )
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "active_version": version,
+            "selected": True,
+            "processed_available": _processed_exists(session_id),
+            "preview_url": f"/preview/{session_id}?version={version}",
+        }
+    except FileNotFoundError:
+        return JSONResponse({"error": "Version not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/preview/{session_id}")
+def get_preview(session_id: str, version: str = Query("active")):
+    if not _session_exists(session_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    version = (version or "active").strip().lower()
+    p = _paths(session_id)
+
+    try:
+        if version == "original":
+            path = p["orig_preview"]
+            if not path.exists():
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            return Response(content=path.read_bytes(), media_type="image/png")
+
+        if version == "processed":
+            path = p["ai_preview"]
+            if not path.exists():
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            return Response(content=path.read_bytes(), media_type="image/png")
+
+        # active fallback
+        s = _sess_get(session_id)
+        active_version = s.get("active_version", "")
+        if active_version == "processed" and p["ai_preview"].exists():
+            return Response(content=p["ai_preview"].read_bytes(), media_type="image/png")
+        return Response(content=p["orig_preview"].read_bytes(), media_type="image/png")
+
+    except Exception:
+        return JSONResponse({"error": "Not found"}, status_code=404)
 
 
 @app.get("/finalize/{session_id}")
 def finalize_get(session_id: str):
-    path = _paths(session_id)["curr"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
+    p = _paths(session_id)
+    s = _sess_get(session_id)
+    version = s.get("active_version", "")
+
+    if version == "processed" and p["ai_curr"].exists():
+        return Response(content=p["ai_curr"].read_bytes(), media_type="image/png")
+    if p["orig_curr"].exists():
+        return Response(content=p["orig_curr"].read_bytes(), media_type="image/png")
+    return JSONResponse({"error": "Not found"}, status_code=404)
 
 
 @app.post("/finalize/{session_id}")
@@ -657,6 +883,8 @@ def finalize_post(session_id: str):
         return result
     except FileNotFoundError:
         return JSONResponse({"error": "Not found"}, status_code=404)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -664,10 +892,17 @@ def finalize_post(session_id: str):
 @app.get("/final-file/{session_id}")
 def final_file(session_id: str):
     p = _paths(session_id)
-    path = p["final"] if p["final"].exists() else p["curr"]
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return Response(content=path.read_bytes(), media_type="image/png")
+    if p["final"].exists():
+        return Response(content=p["final"].read_bytes(), media_type="image/png")
+
+    s = _sess_get(session_id)
+    active_version = s.get("active_version", "")
+    if active_version == "processed" and p["ai_curr"].exists():
+        return Response(content=p["ai_curr"].read_bytes(), media_type="image/png")
+    if p["orig_curr"].exists():
+        return Response(content=p["orig_curr"].read_bytes(), media_type="image/png")
+
+    return JSONResponse({"error": "Not found"}, status_code=404)
 
 
 # ----------------------------
@@ -802,25 +1037,24 @@ async def storefront_request(
             return JSONResponse({"error": "Main logo is not a valid image"}, status_code=400)
 
         main_session_id = str(uuid.uuid4())
-        p = _paths(main_session_id)
-        _save_png(img_main, p["orig_master"])
+        mp = _paths(main_session_id)
+        _save_png(img_main, mp["orig_master"])
+        _build_original_assets(main_session_id)
+        _write_active_files(main_session_id, "original")
 
         _sess_set(
             main_session_id,
-            status="ready",
-            stage="ready",
+            status="uploaded",
+            stage="uploaded",
             created_at=time.time(),
             quality_flags=[],
             finalized=False,
+            processing=False,
+            processed_available=False,
+            active_version="original",
+            selected=True,
+            error="",
         )
-
-        final_main = _trim_transparent_padding(img_main, alpha_threshold=6)
-        final_main = _true_upscale_if_needed(final_main, UPSCALE_TARGET_PX)
-        final_main = _normalize_logo(final_main, target_size=TARGET_PX)
-        preview_main = _center_preview(final_main, canvas_size=PREVIEW_PX)
-
-        _save_png(preview_main, p["preview"])
-        _save_png(final_main, p["curr"])
 
         if storefront_logo_secondary:
             try:
@@ -841,23 +1075,22 @@ async def storefront_request(
                 sp = _paths(secondary_session_id)
 
                 _save_png(img_sec, sp["orig_master"])
+                _build_original_assets(secondary_session_id)
+                _write_active_files(secondary_session_id, "original")
 
                 _sess_set(
                     secondary_session_id,
-                    status="ready",
-                    stage="ready",
+                    status="uploaded",
+                    stage="uploaded",
                     created_at=time.time(),
                     quality_flags=[],
                     finalized=False,
+                    processing=False,
+                    processed_available=False,
+                    active_version="original",
+                    selected=True,
+                    error="",
                 )
-
-                final_sec = _trim_transparent_padding(img_sec, alpha_threshold=6)
-                final_sec = _true_upscale_if_needed(final_sec, UPSCALE_TARGET_PX)
-                final_sec = _normalize_logo(final_sec, target_size=TARGET_PX)
-                preview_sec = _center_preview(final_sec, canvas_size=PREVIEW_PX)
-
-                _save_png(preview_sec, sp["preview"])
-                _save_png(final_sec, sp["curr"])
 
             except Exception as e:
                 print("⚠️ Secondary logo skipped:", str(e))
@@ -930,54 +1163,59 @@ def ui(
       --text: #0f172a;
       --muted: #667085;
       --shadow: 0 26px 70px rgba(15,23,42,0.12);
+      --green1: #34d399;
+      --green2: #10b981;
+      --blue1: #0f172a;
+      --warn-bg: rgba(245,158,11,0.12);
+      --warn-border: rgba(245,158,11,0.24);
+      --warn-text: #b45309;
     }
 
     * { box-sizing: border-box; }
-    html, body { height: 100%; overflow: hidden; }
-    body {
+
+    html, body {
+      height: 100%;
       margin: 0;
+    }
+
+    body {
       min-height: 100vh;
+      overflow: auto;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
       color: var(--text);
       background:
         radial-gradient(1200px 480px at 50% -120px, rgba(255,255,255,0.95), rgba(255,255,255,0) 60%),
         linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 100%);
+    }
+
+    .app {
+      min-height: 100vh;
       display: flex;
       flex-direction: column;
+      padding: 8px;
     }
 
-    .header {
+    .topbar {
       flex: 0 0 auto;
       display: flex;
+      align-items: center;
       justify-content: space-between;
-      align-items: center;
-      padding: 10px 14px;
-      background: rgba(255,255,255,0.70);
-      backdrop-filter: blur(18px) saturate(1.12);
-      border-bottom: 1px solid rgba(15,23,42,0.06);
-      position: relative;
-      z-index: 20;
+      gap: 12px;
+      padding: 8px 4px 10px;
     }
 
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .brand h2 {
-      margin: 0;
-      font-size: 15px;
-      font-weight: 700;
+    .step-label {
+      font-size: 13px;
+      font-weight: 800;
       letter-spacing: -0.02em;
+      color: #334155;
     }
 
-    .brand-pill {
+    .slot-pill {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      height: 28px;
-      min-width: 28px;
+      min-height: 28px;
       padding: 0 10px;
       border-radius: 999px;
       background: rgba(15,23,42,0.05);
@@ -987,23 +1225,31 @@ def ui(
       font-weight: 700;
     }
 
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
     .btn-done {
       display: none;
       border: none;
       border-radius: 999px;
       padding: 10px 16px;
-      min-width: 82px;
-      background: linear-gradient(180deg, #34d399, #10b981);
+      min-width: 88px;
+      background: linear-gradient(180deg, var(--green1), var(--green2));
       color: white;
       font-size: 13px;
-      font-weight: 700;
+      font-weight: 800;
       letter-spacing: -0.01em;
       box-shadow: 0 10px 22px rgba(16,185,129,0.20);
       cursor: pointer;
+      white-space: nowrap;
     }
 
     .btn-done:disabled {
-      opacity: 0.6;
+      opacity: 0.55;
       cursor: not-allowed;
       box-shadow: none;
     }
@@ -1012,28 +1258,36 @@ def ui(
       flex: 1 1 auto;
       min-height: 0;
       display: flex;
-      align-items: center;
+      align-items: stretch;
       justify-content: center;
-      padding: 10px;
+    }
+
+    .shell,
+    .review-wrap {
+      width: min(980px, 100%);
+      background: rgba(255,255,255,0.82);
+      backdrop-filter: blur(18px) saturate(1.12);
+      border: 1px solid var(--panel-border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 16px;
     }
 
     .shell {
-      width: min(760px, 100%);
-      background: rgba(255,255,255,0.78);
-      backdrop-filter: blur(18px) saturate(1.12);
-      border: 1px solid var(--panel-border);
-      border-radius: 30px;
-      box-shadow: var(--shadow);
-      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      justify-content: center;
+      min-height: 0;
     }
 
     .upload-box {
       position: relative;
       border-radius: 24px;
-      padding: 34px 18px;
+      padding: 26px 18px;
       text-align: center;
       border: 1.5px dashed rgba(15,23,42,0.12);
-      background: rgba(255,255,255,0.58);
+      background: rgba(255,255,255,0.60);
       overflow: hidden;
     }
 
@@ -1047,7 +1301,7 @@ def ui(
     }
 
     .title {
-      font-size: 18px;
+      font-size: 19px;
       font-weight: 800;
       letter-spacing: -0.02em;
       margin-top: 8px;
@@ -1060,17 +1314,15 @@ def ui(
     }
 
     .guidance {
-      margin-top: 14px;
       display: grid;
       gap: 10px;
-      text-align: left;
     }
 
     .guide-card {
       border-radius: 18px;
-      background: rgba(255,255,255,0.72);
+      background: rgba(255,255,255,0.74);
       border: 1px solid rgba(15,23,42,0.08);
-      padding: 12px 14px;
+      padding: 11px 13px;
     }
 
     .guide-title {
@@ -1082,48 +1334,48 @@ def ui(
 
     .guide-text {
       font-size: 12px;
-      line-height: 1.55;
+      line-height: 1.5;
       color: #475569;
     }
 
-    .row {
-      margin-top: 12px;
+    .status-row {
+      min-height: 22px;
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
+      align-items: center;
       justify-content: center;
-      align-items: center;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
       gap: 8px;
-      min-height: 42px;
-      padding: 8px 14px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      border: 1px solid rgba(15,23,42,0.08);
+      flex-wrap: wrap;
+      color: #64748b;
       font-size: 13px;
-      font-weight: 600;
-      color: #334155;
+      font-weight: 700;
+      text-align: center;
     }
 
-    .preview-wrap {
+    .review-wrap {
       display: none;
-      width: min(980px, 100%);
-      background: rgba(255,255,255,0.78);
-      backdrop-filter: blur(18px) saturate(1.12);
-      border: 1px solid var(--panel-border);
-      border-radius: 30px;
-      box-shadow: var(--shadow);
-      padding: 18px;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+    }
+
+    .warning-banner {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border-radius: 18px;
+      padding: 12px 14px;
+      background: rgba(245,158,11,0.08);
+      border: 1px solid rgba(245,158,11,0.18);
+      color: #92400e;
+      font-size: 12px;
+      line-height: 1.5;
+      font-weight: 700;
     }
 
     .preview-stage {
       position: relative;
       border-radius: 24px;
-      min-height: 420px;
+      min-height: 360px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -1133,8 +1385,8 @@ def ui(
     }
 
     .preview-stage img {
-      width: min(92vw, 84vh, 820px);
-      height: min(92vw, 84vh, 820px);
+      width: min(88vw, 62vh, 760px);
+      height: min(88vw, 62vh, 760px);
       object-fit: contain;
       display: block;
     }
@@ -1160,8 +1412,7 @@ def ui(
       background-image: none;
     }
 
-    .preview-actions {
-      margin-top: 14px;
+    .choice-row {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
@@ -1169,16 +1420,56 @@ def ui(
       align-items: center;
     }
 
+    .main-choice-btn,
+    .ghost-btn {
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: transform 0.08s ease, opacity 0.15s ease;
+    }
+
+    .main-choice-btn:hover,
+    .ghost-btn:hover {
+      transform: translateY(-1px);
+    }
+
+    .main-choice-btn:disabled,
+    .ghost-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .main-choice-btn {
+      min-height: 44px;
+      padding: 0 16px;
+      border: 1px solid rgba(15,23,42,0.08);
+      background: rgba(255,255,255,0.92);
+      color: #0f172a;
+      box-shadow: 0 6px 18px rgba(15,23,42,0.06);
+    }
+
+    .main-choice-btn.primary {
+      background: linear-gradient(180deg, #1f2937, #0f172a);
+      color: white;
+      border-color: rgba(15,23,42,0.15);
+      box-shadow: 0 10px 22px rgba(15,23,42,0.16);
+    }
+
+    .main-choice-btn.success {
+      background: linear-gradient(180deg, var(--green1), var(--green2));
+      color: white;
+      border-color: rgba(16,185,129,0.18);
+      box-shadow: 0 10px 22px rgba(16,185,129,0.18);
+    }
+
     .ghost-btn {
       height: 40px;
       padding: 0 14px;
       border: 1px solid rgba(15,23,42,0.08);
-      border-radius: 999px;
       background: rgba(255,255,255,0.82);
       color: #334155;
-      font-size: 13px;
-      font-weight: 700;
-      cursor: pointer;
     }
 
     .ghost-btn.active {
@@ -1186,18 +1477,12 @@ def ui(
       color: white;
     }
 
-    .status-row {
-      min-height: 24px;
-      margin-top: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      flex-wrap: wrap;
-      color: #64748b;
-      font-size: 13px;
-      font-weight: 600;
+    .small-note {
       text-align: center;
+      color: #64748b;
+      font-size: 12px;
+      line-height: 1.45;
+      font-weight: 600;
     }
 
     .warn-badge {
@@ -1206,11 +1491,11 @@ def ui(
       gap: 6px;
       padding: 7px 11px;
       border-radius: 999px;
-      background: rgba(245,158,11,0.12);
-      border: 1px solid rgba(245,158,11,0.24);
-      color: #b45309;
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      color: var(--warn-text);
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 800;
     }
 
     .processing-overlay {
@@ -1223,7 +1508,7 @@ def ui(
       flex-direction: column;
       gap: 12px;
       text-align: center;
-      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.86));
+      background: linear-gradient(180deg, rgba(255,255,255,0.74), rgba(255,255,255,0.88));
       backdrop-filter: blur(6px);
       padding: 22px;
     }
@@ -1246,119 +1531,174 @@ def ui(
 
     .overlay-title {
       font-size: 16px;
-      font-weight: 700;
+      font-weight: 800;
       letter-spacing: -0.02em;
       color: #0f172a;
     }
 
     .overlay-sub {
-      max-width: 420px;
+      max-width: 430px;
       font-size: 13px;
       color: #64748b;
       line-height: 1.45;
+      font-weight: 600;
     }
 
     @media (max-width: 640px) {
-      .main {
+      .app {
         padding: 6px;
       }
 
-      .shell, .preview-wrap {
-        border-radius: 22px;
-        padding: 14px;
+      .topbar {
+        padding: 2px 2px 8px;
+      }
+
+      .shell,
+      .review-wrap {
+        border-radius: 20px;
+        padding: 12px;
       }
 
       .upload-box {
-        border-radius: 18px;
-        padding: 28px 14px;
+        border-radius: 16px;
+        padding: 18px 12px;
+      }
+
+      .title {
+        font-size: 17px;
+      }
+
+      .muted {
+        font-size: 12px;
+      }
+
+      .guide-title {
+        font-size: 12px;
+      }
+
+      .guide-text {
+        font-size: 11px;
+        line-height: 1.45;
       }
 
       .preview-stage {
-        min-height: 320px;
+        min-height: 250px;
         border-radius: 18px;
       }
 
       .preview-stage img {
-        width: min(95vw, 78vw, 520px);
-        height: min(95vw, 78vw, 520px);
+        width: min(84vw, 54vh, 420px);
+        height: min(84vw, 54vh, 420px);
+      }
+
+      .warning-banner {
+        padding: 10px 11px;
+        font-size: 11px;
+      }
+
+      .main-choice-btn,
+      .ghost-btn,
+      .btn-done {
+        min-height: 42px;
+        font-size: 12px;
+      }
+
+      .choice-row,
+      .status-row {
+        gap: 8px;
+      }
+
+      .small-note {
+        font-size: 11px;
+      }
+
+      .slot-pill {
+        display: none;
       }
     }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="brand">
-      <h2>Studio Uploader</h2>
-      <span class="brand-pill" id="slotPill">main</span>
-    </div>
-    <button class="btn-done" id="btnDone">Done</button>
-  </div>
-
-  <div class="main">
-    <div class="shell" id="uploadShell">
-      <div class="upload-box">
-        <input id="file" type="file" accept="image/*" />
-        <div style="font-size:30px;">✨</div>
-        <div class="title">Upload logo</div>
-        <div class="muted" style="margin-top:6px;">
-          We can sharpen, upscale, and remove the background for most simple logos.
-        </div>
+  <div class="app">
+    <div class="topbar">
+      <div class="topbar-left">
+        <div class="step-label" id="stepLabel">Upload logo</div>
+        <div class="slot-pill" id="slotPill">main</div>
       </div>
-
-      <div class="guidance">
-        <div class="guide-card">
-          <div class="guide-title">Best results</div>
-          <div class="guide-text">
-            For the best results, use an image that is already prepped with the background removed and scaled up if possible.
-          </div>
-        </div>
-
-        <div class="guide-card">
-          <div class="guide-title">Built-in background removal</div>
-          <div class="guide-text">
-            If you need simple image sharpening, upscaling, or background removal, our built-in background removal works well for most images.
-          </div>
-        </div>
-
-        <div class="guide-card">
-          <div class="guide-title">If the removal looks wrong</div>
-          <div class="guide-text">
-            If your image does not look correct after background removal, please edit it elsewhere and come back and click <strong>Use original image</strong>. That will skip background removal and help preserve the result you want.
-          </div>
-        </div>
-
-        <div class="guide-card">
-          <div class="guide-title">Double-check before saving</div>
-          <div class="guide-text">
-            On the next screen, check your image on different background colors to make sure the background removal was aggressive enough, or not too aggressive. If everything looks good, click <strong>Done</strong> and then submit the form.
-          </div>
-        </div>
-      </div>
-
-      <div class="row">
-        <label class="pill"><input type="checkbox" id="keepOriginal"> Use original image</label>
-      </div>
-
-      <div class="status-row" id="uploadStatus"></div>
+      <button class="btn-done" id="btnDone" disabled>Done</button>
     </div>
 
-    <div class="preview-wrap" id="previewWrap">
-      <div class="preview-stage bg-checker" id="previewStage">
-        <img id="previewImg" alt="Processed preview" />
-        <div class="processing-overlay" id="processingOverlay">
-          <div class="spinner"></div>
-          <div class="overlay-title" id="overlayTitle">Preparing your image…</div>
-          <div class="overlay-sub" id="overlaySub">This usually takes a few seconds.</div>
+    <div class="main">
+      <div class="shell" id="uploadShell">
+        <div class="upload-box">
+          <input id="file" type="file" accept="image/*" />
+          <div style="font-size:28px;">✨</div>
+          <div class="title">Upload your logo</div>
+          <div class="muted" style="margin-top:6px;">
+            Upload first. On the next screen you will choose either <strong>Keep original image</strong> or <strong>Send for background removal and upscale</strong>.
+          </div>
+        </div>
+
+        <div class="guidance">
+          <div class="guide-card">
+            <div class="guide-title">Best results</div>
+            <div class="guide-text">
+              For the best result, upload an image that is already clean and as sharp as possible.
+            </div>
+          </div>
+
+          <div class="guide-card">
+            <div class="guide-title">AI processing is optional</div>
+            <div class="guide-text">
+              After upload, you can send the image for background removal and upscale, or keep the original image instead.
+            </div>
+          </div>
+
+          <div class="guide-card">
+            <div class="guide-title">Check it carefully</div>
+            <div class="guide-text">
+              If it looks wrong here, it will look wrong on the final product. Review it before you hit <strong>Done</strong>.
+            </div>
+          </div>
+        </div>
+
+        <div class="status-row" id="uploadStatus"></div>
+      </div>
+
+      <div class="review-wrap" id="reviewWrap">
+        <div class="warning-banner">
+          <div>⚠️</div>
+          <div>
+            Choose one version before saving. If the background removal or cleanup looks wrong here, it will show up wrong on your products.
+          </div>
+        </div>
+
+        <div class="preview-stage bg-checker" id="previewStage">
+          <img id="previewImg" alt="Logo preview" />
+          <div class="processing-overlay" id="processingOverlay">
+            <div class="spinner"></div>
+            <div class="overlay-title" id="overlayTitle">Preparing your image…</div>
+            <div class="overlay-sub" id="overlaySub">Please wait while we process your file.</div>
+          </div>
+        </div>
+
+        <div class="choice-row">
+          <button class="main-choice-btn" id="btnKeepOriginal">Keep original image</button>
+          <button class="main-choice-btn primary" id="btnRunAi">Send for background removal and upscale</button>
+          <button class="main-choice-btn success" id="btnUseProcessedAgain" style="display:none;">Use processed image again</button>
+        </div>
+
+        <div class="choice-row">
+          <button class="ghost-btn active" id="bgChecker">Grid</button>
+          <button class="ghost-btn" id="bgWhite">White</button>
+          <button class="ghost-btn" id="bgDark">Dark</button>
+        </div>
+
+        <div class="status-row" id="previewStatus"></div>
+        <div class="small-note" id="bottomNote">
+          Upload first, then choose original or AI. Done stays locked until you pick one.
         </div>
       </div>
-
-      <div class="preview-actions">
-        <button class="ghost-btn active" id="bgChecker">Grid</button>
-        <button class="ghost-btn" id="bgWhite">White</button>
-        <button class="ghost-btn" id="bgDark">Dark</button>
-      </div>
-
-      <div class="status-row" id="previewStatus"></div>
     </div>
   </div>
 
@@ -1368,12 +1708,15 @@ def ui(
   let sessionId = null;
   let stageCycleTimer = null;
   let qualityFlags = [];
+  let processedAvailable = false;
+  let selectedVersion = "";
+  let activePreviewVersion = "original";
+  let isProcessing = false;
 
   const fileEl = document.getElementById('file');
-  const keepOriginalEl = document.getElementById('keepOriginal');
 
   const uploadShell = document.getElementById('uploadShell');
-  const previewWrap = document.getElementById('previewWrap');
+  const reviewWrap = document.getElementById('reviewWrap');
   const previewStage = document.getElementById('previewStage');
   const previewImg = document.getElementById('previewImg');
 
@@ -1389,6 +1732,10 @@ def ui(
   const bgWhite = document.getElementById('bgWhite');
   const bgDark = document.getElementById('bgDark');
 
+  const btnKeepOriginal = document.getElementById('btnKeepOriginal');
+  const btnRunAi = document.getElementById('btnRunAi');
+  const btnUseProcessedAgain = document.getElementById('btnUseProcessedAgain');
+
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
   const RETURN_TO = params.get('return_to') || '';
@@ -1397,22 +1744,21 @@ def ui(
   document.getElementById('slotPill').textContent = SLOT;
 
   const STAGE_LABELS = {
-    queued: "Uploading image…",
+    uploaded: "Choose original or AI",
     loading_image: "Loading image…",
-    using_original: "Using original image…",
     removing_background: "Removing background…",
     cleaning_edges: "Cleaning edges…",
     checking_quality: "Checking quality…",
     trimming: "Trimming spacing…",
     upscaling: "Upscaling image…",
     building_final: "Building final image…",
-    ready: "Ready ✓",
+    ready: "Processed image ready ✓",
     failed: "Processing failed"
   };
 
   const CYCLE_MESSAGES = [
     "Uploading image…",
-    "Removing background…",
+    "Sending to background removal…",
     "Cleaning edges…",
     "Upscaling image…",
     "Building final image…"
@@ -1432,6 +1778,10 @@ def ui(
       }
     } catch (e) {}
     return false;
+  }
+
+  function setStepLabel(text) {
+    document.getElementById('stepLabel').textContent = text;
   }
 
   function setBgMode(mode) {
@@ -1456,7 +1806,7 @@ def ui(
   bgWhite.addEventListener('click', () => setBgMode('white'));
   bgDark.addEventListener('click', () => setBgMode('dark'));
 
-  function showOverlay(title, sub = "This usually takes a few seconds.") {
+  function showOverlay(title, sub = "Please wait while we process your file.") {
     processingOverlay.classList.add('show');
     overlayTitle.textContent = title || "Preparing your image…";
     overlaySub.textContent = sub;
@@ -1469,7 +1819,7 @@ def ui(
   function startStageCycle() {
     stopStageCycle();
     let i = 0;
-    showOverlay(CYCLE_MESSAGES[0], "Please wait while we prepare your file.");
+    showOverlay(CYCLE_MESSAGES[0], "Please wait while we process your file.");
     stageCycleTimer = setInterval(() => {
       i = (i + 1) % CYCLE_MESSAGES.length;
       overlayTitle.textContent = CYCLE_MESSAGES[i];
@@ -1493,17 +1843,80 @@ def ui(
 
     if (warnings.length) {
       previewStatus.innerHTML = warnings.map(w => `<span class="warn-badge">⚠ ${w}</span>`).join(" ");
+    } else if (selectedVersion === "processed") {
+      previewStatus.textContent = "Processed image ready ✓";
+    } else if (selectedVersion === "original") {
+      previewStatus.textContent = "Original image selected ✓";
     } else {
-      previewStatus.textContent = "Image ready ✓";
+      previewStatus.textContent = "Choose original or AI before saving.";
     }
   }
 
-  function loadPreviewImage(src) {
+  function setDoneState() {
+    const ready = !!selectedVersion && !isProcessing;
+    btnDone.disabled = !ready;
+    btnDone.style.display = reviewWrap.style.display === 'flex' ? 'inline-flex' : 'none';
+  }
+
+  function updateChoiceButtons() {
+    btnKeepOriginal.classList.toggle('success', selectedVersion === 'original');
+    btnKeepOriginal.textContent = selectedVersion === 'original' ? 'Using original image' : 'Keep original image';
+
+    if (processedAvailable) {
+      btnRunAi.style.display = activePreviewVersion === 'processed' ? 'none' : 'inline-flex';
+      btnUseProcessedAgain.style.display = activePreviewVersion === 'original' ? 'inline-flex' : 'none';
+    } else {
+      btnRunAi.style.display = 'inline-flex';
+      btnUseProcessedAgain.style.display = 'none';
+    }
+  }
+
+  function setBottomNote(text) {
+    document.getElementById('bottomNote').textContent = text;
+  }
+
+  async function loadPreviewImage(src) {
     return new Promise((resolve, reject) => {
       previewImg.onload = () => resolve();
       previewImg.onerror = () => reject(new Error("Failed to load preview"));
       previewImg.src = src;
     });
+  }
+
+  async function switchPreview(version, chooseIt = false) {
+    if (!sessionId) return;
+
+    const src = `${API_BASE}/preview/${sessionId}?version=${encodeURIComponent(version)}&t=${Date.now()}`;
+    await loadPreviewImage(src);
+
+    activePreviewVersion = version;
+
+    if (chooseIt) {
+      const r = await fetch(`${API_BASE}/set-active/${sessionId}?version=${encodeURIComponent(version)}`, {
+        method: 'POST',
+        cache: 'no-store'
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "Failed to select image version");
+      selectedVersion = version;
+    }
+
+    if (version === 'original') {
+      setBottomNote("Original image selected. If you want AI cleanup later, you can switch back without processing again.");
+    } else {
+      setBottomNote("Processed image selected. Review it carefully on different backgrounds before hitting Done.");
+    }
+
+    renderQualityFlags(version === 'processed' ? qualityFlags : []);
+    updateChoiceButtons();
+    setDoneState();
+  }
+
+  async function moveToReviewScreen() {
+    uploadShell.style.display = 'none';
+    reviewWrap.style.display = 'flex';
+    setStepLabel('Review logo');
+    setDoneState();
   }
 
   async function loadExistingSession(existingId) {
@@ -1512,18 +1925,32 @@ def ui(
     if (!r.ok) throw new Error(j.error || "Saved session not found");
 
     sessionId = existingId;
+    processedAvailable = !!j.processed_available;
+    selectedVersion = j.selected ? (j.active_version || "") : "";
+    qualityFlags = Array.isArray(j.quality_flags) ? j.quality_flags : [];
+    isProcessing = !!j.processing;
 
-    uploadShell.style.display = 'none';
-    previewWrap.style.display = 'block';
-    btnDone.style.display = 'inline-flex';
+    await moveToReviewScreen();
 
-    await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
-    renderQualityFlags(j.quality_flags || []);
-    hideOverlay();
+    if (selectedVersion === 'processed' && processedAvailable) {
+      await switchPreview('processed', false);
+    } else {
+      await switchPreview('original', false);
+    }
+
+    if (isProcessing) {
+      startStageCycle();
+      await pollReady(j.status_url);
+    } else {
+      hideOverlay();
+      renderQualityFlags(selectedVersion === 'processed' ? qualityFlags : []);
+      updateChoiceButtons();
+      setDoneState();
+    }
   }
 
   async function pollReady(statusUrl) {
-    for (let i = 0; i < 180; i++) {
+    for (let i = 0; i < 240; i++) {
       try {
         const r = await fetch(statusUrl + '?t=' + Date.now(), { cache: "no-store" });
         const j = await r.json();
@@ -1531,24 +1958,24 @@ def ui(
         const stage = j.stage || j.status || "processing";
         overlayTitle.textContent = STAGE_LABELS[stage] || "Preparing your image…";
 
-        if (j.status === 'ready') {
+        if (j.status === 'ready' && j.processed_available) {
           stopStageCycle();
-          await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
-          renderQualityFlags(j.quality_flags || []);
+          processedAvailable = true;
+          isProcessing = false;
+          qualityFlags = Array.isArray(j.quality_flags) ? j.quality_flags : [];
+          await switchPreview('processed', true);
           hideOverlay();
-          if (!previewStatus.textContent.trim()) {
-            previewStatus.textContent = "Image ready ✓";
-          }
           return;
         }
 
         if (j.status === 'failed') {
           stopStageCycle();
-          try {
-            await loadPreviewImage(`${API_BASE}/preview/${sessionId}?t=${Date.now()}`);
-          } catch (e) {}
+          isProcessing = false;
           hideOverlay();
-          previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — fallback image ready</span>`;
+          previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — keep original or try again later</span>`;
+          selectedVersion = "";
+          updateChoiceButtons();
+          setDoneState();
           return;
         }
       } catch (e) {
@@ -1559,6 +1986,7 @@ def ui(
     }
 
     stopStageCycle();
+    isProcessing = false;
     overlayTitle.textContent = "Still processing…";
     overlaySub.textContent = "This is taking longer than usual. Please wait a little longer.";
   }
@@ -1567,20 +1995,16 @@ def ui(
     const f = fileEl.files && fileEl.files[0];
     if (!f) return;
 
-    uploadStatus.textContent = "Uploading…";
-    previewStatus.textContent = "";
-    previewImg.removeAttribute("src");
+    uploadStatus.textContent = "Uploading image…";
 
     const fd = new FormData();
     fd.append('file', f);
 
-    const keep = keepOriginalEl.checked ? 'true' : 'false';
-
     try {
-      const r = await fetch(`${API_BASE}/upload?keep_original=${keep}`, {
+      const r = await fetch(`${API_BASE}/upload`, {
         method: 'POST',
         body: fd,
-        cache: "no-store"
+        cache: 'no-store'
       });
 
       const ct = (r.headers.get("content-type") || "").toLowerCase();
@@ -1593,13 +2017,18 @@ def ui(
       if (!r.ok) throw new Error(j.error || 'Upload failed');
 
       sessionId = j.session_id;
+      processedAvailable = false;
+      selectedVersion = "";
+      qualityFlags = [];
+      isProcessing = false;
 
-      uploadShell.style.display = 'none';
-      previewWrap.style.display = 'block';
-      btnDone.style.display = 'inline-flex';
-
-      startStageCycle();
-      await pollReady(j.status_url);
+      await moveToReviewScreen();
+      await loadPreviewImage(`${API_BASE}/preview/${sessionId}?version=original&t=${Date.now()}`);
+      activePreviewVersion = 'original';
+      updateChoiceButtons();
+      renderQualityFlags([]);
+      setDoneState();
+      setBottomNote("Choose original or AI before saving. If it looks wrong here, it will look wrong on products.");
 
     } catch (err) {
       console.error(err);
@@ -1608,13 +2037,74 @@ def ui(
     }
   }
 
+  async function chooseOriginal() {
+    if (!sessionId || isProcessing) return;
+    try {
+      await switchPreview('original', true);
+    } catch (e) {
+      console.error(e);
+      alert(e.message || "Could not use original image.");
+    }
+  }
+
+  async function runAiProcessing() {
+    if (!sessionId || isProcessing) return;
+
+    try {
+      isProcessing = true;
+      setDoneState();
+
+      const resp = await fetch(`${API_BASE}/process/${sessionId}`, {
+        method: 'POST',
+        cache: 'no-store'
+      });
+      const json = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(json.error || "Processing failed to start");
+
+      if (json.cached) {
+        processedAvailable = true;
+        isProcessing = false;
+        await switchPreview('processed', true);
+        hideOverlay();
+        return;
+      }
+
+      startStageCycle();
+      await pollReady(`${API_BASE}/status/${sessionId}`);
+    } catch (e) {
+      console.error(e);
+      isProcessing = false;
+      stopStageCycle();
+      hideOverlay();
+      setDoneState();
+      alert(e.message || "AI processing failed.");
+    }
+  }
+
   fileEl.addEventListener('click', () => { fileEl.value = ""; });
   fileEl.addEventListener('change', handlePickedFile);
   fileEl.addEventListener('input', handlePickedFile);
 
+  btnKeepOriginal.addEventListener('click', chooseOriginal);
+  btnRunAi.addEventListener('click', runAiProcessing);
+  btnUseProcessedAgain.addEventListener('click', async () => {
+    if (!processedAvailable || isProcessing) return;
+    try {
+      await switchPreview('processed', true);
+    } catch (e) {
+      console.error(e);
+      alert(e.message || "Could not switch back to processed image.");
+    }
+  });
+
   btnDone.addEventListener('click', async () => {
     if (!sessionId) {
       alert("No image session found.");
+      return;
+    }
+
+    if (!selectedVersion) {
+      alert("Choose original or processed image before saving.");
       return;
     }
 
@@ -1639,7 +2129,8 @@ def ui(
         session_id: sessionId,
         finalize_url: `${API_BASE}/finalize/${sessionId}`,
         final_image_url: `${API_BASE}/final-file/${sessionId}`,
-        saved: true
+        saved: true,
+        active_version: selectedVersion
       };
 
       const sent = notifyDone(payload);
@@ -1651,6 +2142,7 @@ def ui(
           url.searchParams.set("finalize_url", payload.finalize_url);
           url.searchParams.set("final_image_url", payload.final_image_url);
           url.searchParams.set("saved", "1");
+          url.searchParams.set("active_version", selectedVersion);
           window.location.href = url.toString();
         } else {
           btnDone.textContent = "Saved ✓";
@@ -1663,6 +2155,7 @@ def ui(
       alert(e.message || "Done failed — try again.");
       btnDone.textContent = "Done";
       btnDone.disabled = false;
+      setDoneState();
     }
   });
 
