@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — upload first, choose original vs AI after upload
+# app.py — Studio Uploader (FastAPI) — polished version toggle flow + cleaner premium UI
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="5.0.0")
+app = FastAPI(title="Studio Uploader", version="5.1.0")
 
 
 # ----------------------------
@@ -477,31 +477,6 @@ def _build_original_assets(session_id: str):
     _save_png(original_final, p["orig_curr"])
 
 
-def _set_active_version(session_id: str, version: str):
-    p = _paths(session_id)
-    if version == "original":
-        if not p["orig_preview"].exists() or not p["orig_curr"].exists():
-            raise FileNotFoundError("Original version not found")
-        _save_png(Image.open(p["orig_preview"]).convert("RGBA"), p["curr"].with_name(p["curr"].name.replace("_curr", "_preview_placeholder")))  # unused placeholder safety
-        p["curr"].write_bytes(p["orig_curr"].read_bytes())
-        _save_png(Image.open(p["orig_preview"]).convert("RGBA"), p["orig_preview"])  # noop normalize save
-    elif version == "processed":
-        if not p["ai_preview"].exists() or not p["ai_curr"].exists():
-            raise FileNotFoundError("Processed version not found")
-        p["curr"].write_bytes(p["ai_curr"].read_bytes())
-    else:
-        raise ValueError("Invalid version")
-
-    _sess_set(
-        session_id,
-        active_version=version,
-        selected=True,
-        finalized=False,
-        final_path="",
-        final_version="",
-    )
-
-
 def _write_active_files(session_id: str, version: str):
     p = _paths(session_id)
     if version == "original":
@@ -510,18 +485,6 @@ def _write_active_files(session_id: str, version: str):
         p["curr"].write_bytes(p["ai_curr"].read_bytes())
     else:
         raise ValueError("Invalid version")
-
-
-def _preview_bytes_for_version(session_id: str, version: str) -> bytes:
-    p = _paths(session_id)
-    if version == "original":
-        return p["orig_preview"].read_bytes()
-    if version == "processed":
-        return p["ai_preview"].read_bytes()
-    active = _sess_get(session_id).get("active_version", "")
-    if active == "processed" and p["ai_preview"].exists():
-        return p["ai_preview"].read_bytes()
-    return p["orig_preview"].read_bytes()
 
 
 # ----------------------------
@@ -852,7 +815,6 @@ def get_preview(session_id: str, version: str = Query("active")):
                 return JSONResponse({"error": "Not found"}, status_code=404)
             return Response(content=path.read_bytes(), media_type="image/png")
 
-        # active fallback
         s = _sess_get(session_id)
         active_version = s.get("active_version", "")
         if active_version == "processed" and p["ai_preview"].exists():
@@ -1157,18 +1119,26 @@ def ui(
   <title>Studio Uploader</title>
   <style>
     :root {
-      --bg0: #f6f8fb;
-      --bg1: #eef3f8;
-      --panel-border: rgba(15,23,42,0.07);
+      --bg0: #f7f8fb;
+      --bg1: #edf2f7;
+      --card: rgba(255,255,255,0.82);
+      --card-2: rgba(255,255,255,0.66);
+      --border: rgba(15,23,42,0.08);
+      --border-soft: rgba(15,23,42,0.06);
       --text: #0f172a;
       --muted: #667085;
-      --shadow: 0 26px 70px rgba(15,23,42,0.12);
+      --muted-2: #64748b;
+      --shadow-lg: 0 28px 80px rgba(15,23,42,0.10);
+      --shadow-md: 0 14px 32px rgba(15,23,42,0.08);
       --green1: #34d399;
       --green2: #10b981;
       --blue1: #0f172a;
-      --warn-bg: rgba(245,158,11,0.12);
-      --warn-border: rgba(245,158,11,0.24);
-      --warn-text: #b45309;
+      --blue2: #1f2937;
+      --blue3: #334155;
+      --soft-fill: rgba(15,23,42,0.045);
+      --warn-bg: rgba(245,158,11,0.10);
+      --warn-border: rgba(245,158,11,0.20);
+      --warn-text: #a16207;
     }
 
     * { box-sizing: border-box; }
@@ -1184,15 +1154,18 @@ def ui(
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(1200px 480px at 50% -120px, rgba(255,255,255,0.95), rgba(255,255,255,0) 60%),
+        radial-gradient(900px 420px at 50% -130px, rgba(255,255,255,0.95), rgba(255,255,255,0) 60%),
         linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 100%);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
 
     .app {
       min-height: 100vh;
       display: flex;
       flex-direction: column;
-      padding: 8px;
+      padding: 10px;
+      gap: 10px;
     }
 
     .topbar {
@@ -1201,7 +1174,14 @@ def ui(
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 8px 4px 10px;
+      padding: 2px 4px 2px;
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
     }
 
     .step-label {
@@ -1222,36 +1202,39 @@ def ui(
       color: #475569;
       border: 1px solid rgba(15,23,42,0.06);
       font-size: 12px;
-      font-weight: 700;
-    }
-
-    .topbar-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
+      font-weight: 800;
+      line-height: 1;
+      white-space: nowrap;
     }
 
     .btn-done {
       display: none;
+      align-items: center;
+      justify-content: center;
       border: none;
       border-radius: 999px;
-      padding: 10px 16px;
-      min-width: 88px;
+      min-height: 42px;
+      height: 42px;
+      min-width: 92px;
+      padding: 0 18px;
       background: linear-gradient(180deg, var(--green1), var(--green2));
       color: white;
       font-size: 13px;
       font-weight: 800;
+      line-height: 1;
       letter-spacing: -0.01em;
-      box-shadow: 0 10px 22px rgba(16,185,129,0.20);
+      box-shadow: 0 12px 26px rgba(16,185,129,0.18);
       cursor: pointer;
       white-space: nowrap;
+      transition: transform 0.12s ease, opacity 0.15s ease, box-shadow 0.15s ease;
     }
 
+    .btn-done:hover { transform: translateY(-1px); }
     .btn-done:disabled {
-      opacity: 0.55;
+      opacity: 0.56;
       cursor: not-allowed;
       box-shadow: none;
+      transform: none;
     }
 
     .main {
@@ -1265,30 +1248,30 @@ def ui(
     .shell,
     .review-wrap {
       width: min(980px, 100%);
-      background: rgba(255,255,255,0.82);
-      backdrop-filter: blur(18px) saturate(1.12);
-      border: 1px solid var(--panel-border);
-      border-radius: 28px;
-      box-shadow: var(--shadow);
+      background: var(--card);
+      backdrop-filter: blur(22px) saturate(1.08);
+      border: 1px solid var(--border);
+      border-radius: 30px;
+      box-shadow: var(--shadow-lg);
       padding: 16px;
     }
 
     .shell {
       display: flex;
       flex-direction: column;
-      gap: 12px;
       justify-content: center;
-      min-height: 0;
+      gap: 12px;
     }
 
     .upload-box {
       position: relative;
       border-radius: 24px;
-      padding: 26px 18px;
+      padding: 28px 18px;
       text-align: center;
-      border: 1.5px dashed rgba(15,23,42,0.12);
-      background: rgba(255,255,255,0.60);
+      border: 1.5px dashed rgba(15,23,42,0.11);
+      background: var(--card-2);
       overflow: hidden;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
     }
 
     .upload-box input {
@@ -1300,10 +1283,15 @@ def ui(
       height: 100%;
     }
 
+    .upload-emoji {
+      font-size: 28px;
+      line-height: 1;
+    }
+
     .title {
       font-size: 19px;
       font-weight: 800;
-      letter-spacing: -0.02em;
+      letter-spacing: -0.03em;
       margin-top: 8px;
     }
 
@@ -1319,10 +1307,11 @@ def ui(
     }
 
     .guide-card {
-      border-radius: 18px;
+      border-radius: 20px;
       background: rgba(255,255,255,0.74);
-      border: 1px solid rgba(15,23,42,0.08);
+      border: 1px solid var(--border);
       padding: 11px 13px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.82);
     }
 
     .guide-title {
@@ -1330,11 +1319,12 @@ def ui(
       font-weight: 800;
       color: #0f172a;
       margin-bottom: 4px;
+      letter-spacing: -0.01em;
     }
 
     .guide-text {
       font-size: 12px;
-      line-height: 1.5;
+      line-height: 1.52;
       color: #475569;
     }
 
@@ -1345,7 +1335,7 @@ def ui(
       justify-content: center;
       gap: 8px;
       flex-wrap: wrap;
-      color: #64748b;
+      color: var(--muted-2);
       font-size: 13px;
       font-weight: 700;
       text-align: center;
@@ -1362,26 +1352,30 @@ def ui(
       display: flex;
       align-items: flex-start;
       gap: 10px;
-      border-radius: 18px;
+      border-radius: 20px;
       padding: 12px 14px;
-      background: rgba(245,158,11,0.08);
-      border: 1px solid rgba(245,158,11,0.18);
-      color: #92400e;
+      background: var(--warn-bg);
+      border: 1px solid var(--warn-border);
+      color: var(--warn-text);
       font-size: 12px;
       line-height: 1.5;
       font-weight: 700;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
     }
 
     .preview-stage {
       position: relative;
-      border-radius: 24px;
-      min-height: 360px;
+      border-radius: 26px;
+      min-height: 380px;
       display: flex;
       align-items: center;
       justify-content: center;
-      border: 1px solid rgba(15,23,42,0.08);
+      border: 1px solid var(--border);
       background: #ffffff;
       overflow: hidden;
+      box-shadow:
+        inset 0 1px 0 rgba(255,255,255,0.95),
+        0 10px 24px rgba(15,23,42,0.05);
     }
 
     .preview-stage img {
@@ -1389,6 +1383,7 @@ def ui(
       height: min(88vw, 62vh, 760px);
       object-fit: contain;
       display: block;
+      filter: drop-shadow(0 10px 22px rgba(15,23,42,0.07));
     }
 
     .preview-stage.bg-checker {
@@ -1412,90 +1407,135 @@ def ui(
       background-image: none;
     }
 
-    .choice-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      justify-content: center;
-      align-items: center;
+    .toolbar-card {
+      border-radius: 22px;
+      background: rgba(255,255,255,0.74);
+      border: 1px solid var(--border);
+      padding: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.82);
     }
 
-    .main-choice-btn,
+    .toolbar-label {
+      text-align: center;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .segmented {
+      display: flex;
+      gap: 8px;
+      width: 100%;
+      justify-content: center;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .seg-btn,
     .ghost-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
       border-radius: 999px;
       font-size: 13px;
       font-weight: 800;
+      line-height: 1;
+      white-space: nowrap;
       cursor: pointer;
-      transition: transform 0.08s ease, opacity 0.15s ease;
+      transition: transform 0.10s ease, opacity 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      user-select: none;
     }
 
-    .main-choice-btn:hover,
+    .seg-btn:hover,
     .ghost-btn:hover {
       transform: translateY(-1px);
     }
 
-    .main-choice-btn:disabled,
+    .seg-btn:disabled,
     .ghost-btn:disabled {
-      opacity: 0.55;
+      opacity: 0.56;
       cursor: not-allowed;
       transform: none;
     }
 
-    .main-choice-btn {
+    .seg-btn {
       min-height: 44px;
+      height: 44px;
       padding: 0 16px;
-      border: 1px solid rgba(15,23,42,0.08);
+      border: 1px solid var(--border);
       background: rgba(255,255,255,0.92);
       color: #0f172a;
-      box-shadow: 0 6px 18px rgba(15,23,42,0.06);
+      box-shadow: 0 8px 18px rgba(15,23,42,0.05);
+      min-width: 220px;
     }
 
-    .main-choice-btn.primary {
+    .seg-btn.active {
+      background: linear-gradient(180deg, var(--blue2), var(--blue1));
+      color: white;
+      border-color: rgba(15,23,42,0.16);
+      box-shadow: 0 12px 24px rgba(15,23,42,0.16);
+    }
+
+    .seg-btn.process {
       background: linear-gradient(180deg, #1f2937, #0f172a);
       color: white;
-      border-color: rgba(15,23,42,0.15);
-      box-shadow: 0 10px 22px rgba(15,23,42,0.16);
+      border-color: rgba(15,23,42,0.16);
+      box-shadow: 0 12px 24px rgba(15,23,42,0.16);
     }
 
-    .main-choice-btn.success {
-      background: linear-gradient(180deg, var(--green1), var(--green2));
-      color: white;
-      border-color: rgba(16,185,129,0.18);
-      box-shadow: 0 10px 22px rgba(16,185,129,0.18);
+    .bg-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      align-items: center;
     }
 
     .ghost-btn {
+      min-height: 40px;
       height: 40px;
       padding: 0 14px;
-      border: 1px solid rgba(15,23,42,0.08);
-      background: rgba(255,255,255,0.82);
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.88);
       color: #334155;
+      box-shadow: 0 6px 16px rgba(15,23,42,0.04);
     }
 
     .ghost-btn.active {
       background: #0f172a;
       color: white;
+      border-color: rgba(15,23,42,0.16);
+      box-shadow: 0 10px 18px rgba(15,23,42,0.12);
     }
 
     .small-note {
       text-align: center;
-      color: #64748b;
+      color: var(--muted-2);
       font-size: 12px;
-      line-height: 1.45;
-      font-weight: 600;
+      line-height: 1.5;
+      font-weight: 650;
+      max-width: 680px;
+      margin: 0 auto;
     }
 
     .warn-badge {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
       padding: 7px 11px;
       border-radius: 999px;
-      background: var(--warn-bg);
-      border: 1px solid var(--warn-border);
-      color: var(--warn-text);
+      background: rgba(245,158,11,0.12);
+      border: 1px solid rgba(245,158,11,0.22);
+      color: #b45309;
       font-size: 12px;
       font-weight: 800;
+      line-height: 1;
+      white-space: nowrap;
     }
 
     .processing-overlay {
@@ -1508,19 +1548,19 @@ def ui(
       flex-direction: column;
       gap: 12px;
       text-align: center;
-      background: linear-gradient(180deg, rgba(255,255,255,0.74), rgba(255,255,255,0.88));
-      backdrop-filter: blur(6px);
+      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.90));
+      backdrop-filter: blur(8px);
       padding: 22px;
     }
 
     .processing-overlay.show { display: flex; }
 
     .spinner {
-      width: 44px;
-      height: 44px;
+      width: 46px;
+      height: 46px;
       border-radius: 999px;
       border: 3px solid rgba(15,23,42,0.10);
-      border-top-color: rgba(15,23,42,0.80);
+      border-top-color: rgba(15,23,42,0.82);
       animation: spin 0.9s linear infinite;
     }
 
@@ -1539,51 +1579,31 @@ def ui(
     .overlay-sub {
       max-width: 430px;
       font-size: 13px;
-      color: #64748b;
+      color: var(--muted-2);
       line-height: 1.45;
-      font-weight: 600;
+      font-weight: 650;
     }
 
     @media (max-width: 640px) {
       .app {
         padding: 6px;
-      }
-
-      .topbar {
-        padding: 2px 2px 8px;
+        gap: 8px;
       }
 
       .shell,
       .review-wrap {
-        border-radius: 20px;
+        border-radius: 22px;
         padding: 12px;
       }
 
       .upload-box {
-        border-radius: 16px;
+        border-radius: 18px;
         padding: 18px 12px;
-      }
-
-      .title {
-        font-size: 17px;
-      }
-
-      .muted {
-        font-size: 12px;
-      }
-
-      .guide-title {
-        font-size: 12px;
-      }
-
-      .guide-text {
-        font-size: 11px;
-        line-height: 1.45;
       }
 
       .preview-stage {
         min-height: 250px;
-        border-radius: 18px;
+        border-radius: 20px;
       }
 
       .preview-stage img {
@@ -1596,19 +1616,28 @@ def ui(
         font-size: 11px;
       }
 
-      .main-choice-btn,
-      .ghost-btn,
-      .btn-done {
+      .seg-btn {
+        min-width: 100%;
+        width: 100%;
+        height: 42px;
         min-height: 42px;
         font-size: 12px;
       }
 
-      .choice-row,
-      .status-row {
-        gap: 8px;
+      .ghost-btn,
+      .btn-done {
+        min-height: 40px;
+        height: 40px;
+        font-size: 12px;
       }
 
-      .small-note {
+      .guide-title {
+        font-size: 12px;
+      }
+
+      .guide-text,
+      .small-note,
+      .muted {
         font-size: 11px;
       }
 
@@ -1632,10 +1661,10 @@ def ui(
       <div class="shell" id="uploadShell">
         <div class="upload-box">
           <input id="file" type="file" accept="image/*" />
-          <div style="font-size:28px;">✨</div>
+          <div class="upload-emoji">✨</div>
           <div class="title">Upload your logo</div>
           <div class="muted" style="margin-top:6px;">
-            Upload first. On the next screen you will choose either <strong>Keep original image</strong> or <strong>Send for background removal and upscale</strong>.
+            Upload first. Then choose either <strong>Use original image</strong> or <strong>Send for AI cleanup</strong>.
           </div>
         </div>
 
@@ -1643,21 +1672,21 @@ def ui(
           <div class="guide-card">
             <div class="guide-title">Best results</div>
             <div class="guide-text">
-              For the best result, upload an image that is already clean and as sharp as possible.
+              Use a clean image when possible. The better the upload, the better the final result.
             </div>
           </div>
 
           <div class="guide-card">
-            <div class="guide-title">AI processing is optional</div>
+            <div class="guide-title">AI is optional</div>
             <div class="guide-text">
-              After upload, you can send the image for background removal and upscale, or keep the original image instead.
+              After upload, you can keep the original image or send it for background removal and upscale.
             </div>
           </div>
 
           <div class="guide-card">
-            <div class="guide-title">Check it carefully</div>
+            <div class="guide-title">Check carefully</div>
             <div class="guide-text">
-              If it looks wrong here, it will look wrong on the final product. Review it before you hit <strong>Done</strong>.
+              If it looks wrong here, it will look wrong on the final product. Review it before you click <strong>Done</strong>.
             </div>
           </div>
         </div>
@@ -1669,7 +1698,7 @@ def ui(
         <div class="warning-banner">
           <div>⚠️</div>
           <div>
-            Choose one version before saving. If the background removal or cleanup looks wrong here, it will show up wrong on your products.
+            Choose one version before saving. If the cleanup or edges look wrong here, they will look wrong on your products.
           </div>
         </div>
 
@@ -1682,13 +1711,12 @@ def ui(
           </div>
         </div>
 
-        <div class="choice-row">
-          <button class="main-choice-btn" id="btnKeepOriginal">Keep original image</button>
-          <button class="main-choice-btn primary" id="btnRunAi">Send for background removal and upscale</button>
-          <button class="main-choice-btn success" id="btnUseProcessedAgain" style="display:none;">Use processed image again</button>
+        <div class="toolbar-card">
+          <div class="toolbar-label" id="versionToolbarLabel">Choose image version</div>
+          <div class="segmented" id="versionSelector"></div>
         </div>
 
-        <div class="choice-row">
+        <div class="bg-row">
           <button class="ghost-btn active" id="bgChecker">Grid</button>
           <button class="ghost-btn" id="bgWhite">White</button>
           <button class="ghost-btn" id="bgDark">Dark</button>
@@ -1732,9 +1760,8 @@ def ui(
   const bgWhite = document.getElementById('bgWhite');
   const bgDark = document.getElementById('bgDark');
 
-  const btnKeepOriginal = document.getElementById('btnKeepOriginal');
-  const btnRunAi = document.getElementById('btnRunAi');
-  const btnUseProcessedAgain = document.getElementById('btnUseProcessedAgain');
+  const versionSelector = document.getElementById('versionSelector');
+  const versionToolbarLabel = document.getElementById('versionToolbarLabel');
 
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
@@ -1758,7 +1785,7 @@ def ui(
 
   const CYCLE_MESSAGES = [
     "Uploading image…",
-    "Sending to background removal…",
+    "Sending to AI cleanup…",
     "Cleaning edges…",
     "Upscaling image…",
     "Building final image…"
@@ -1841,14 +1868,14 @@ def ui(
     if (qualityFlags.includes("heavy_soft_edges")) warnings.push("Soft edges detected");
     if (qualityFlags.includes("subject_too_small")) warnings.push("Logo looks small");
 
-    if (warnings.length) {
+    if (warnings.length && selectedVersion === "processed") {
       previewStatus.innerHTML = warnings.map(w => `<span class="warn-badge">⚠ ${w}</span>`).join(" ");
     } else if (selectedVersion === "processed") {
-      previewStatus.textContent = "Processed image ready ✓";
+      previewStatus.textContent = "AI processed image selected ✓";
     } else if (selectedVersion === "original") {
       previewStatus.textContent = "Original image selected ✓";
     } else {
-      previewStatus.textContent = "Choose original or AI before saving.";
+      previewStatus.textContent = "Choose a version before saving.";
     }
   }
 
@@ -1858,21 +1885,69 @@ def ui(
     btnDone.style.display = reviewWrap.style.display === 'flex' ? 'inline-flex' : 'none';
   }
 
-  function updateChoiceButtons() {
-    btnKeepOriginal.classList.toggle('success', selectedVersion === 'original');
-    btnKeepOriginal.textContent = selectedVersion === 'original' ? 'Using original image' : 'Keep original image';
-
-    if (processedAvailable) {
-      btnRunAi.style.display = activePreviewVersion === 'processed' ? 'none' : 'inline-flex';
-      btnUseProcessedAgain.style.display = activePreviewVersion === 'original' ? 'inline-flex' : 'none';
-    } else {
-      btnRunAi.style.display = 'inline-flex';
-      btnUseProcessedAgain.style.display = 'none';
-    }
-  }
-
   function setBottomNote(text) {
     document.getElementById('bottomNote').textContent = text;
+  }
+
+  function renderVersionSelector() {
+    versionSelector.innerHTML = "";
+
+    const makeBtn = ({ label, version = "", mode = "select", active = false, tone = "" }) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "seg-btn";
+      if (active) btn.classList.add("active");
+      if (tone) btn.classList.add(tone);
+      btn.textContent = label;
+
+      if (mode === "process") {
+        btn.addEventListener("click", runAiProcessing);
+        btn.disabled = isProcessing;
+      } else {
+        btn.addEventListener("click", async () => {
+          if (isProcessing) return;
+          try {
+            await switchPreview(version, true);
+          } catch (e) {
+            console.error(e);
+            alert(e.message || "Could not switch image version.");
+          }
+        });
+        btn.disabled = isProcessing;
+      }
+
+      versionSelector.appendChild(btn);
+    };
+
+    if (!processedAvailable) {
+      versionToolbarLabel.textContent = "Choose image version";
+      makeBtn({
+        label: "Use original image",
+        version: "original",
+        mode: "select",
+        active: selectedVersion === "original"
+      });
+      makeBtn({
+        label: "Send for AI cleanup",
+        mode: "process",
+        tone: "process"
+      });
+      return;
+    }
+
+    versionToolbarLabel.textContent = "Switch between saved versions";
+    makeBtn({
+      label: "Use original image",
+      version: "original",
+      mode: "select",
+      active: selectedVersion === "original"
+    });
+    makeBtn({
+      label: "Use AI processed image",
+      version: "processed",
+      mode: "select",
+      active: selectedVersion === "processed"
+    });
   }
 
   async function loadPreviewImage(src) {
@@ -1902,13 +1977,15 @@ def ui(
     }
 
     if (version === 'original') {
-      setBottomNote("Original image selected. If you want AI cleanup later, you can switch back without processing again.");
+      setBottomNote(processedAvailable
+        ? "Original image selected. You can switch back to the AI processed version instantly."
+        : "Original image selected. You can hit Done now, or send it for AI cleanup first.");
     } else {
-      setBottomNote("Processed image selected. Review it carefully on different backgrounds before hitting Done.");
+      setBottomNote("AI processed image selected. Review it carefully on different backgrounds before clicking Done.");
     }
 
     renderQualityFlags(version === 'processed' ? qualityFlags : []);
-    updateChoiceButtons();
+    renderVersionSelector();
     setDoneState();
   }
 
@@ -1916,6 +1993,7 @@ def ui(
     uploadShell.style.display = 'none';
     reviewWrap.style.display = 'flex';
     setStepLabel('Review logo');
+    renderVersionSelector();
     setDoneState();
   }
 
@@ -1944,7 +2022,7 @@ def ui(
     } else {
       hideOverlay();
       renderQualityFlags(selectedVersion === 'processed' ? qualityFlags : []);
-      updateChoiceButtons();
+      renderVersionSelector();
       setDoneState();
     }
   }
@@ -1972,9 +2050,9 @@ def ui(
           stopStageCycle();
           isProcessing = false;
           hideOverlay();
-          previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — keep original or try again later</span>`;
+          previewStatus.innerHTML = `<span class="warn-badge">⚠ Processing failed — use original image or try again later</span>`;
           selectedVersion = "";
-          updateChoiceButtons();
+          renderVersionSelector();
           setDoneState();
           return;
         }
@@ -1989,6 +2067,8 @@ def ui(
     isProcessing = false;
     overlayTitle.textContent = "Still processing…";
     overlaySub.textContent = "This is taking longer than usual. Please wait a little longer.";
+    renderVersionSelector();
+    setDoneState();
   }
 
   async function handlePickedFile() {
@@ -2025,7 +2105,7 @@ def ui(
       await moveToReviewScreen();
       await loadPreviewImage(`${API_BASE}/preview/${sessionId}?version=original&t=${Date.now()}`);
       activePreviewVersion = 'original';
-      updateChoiceButtons();
+      renderVersionSelector();
       renderQualityFlags([]);
       setDoneState();
       setBottomNote("Choose original or AI before saving. If it looks wrong here, it will look wrong on products.");
@@ -2037,21 +2117,12 @@ def ui(
     }
   }
 
-  async function chooseOriginal() {
-    if (!sessionId || isProcessing) return;
-    try {
-      await switchPreview('original', true);
-    } catch (e) {
-      console.error(e);
-      alert(e.message || "Could not use original image.");
-    }
-  }
-
   async function runAiProcessing() {
-    if (!sessionId || isProcessing) return;
+    if (!sessionId || isProcessing || processedAvailable) return;
 
     try {
       isProcessing = true;
+      renderVersionSelector();
       setDoneState();
 
       const resp = await fetch(`${API_BASE}/process/${sessionId}`, {
@@ -2076,6 +2147,7 @@ def ui(
       isProcessing = false;
       stopStageCycle();
       hideOverlay();
+      renderVersionSelector();
       setDoneState();
       alert(e.message || "AI processing failed.");
     }
@@ -2084,18 +2156,6 @@ def ui(
   fileEl.addEventListener('click', () => { fileEl.value = ""; });
   fileEl.addEventListener('change', handlePickedFile);
   fileEl.addEventListener('input', handlePickedFile);
-
-  btnKeepOriginal.addEventListener('click', chooseOriginal);
-  btnRunAi.addEventListener('click', runAiProcessing);
-  btnUseProcessedAgain.addEventListener('click', async () => {
-    if (!processedAvailable || isProcessing) return;
-    try {
-      await switchPreview('processed', true);
-    } catch (e) {
-      console.error(e);
-      alert(e.message || "Could not switch back to processed image.");
-    }
-  });
 
   btnDone.addEventListener('click', async () => {
     if (!sessionId) {
