@@ -1,4 +1,4 @@
-# app.py — Studio Uploader (FastAPI) — polished version toggle flow + cleaner premium UI
+# app.py — Studio Uploader (FastAPI) — neutral initial selector + required selection warning + faster transition to review screen
 from __future__ import annotations
 
 import os
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Studio Uploader", version="5.1.0")
+app = FastAPI(title="Studio Uploader", version="5.2.0")
 
 
 # ----------------------------
@@ -58,7 +58,7 @@ MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
 PHOTOROOM_ENDPOINT = (os.getenv("PHOTOROOM_ENDPOINT") or "https://sdk.photoroom.com/v1/segment").strip()
 PHOTOROOM_TIMEOUT = int(os.getenv("PHOTOROOM_TIMEOUT", "60"))
-PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "hd").strip()  # preview | hd
+PHOTOROOM_SIZE = (os.getenv("PHOTOROOM_SIZE") or "hd").strip()
 PHOTOROOM_CROP = os.getenv("PHOTOROOM_CROP", "false").strip().lower() in ("1", "true", "yes", "y")
 PHOTOROOM_FORMAT = (os.getenv("PHOTOROOM_FORMAT") or "png").strip()
 PHOTOROOM_MAX_DIM = int(os.getenv("PHOTOROOM_MAX_DIM", "2000"))
@@ -1124,21 +1124,21 @@ def ui(
       --card: rgba(255,255,255,0.82);
       --card-2: rgba(255,255,255,0.66);
       --border: rgba(15,23,42,0.08);
-      --border-soft: rgba(15,23,42,0.06);
       --text: #0f172a;
       --muted: #667085;
       --muted-2: #64748b;
       --shadow-lg: 0 28px 80px rgba(15,23,42,0.10);
-      --shadow-md: 0 14px 32px rgba(15,23,42,0.08);
       --green1: #34d399;
       --green2: #10b981;
       --blue1: #0f172a;
       --blue2: #1f2937;
       --blue3: #334155;
-      --soft-fill: rgba(15,23,42,0.045);
       --warn-bg: rgba(245,158,11,0.10);
       --warn-border: rgba(245,158,11,0.20);
       --warn-text: #a16207;
+      --danger: #dc2626;
+      --danger-soft: rgba(220,38,38,0.08);
+      --danger-border: rgba(220,38,38,0.18);
     }
 
     * { box-sizing: border-box; }
@@ -1413,6 +1413,12 @@ def ui(
       border: 1px solid var(--border);
       padding: 12px;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.82);
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+
+    .toolbar-card.needs-attention {
+      border-color: var(--danger-border);
+      background: linear-gradient(180deg, rgba(255,255,255,0.76), var(--danger-soft));
     }
 
     .toolbar-label {
@@ -1423,6 +1429,16 @@ def ui(
       letter-spacing: 0.02em;
       text-transform: uppercase;
       margin-bottom: 10px;
+    }
+
+    .toolbar-label .req-star {
+      color: var(--danger);
+      margin-left: 4px;
+      display: none;
+    }
+
+    .toolbar-card.needs-attention .toolbar-label .req-star {
+      display: inline;
     }
 
     .segmented {
@@ -1467,8 +1483,8 @@ def ui(
       height: 44px;
       padding: 0 16px;
       border: 1px solid var(--border);
-      background: rgba(255,255,255,0.92);
-      color: #0f172a;
+      background: rgba(255,255,255,0.96);
+      color: #334155;
       box-shadow: 0 8px 18px rgba(15,23,42,0.05);
       min-width: 220px;
     }
@@ -1481,10 +1497,10 @@ def ui(
     }
 
     .seg-btn.process {
-      background: linear-gradient(180deg, #1f2937, #0f172a);
-      color: white;
-      border-color: rgba(15,23,42,0.16);
-      box-shadow: 0 12px 24px rgba(15,23,42,0.16);
+      background: rgba(255,255,255,0.96);
+      color: #334155;
+      border-color: var(--border);
+      box-shadow: 0 8px 18px rgba(15,23,42,0.05);
     }
 
     .bg-row {
@@ -1548,7 +1564,7 @@ def ui(
       flex-direction: column;
       gap: 12px;
       text-align: center;
-      background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0.90));
+      background: linear-gradient(180deg, rgba(255,255,255,0.80), rgba(255,255,255,0.92));
       backdrop-filter: blur(8px);
       padding: 22px;
     }
@@ -1707,12 +1723,14 @@ def ui(
           <div class="processing-overlay" id="processingOverlay">
             <div class="spinner"></div>
             <div class="overlay-title" id="overlayTitle">Preparing your image…</div>
-            <div class="overlay-sub" id="overlaySub">Please wait while we process your file.</div>
+            <div class="overlay-sub" id="overlaySub">Please wait while we prepare your preview.</div>
           </div>
         </div>
 
-        <div class="toolbar-card">
-          <div class="toolbar-label" id="versionToolbarLabel">Choose image version</div>
+        <div class="toolbar-card" id="toolbarCard">
+          <div class="toolbar-label" id="versionToolbarLabel">
+            Choose image version <span class="req-star" id="reqStar">*</span>
+          </div>
           <div class="segmented" id="versionSelector"></div>
         </div>
 
@@ -1724,7 +1742,7 @@ def ui(
 
         <div class="status-row" id="previewStatus"></div>
         <div class="small-note" id="bottomNote">
-          Upload first, then choose original or AI. Done stays locked until you pick one.
+          Choose original or AI before saving. Done stays locked until you pick one.
         </div>
       </div>
     </div>
@@ -1762,6 +1780,7 @@ def ui(
 
   const versionSelector = document.getElementById('versionSelector');
   const versionToolbarLabel = document.getElementById('versionToolbarLabel');
+  const toolbarCard = document.getElementById('toolbarCard');
 
   const params = new URLSearchParams(window.location.search);
   const SLOT = params.get('slot') || 'main';
@@ -1771,7 +1790,7 @@ def ui(
   document.getElementById('slotPill').textContent = SLOT;
 
   const STAGE_LABELS = {
-    uploaded: "Choose original or AI",
+    uploaded: "Preparing preview…",
     loading_image: "Loading image…",
     removing_background: "Removing background…",
     cleaning_edges: "Cleaning edges…",
@@ -1784,7 +1803,7 @@ def ui(
   };
 
   const CYCLE_MESSAGES = [
-    "Uploading image…",
+    "Preparing preview…",
     "Sending to AI cleanup…",
     "Cleaning edges…",
     "Upscaling image…",
@@ -1833,7 +1852,7 @@ def ui(
   bgWhite.addEventListener('click', () => setBgMode('white'));
   bgDark.addEventListener('click', () => setBgMode('dark'));
 
-  function showOverlay(title, sub = "Please wait while we process your file.") {
+  function showOverlay(title, sub = "Please wait while we prepare your preview.") {
     processingOverlay.classList.add('show');
     overlayTitle.textContent = title || "Preparing your image…";
     overlaySub.textContent = sub;
@@ -1846,7 +1865,7 @@ def ui(
   function startStageCycle() {
     stopStageCycle();
     let i = 0;
-    showOverlay(CYCLE_MESSAGES[0], "Please wait while we process your file.");
+    showOverlay(CYCLE_MESSAGES[0], "Please wait while we prepare your preview.");
     stageCycleTimer = setInterval(() => {
       i = (i + 1) % CYCLE_MESSAGES.length;
       overlayTitle.textContent = CYCLE_MESSAGES[i];
@@ -1858,6 +1877,10 @@ def ui(
       clearInterval(stageCycleTimer);
       stageCycleTimer = null;
     }
+  }
+
+  function setSelectionError(show) {
+    toolbarCard.classList.toggle('needs-attention', !!show);
   }
 
   function renderQualityFlags(flags) {
@@ -1892,12 +1915,12 @@ def ui(
   function renderVersionSelector() {
     versionSelector.innerHTML = "";
 
-    const makeBtn = ({ label, version = "", mode = "select", active = false, tone = "" }) => {
+    const makeBtn = ({ label, version = "", mode = "select", active = false }) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "seg-btn";
       if (active) btn.classList.add("active");
-      if (tone) btn.classList.add(tone);
+      if (mode === "process") btn.classList.add("process");
       btn.textContent = label;
 
       if (mode === "process") {
@@ -1907,6 +1930,7 @@ def ui(
         btn.addEventListener("click", async () => {
           if (isProcessing) return;
           try {
+            setSelectionError(false);
             await switchPreview(version, true);
           } catch (e) {
             console.error(e);
@@ -1920,7 +1944,7 @@ def ui(
     };
 
     if (!processedAvailable) {
-      versionToolbarLabel.textContent = "Choose image version";
+      versionToolbarLabel.childNodes[0].nodeValue = "Choose image version ";
       makeBtn({
         label: "Use original image",
         version: "original",
@@ -1930,12 +1954,12 @@ def ui(
       makeBtn({
         label: "Send for AI cleanup",
         mode: "process",
-        tone: "process"
+        active: false
       });
       return;
     }
 
-    versionToolbarLabel.textContent = "Switch between saved versions";
+    versionToolbarLabel.childNodes[0].nodeValue = "Choose image version ";
     makeBtn({
       label: "Use original image",
       version: "original",
@@ -1974,6 +1998,7 @@ def ui(
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || "Failed to select image version");
       selectedVersion = version;
+      setSelectionError(false);
     }
 
     if (version === 'original') {
@@ -1989,12 +2014,15 @@ def ui(
     setDoneState();
   }
 
-  async function moveToReviewScreen() {
+  async function moveToReviewScreen(showLoader = false, loaderText = "Preparing preview…") {
     uploadShell.style.display = 'none';
     reviewWrap.style.display = 'flex';
     setStepLabel('Review logo');
     renderVersionSelector();
     setDoneState();
+    if (showLoader) {
+      showOverlay(loaderText, "Please wait while we load your image.");
+    }
   }
 
   async function loadExistingSession(existingId) {
@@ -2008,7 +2036,7 @@ def ui(
     qualityFlags = Array.isArray(j.quality_flags) ? j.quality_flags : [];
     isProcessing = !!j.processing;
 
-    await moveToReviewScreen();
+    await moveToReviewScreen(true, "Loading saved image…");
 
     if (selectedVersion === 'processed' && processedAvailable) {
       await switchPreview('processed', false);
@@ -2054,6 +2082,7 @@ def ui(
           selectedVersion = "";
           renderVersionSelector();
           setDoneState();
+          setSelectionError(true);
           return;
         }
       } catch (e) {
@@ -2102,12 +2131,15 @@ def ui(
       qualityFlags = [];
       isProcessing = false;
 
-      await moveToReviewScreen();
-      await loadPreviewImage(`${API_BASE}/preview/${sessionId}?version=original&t=${Date.now()}`);
+      await moveToReviewScreen(true, "Loading preview…");
       activePreviewVersion = 'original';
+      await loadPreviewImage(`${API_BASE}/preview/${sessionId}?version=original&t=${Date.now()}`);
+      hideOverlay();
+
       renderVersionSelector();
       renderQualityFlags([]);
       setDoneState();
+      setSelectionError(false);
       setBottomNote("Choose original or AI before saving. If it looks wrong here, it will look wrong on products.");
 
     } catch (err) {
@@ -2122,6 +2154,7 @@ def ui(
 
     try {
       isProcessing = true;
+      setSelectionError(false);
       renderVersionSelector();
       setDoneState();
 
@@ -2164,7 +2197,8 @@ def ui(
     }
 
     if (!selectedVersion) {
-      alert("Choose original or processed image before saving.");
+      setSelectionError(true);
+      alert("Please choose either the original image or the AI processed image before continuing.");
       return;
     }
 
