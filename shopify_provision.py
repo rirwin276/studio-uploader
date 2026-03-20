@@ -559,11 +559,55 @@ def metaobject_upsert_custom_shop(
 # -----------------------------
 # Printful trigger ONLY
 # -----------------------------
+_POST_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_POST_MAX_ATTEMPTS = 4
+_POST_BACKOFF_BASE_S = 2
+
+
 def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> requests.Response:
+    """POST *url* with JSON *payload*, retrying on transient errors.
+
+    Retries up to ``_POST_MAX_ATTEMPTS`` total attempts with exponential
+    backoff (2 s, 4 s, 8 s) on:
+    * HTTP 429, 500, 502, 503, 504
+    * ``requests.ConnectionError`` / ``requests.Timeout``
+
+    404 and other 4xx responses are returned immediately so the caller
+    (``trigger_printful_automation``) can handle 404 by trying the next
+    candidate endpoint.  On a final connection-level failure the exception
+    is re-raised.
+    """
     headers = {"Content-Type": "application/json"}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
-    return requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+
+    for attempt in range(1, _POST_MAX_ATTEMPTS + 1):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt < _POST_MAX_ATTEMPTS:
+                wait = _POST_BACKOFF_BASE_S ** attempt  # 2 s, 4 s, 8 s
+                print(
+                    f"⚠️ POST {url} connection error ({exc.__class__.__name__}), "
+                    f"retrying in {wait}s (attempt {attempt}/{_POST_MAX_ATTEMPTS})…"
+                )
+                time.sleep(wait)
+                continue
+            raise
+
+        if r.status_code in _POST_RETRYABLE_STATUSES and attempt < _POST_MAX_ATTEMPTS:
+            wait = _POST_BACKOFF_BASE_S ** attempt  # 2 s, 4 s, 8 s
+            print(
+                f"⚠️ POST {url} returned HTTP {r.status_code}, "
+                f"retrying in {wait}s (attempt {attempt}/{_POST_MAX_ATTEMPTS})…"
+            )
+            time.sleep(wait)
+            continue
+
+        return r
+
+    # Unreachable — keeps type-checkers happy
+    raise RuntimeError(f"POST {url} failed after {_POST_MAX_ATTEMPTS} attempts")
 
 
 def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> str:
