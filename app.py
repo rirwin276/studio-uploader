@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import uuid
 import time
 import threading
@@ -83,6 +84,13 @@ REALESRGAN_TILE = int(os.getenv("REALESRGAN_TILE", "0"))
 REALESRGAN_TIMEOUT = int(os.getenv("REALESRGAN_TIMEOUT", "180"))
 
 PROVISION_SCRIPT = Path(os.getenv("PROVISION_SCRIPT", str(ROOT / "shopify_provision.py")))
+DEPROVISION_SCRIPT = Path(os.getenv("DEPROVISION_SCRIPT", str(ROOT / "shopify_deprovision.py")))
+DEPROVISION_TIMEOUT = int(os.getenv("DEPROVISION_TIMEOUT", "900"))  # 15 min: nuke can touch many customers
+
+# Shopify Admin API (used by leave/nuke endpoints directly)
+_SHOPIFY_SHOP = os.getenv("SHOP", "").strip()
+_SHOPIFY_API_VERSION = os.getenv("API_VERSION", "2026-01").strip()
+_SHOPIFY_ACCESS_TOKEN = os.getenv("CLIENT_SECRET", "").strip()
 
 
 # ----------------------------
@@ -117,6 +125,76 @@ def _sess_set(session_id: str, **kwargs):
 def _sess_get(session_id: str) -> Dict[str, Any]:
     with _SESS_LOCK:
         return dict(_SESS.get(session_id, {}))
+
+
+# ----------------------------
+# Shopify Admin API helpers
+# ----------------------------
+def _shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    """Direct Shopify Admin GraphQL call (used by leave/nuke endpoints)."""
+    if not _SHOPIFY_SHOP or not _SHOPIFY_ACCESS_TOKEN:
+        raise RuntimeError("Shopify Admin API credentials not configured (SHOP / CLIENT_SECRET)")
+    url = f"https://{_SHOPIFY_SHOP}/admin/api/{_SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": _SHOPIFY_ACCESS_TOKEN,
+    }
+    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=60)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("errors"):
+        raise RuntimeError(f"Shopify GraphQL errors: {json.dumps(payload['errors'])}")
+    data = payload.get("data")
+    if data is None:
+        raise RuntimeError(f"Shopify GraphQL returned no data: {json.dumps(payload)}")
+    return data
+
+
+def _get_customer_tags(customer_gid: str) -> Optional[list]:
+    """Return the tag list for a customer, or None if not found."""
+    q = """
+    query getCustomerTags($id: ID!) {
+      customer(id: $id) {
+        id
+        tags
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"id": customer_gid})
+    cust = data.get("customer")
+    if not cust:
+        return None
+    return cust.get("tags") or []
+
+
+def _ensure_gid_customer(customer_id: str) -> str:
+    cid = (customer_id or "").strip()
+    if cid.startswith("gid://"):
+        return cid
+    cid_num = cid.split("/")[-1]
+    return f"gid://shopify/Customer/{cid_num}"
+
+
+def _customer_remove_tag(customer_gid: str, tag: str) -> None:
+    """Remove a single tag from a customer (merge-safe)."""
+    existing = _get_customer_tags(customer_gid)
+    if existing is None:
+        raise RuntimeError(f"Customer not found: {customer_gid}")
+    if tag not in existing:
+        return
+    new_tags = [t for t in existing if t != tag]
+    q = """
+    mutation customerUpdate($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id tags }
+        userErrors { field message }
+      }
+    }
+    """
+    res = _shopify_graphql(q, {"input": {"id": customer_gid, "tags": new_tags}})
+    errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
 
 
 # ----------------------------
@@ -1100,8 +1178,179 @@ def job_status(job_id: str):
 
 
 # ----------------------------
-# UI
+# Deprovision (nuke) runner
 # ----------------------------
+def _run_shopify_deprovision_job(job_id: str, handle: str):
+    _job_set(job_id, status="running", started_at=time.time())
+
+    if not DEPROVISION_SCRIPT.exists():
+        _job_set(job_id, status="error", error=f"Deprovision script not found: {DEPROVISION_SCRIPT}")
+        return
+
+    cmd = ["python", str(DEPROVISION_SCRIPT), "--handle", handle]
+    print("💣 Deprovision cmd:", " ".join(cmd))
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            timeout=DEPROVISION_TIMEOUT,
+        )
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+
+        # Parse log lines from stdout
+        log_lines = [ln for ln in stdout.splitlines() if ln.strip()]
+
+        if stdout.strip():
+            print("📄 Deprovision stdout:\n", stdout[-12000:])
+        if stderr.strip():
+            print("🧯 Deprovision stderr:\n", stderr[-12000:])
+
+        if proc.returncode != 0:
+            _job_set(
+                job_id,
+                status="error",
+                finished_at=time.time(),
+                error=f"Deprovision failed (exit {proc.returncode})",
+                log=log_lines,
+                stdout=stdout[-12000:],
+                stderr=stderr[-12000:],
+            )
+            return
+
+        _job_set(
+            job_id,
+            status="done",
+            finished_at=time.time(),
+            log=log_lines,
+            stdout=stdout[-12000:],
+            stderr=stderr[-12000:],
+        )
+
+    except subprocess.TimeoutExpired:
+        _job_set(job_id, status="error", finished_at=time.time(), error="Deprovision timed out", log=[])
+    except Exception as e:
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=[])
+
+
+# ----------------------------
+# Storefront: Leave + Nuke
+# ----------------------------
+@app.post("/api/storefront/{handle}/leave")
+async def storefront_leave(handle: str, request: Request):
+    """
+    Member self-removal from a store.
+    Body JSON: {"customer_id": "<id>"}
+    Returns 403 if the customer is also an admin (must nuke instead).
+    Returns 200 {"ok": true} on success.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+    customer_id = (body.get("customer_id") or "").strip()
+    if not customer_id:
+        return JSONResponse({"error": "customer_id is required"}, status_code=400)
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    customer_gid = _ensure_gid_customer(customer_id)
+    admin_tag = f"storefront-admin--{handle}"
+    member_tag = f"storefront-member--{handle}"
+
+    try:
+        tags = _get_customer_tags(customer_gid)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+
+    if tags is None:
+        return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+    if admin_tag in tags:
+        return JSONResponse(
+            {"error": "Admins cannot leave a store — use the nuke endpoint instead"},
+            status_code=403,
+        )
+
+    if member_tag not in tags:
+        return JSONResponse({"error": "Customer is not a member of this store"}, status_code=404)
+
+    try:
+        _customer_remove_tag(customer_gid, member_tag)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to remove member tag: {e}"}, status_code=502)
+
+    return {"ok": True}
+
+
+@app.post("/api/storefront/{handle}/nuke")
+async def storefront_nuke(handle: str, request: Request):
+    """
+    Admin-only store nuke. Runs as a background job.
+    Body JSON: {"customer_id": "<id>"}
+    Returns 403 if the customer does not have storefront-admin--{handle}.
+    Returns {"job_id": "<uuid>"} immediately; poll GET /api/job/{job_id} for status.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+    customer_id = (body.get("customer_id") or "").strip()
+    if not customer_id:
+        return JSONResponse({"error": "customer_id is required"}, status_code=400)
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    customer_gid = _ensure_gid_customer(customer_id)
+    admin_tag = f"storefront-admin--{handle}"
+
+    try:
+        tags = _get_customer_tags(customer_gid)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+
+    if tags is None:
+        return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+    if admin_tag not in tags:
+        return JSONResponse(
+            {"error": "Only store admins can nuke a store"},
+            status_code=403,
+        )
+
+    job_id = str(uuid.uuid4())
+    _job_set(
+        job_id,
+        status="running",
+        handle=handle,
+        customer_id=customer_id,
+        created_at=time.time(),
+        log=[],
+    )
+
+    t = threading.Thread(
+        target=_run_shopify_deprovision_job,
+        args=(job_id, handle),
+        daemon=True,
+    )
+    t.start()
+
+    return {"job_id": job_id}
+
+
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
     request: Request,
