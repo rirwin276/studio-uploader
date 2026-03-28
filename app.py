@@ -1302,9 +1302,11 @@ async def storefront_nuke(handle: str, request: Request):
     """
     body = {}
     try:
-        body = await request.json()
+        raw = await request.body()
+        if raw and raw.strip():
+            body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+        pass  # treat missing/empty/malformed body as {}
 
     handle = handle.strip()
     if not handle:
