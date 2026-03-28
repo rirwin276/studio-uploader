@@ -1304,7 +1304,7 @@ async def storefront_nuke(handle: str, request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+        body = {}  # Empty body is fine — admin page sends no body
 
     handle = handle.strip()
     if not handle:
