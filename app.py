@@ -1352,6 +1352,246 @@ async def storefront_nuke(handle: str, request: Request):
     return {"job_id": job_id}
 
 
+# ----------------------------
+# Admin secret + cron secret helpers
+# ----------------------------
+_ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
+_CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+
+
+def _require_admin_secret(request: Request) -> Optional[JSONResponse]:
+    """Return a 401 JSONResponse if X-Admin-Secret header is missing or wrong."""
+    secret = request.headers.get("X-Admin-Secret", "").strip()
+    if not _ADMIN_SECRET:
+        # Guard: if env var is not configured, always deny to avoid open access
+        return JSONResponse({"error": "ADMIN_SECRET not configured on server"}, status_code=401)
+    if secret != _ADMIN_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
+def _require_cron_secret(request: Request) -> Optional[JSONResponse]:
+    """Return a 401 JSONResponse if X-Cron-Secret header is missing or wrong."""
+    secret = request.headers.get("X-Cron-Secret", "").strip()
+    if not _CRON_SECRET:
+        return JSONResponse({"error": "CRON_SECRET not configured on server"}, status_code=401)
+    if secret != _CRON_SECRET:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
+# ----------------------------
+# Sleep-mode background runner
+# ----------------------------
+def _run_sleep_check_job(job_id: str) -> None:
+    from shopify_sleep import run_sleep_check  # imported here to keep top-level imports clean
+
+    _job_set(job_id, status="running", started_at=time.time())
+    log: list = []
+    try:
+        run_sleep_check(log)
+        _job_set(job_id, status="done", finished_at=time.time(), log=log)
+    except Exception as e:
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+
+
+def _run_store_sleep_job(job_id: str, handle: str) -> None:
+    """Sleep a single store in the background."""
+    from shopify_sleep import sleep_store, _get_metaobject_id_by_handle  # type: ignore[attr-defined]
+
+    _job_set(job_id, status="running", started_at=time.time())
+    log: list = []
+
+    def _log(msg: str) -> None:
+        log.append(msg)
+        print(msg)
+
+    try:
+        # We need the metaobject ID for sleep_store; import helper from sleep module
+        from shopify_sleep import _shopify_graphql, METAOBJECT_TYPE  # type: ignore[attr-defined]
+        q = """
+        query getMetaobject($handle: MetaobjectHandleInput!) {
+          metaobjectByHandle(handle: $handle) { id }
+        }
+        """
+        data = _shopify_graphql(q, {"handle": {"type": METAOBJECT_TYPE, "handle": handle}})
+        mo = data.get("metaobjectByHandle")
+        if not mo:
+            raise RuntimeError(f"Metaobject not found for handle {handle!r}")
+        mo_id = mo["id"]
+        sleep_store(handle, mo_id, log)
+        _job_set(job_id, status="done", finished_at=time.time(), log=log)
+    except Exception as e:
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+
+
+def _run_store_wakeup_job(job_id: str, handle: str) -> None:
+    from shopify_wakeup import wakeup
+
+    _job_set(job_id, status="running", started_at=time.time())
+    log: list = []
+    try:
+        printful_job_id = wakeup(handle, log)
+        _job_set(
+            job_id,
+            status="done",
+            finished_at=time.time(),
+            log=log,
+            printful_job_id=printful_job_id,
+        )
+    except Exception as e:
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+
+
+# ----------------------------
+# Sleep-mode endpoints
+# ----------------------------
+@app.post("/admin/sleep-check")
+async def admin_sleep_check(request: Request):
+    """
+    Admin-only. Run the full sleep check across all stores in the background.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"status": "ok", "job_id": "..."}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status="queued", created_at=time.time(), log=[])
+    t = threading.Thread(target=_run_sleep_check_job, args=(job_id,), daemon=True)
+    t.start()
+    return {"status": "ok", "job_id": job_id}
+
+
+@app.post("/admin/sleep-check/cron")
+async def admin_sleep_check_cron(request: Request):
+    """
+    Cron-triggered sleep check. Validate with X-Cron-Secret header.
+    Called by Railway cron or an external scheduler once per day.
+    Returns: {"status": "ok", "job_id": "..."}
+    """
+    denied = _require_cron_secret(request)
+    if denied is not None:
+        return denied
+
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status="queued", created_at=time.time(), log=[])
+    t = threading.Thread(target=_run_sleep_check_job, args=(job_id,), daemon=True)
+    t.start()
+    return {"status": "ok", "job_id": job_id}
+
+
+@app.post("/admin/store/{handle}/sleep")
+async def admin_store_sleep(handle: str, request: Request):
+    """
+    Admin-only. Manually put a specific store to sleep immediately.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"status": "ok", "job_id": "..."}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status="queued", handle=handle, created_at=time.time(), log=[])
+    t = threading.Thread(target=_run_store_sleep_job, args=(job_id, handle), daemon=True)
+    t.start()
+    return {"status": "ok", "job_id": job_id}
+
+
+@app.post("/admin/store/{handle}/wakeup")
+async def admin_store_wakeup(handle: str, request: Request):
+    """
+    Admin-only. Wake up a sleeping store by re-running Printful Automation.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"status": "ok", "job_id": "...", "printful_job_id": "..."}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status="queued", handle=handle, created_at=time.time(), log=[])
+    t = threading.Thread(target=_run_store_wakeup_job, args=(job_id, handle), daemon=True)
+    t.start()
+    return {"status": "ok", "job_id": job_id}
+
+
+@app.get("/store/{handle}/status")
+async def store_status(handle: str):
+    """
+    Public. Returns the current sleep status of a store from its metaobject.
+    Response: {"handle": "...", "status": "active"|"sleeping", "slept_at": "...|null", "last_active": "...|null"}
+    """
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    # Inline metaobject lookup using the same env vars as shopify_sleep/deprovision
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        handle
+        fields { key value }
+      }
+    }
+    """
+    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            url,
+            headers=headers,
+            json={"query": q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Shopify request failed: {e}"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return JSONResponse({"error": "Store not found"}, status_code=404)
+
+    def _field(key: str) -> Optional[str]:
+        for f in (mo.get("fields") or []):
+            if f.get("key") == key:
+                return f.get("value") or None
+        return None
+
+    status_val = _field("status") or "active"
+    slept_at = _field("slept_at")
+    last_active = _field("last_active")
+
+    return {
+        "handle": handle,
+        "status": status_val,
+        "slept_at": slept_at,
+        "last_active": last_active,
+    }
+
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
