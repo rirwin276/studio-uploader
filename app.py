@@ -1295,9 +1295,10 @@ async def storefront_leave(handle: str, request: Request):
 async def storefront_nuke(handle: str, request: Request):
     """
     Admin-only store nuke. Runs as a background job.
-    Body JSON: {"customer_id": "<id>"}
-    Returns 403 if the customer does not have storefront-admin--{handle}.
-    Returns {"job_id": "<uuid>"} immediately; poll GET /api/job/{job_id} for status.
+    Body JSON: {"customer_id": "<id>"} — customer_id is optional.
+    If customer_id is provided, validates it holds storefront-admin--{handle}.
+    If omitted (e.g. called from the Shopify admin page), proceeds directly.
+    Returns {"job_id": "<uuid>"}; poll GET /api/job/{job_id} for status + log lines.
     """
     body = {}
     try:
@@ -1305,30 +1306,31 @@ async def storefront_nuke(handle: str, request: Request):
     except Exception:
         return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
 
-    customer_id = (body.get("customer_id") or "").strip()
-    if not customer_id:
-        return JSONResponse({"error": "customer_id is required"}, status_code=400)
-
     handle = handle.strip()
     if not handle:
         return JSONResponse({"error": "handle is required"}, status_code=400)
 
-    customer_gid = _ensure_gid_customer(customer_id)
-    admin_tag = f"storefront-admin--{handle}"
+    customer_id = (body.get("customer_id") or "").strip()
 
-    try:
-        tags = _get_customer_tags(customer_gid)
-    except Exception as e:
-        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+    # Only verify the admin tag if a customer_id was supplied.
+    # Admin-page initiated nukes omit customer_id — trust is enforced at the UI layer.
+    if customer_id:
+        customer_gid = _ensure_gid_customer(customer_id)
+        admin_tag = f"storefront-admin--{handle}"
 
-    if tags is None:
-        return JSONResponse({"error": "Customer not found"}, status_code=404)
+        try:
+            tags = _get_customer_tags(customer_gid)
+        except Exception as e:
+            return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
 
-    if admin_tag not in tags:
-        return JSONResponse(
-            {"error": "Only store admins can nuke a store"},
-            status_code=403,
-        )
+        if tags is None:
+            return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+        if admin_tag not in tags:
+            return JSONResponse(
+                {"error": "Only store admins can nuke a store"},
+                status_code=403,
+            )
 
     job_id = str(uuid.uuid4())
     _job_set(
