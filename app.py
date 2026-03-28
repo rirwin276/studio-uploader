@@ -1303,8 +1303,8 @@ async def storefront_nuke(handle: str, request: Request):
     body = {}
     try:
         raw = await request.body()
-        if raw and raw.strip():
-            body = await request.json()
+        if raw.strip():
+            body = json.loads(raw)
     except Exception:
         pass  # treat missing/empty/malformed body as {}
 
