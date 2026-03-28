@@ -4,7 +4,7 @@
 # Steps:
 # 1. Look up custom_shop metaobject by handle via GraphQL Admin API
 # 2. Extract logo file GIDs, collection GID from the metaobject
-# 3. Remove store handle tag from all products in the collection (paginated)
+# 3. Find all products with the store handle as a tag (tag-based search) and DELETE them
 # 4. Delete the Shopify collection
 # 5. Strip storefront-admin--{handle} and storefront-member--{handle} tags from ALL
 #    customers who have them (paginated, cursor-based GraphQL)
@@ -154,6 +154,51 @@ def get_collection_products(collection_id: str) -> List[Dict[str, Any]]:
 
 
 # -----------------------------
+# Products by tag (paginated)
+# -----------------------------
+def get_products_by_tag(handle: str) -> List[Dict[str, Any]]:
+    """
+    Return all products that have the given store handle as a tag.
+    Uses cursor-based pagination.
+    """
+    q = """
+    query getProductsByTag($query: String!, $after: String) {
+      products(first: 50, query: $query, after: $after) {
+        edges {
+          node {
+            id
+            tags
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    """
+    products = []
+    cursor = None
+    search_query = f"tag:{handle}"
+
+    while True:
+        data = shopify_graphql(q, {"query": search_query, "after": cursor})
+        page = data.get("products") or {}
+        edges = page.get("edges") or []
+        for edge in edges:
+            node = edge.get("node")
+            if node:
+                products.append(node)
+
+        page_info = page.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+
+    return products
+
+
+# -----------------------------
 # Product tag removal
 # -----------------------------
 def remove_tag_from_product(product_id: str, tag: str) -> None:
@@ -192,6 +237,26 @@ def remove_tag_from_product(product_id: str, tag: str) -> None:
     errs = (res.get("productUpdate") or {}).get("userErrors") or []
     if errs:
         raise RuntimeError(f"productUpdate userErrors: {json.dumps(errs, indent=2)}")
+
+
+# -----------------------------
+# Product deletion
+# -----------------------------
+def delete_product(product_id: str) -> None:
+    """Delete a product from Shopify by GID."""
+    q = """
+    mutation productDelete($input: ProductDeleteInput!) {
+      productDelete(input: $input) {
+        deletedProductId
+        userErrors { field message }
+      }
+    }
+    """
+    data = shopify_graphql(q, {"input": {"id": product_id}})
+    res = data.get("productDelete") or {}
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"productDelete userErrors: {json.dumps(errs, indent=2)}")
 
 
 # -----------------------------
@@ -387,25 +452,26 @@ def deprovision(handle: str, log: List[str]) -> None:
         _log(f"🖼️  secondary_logo_gid: {secondary_logo_gid}")
 
     # ------------------------------------------------------------------
-    # Step 3: Remove store handle tag from all products in the collection
+    # Step 3: Find and DELETE all products tagged with this store handle
     # ------------------------------------------------------------------
-    if collection_gid:
-        _log(f"📋 Step 3: Fetching products from collection {collection_gid}")
-        try:
-            products = get_collection_products(collection_gid)
-            _log(f"   Found {len(products)} product(s) in collection")
-            for product in products:
-                pid = product["id"]
-                if handle in (product.get("tags") or []):
-                    _log(f"   Removing tag {handle!r} from product {pid}")
-                    remove_tag_from_product(pid, handle)
-                    _log(f"   ✅ Tag removed from product {pid}")
-                else:
-                    _log(f"   ℹ️  Product {pid} does not have tag {handle!r} — skipping")
-        except Exception as e:
-            _log(f"⚠️  Step 3 error (non-fatal): {e}")
-    else:
-        _log("ℹ️  Step 3: No collection_gid — skipping product tag removal")
+    _log(f"🗑️  Step 3: Finding and deleting all products with tag {handle!r}")
+    try:
+        tagged_products = get_products_by_tag(handle)
+        _log(f"   Found {len(tagged_products)} product(s) to delete")
+        for product in tagged_products:
+            pid = product["id"]
+            # Double-check the tag is actually on this product (safety check)
+            if handle in (product.get("tags") or []):
+                try:
+                    _log(f"   Deleting product {pid}")
+                    delete_product(pid)
+                    _log(f"   ✅ Product deleted: {pid}")
+                except Exception as e:
+                    _log(f"   ⚠️  Failed to delete product {pid}: {e}")
+            else:
+                _log(f"   ℹ️  Product {pid} does not have tag {handle!r} — skipping (safety)")
+    except Exception as e:
+        _log(f"⚠️  Step 3 error (non-fatal): {e}")
 
     # ------------------------------------------------------------------
     # Step 4: Delete the collection
