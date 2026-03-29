@@ -125,9 +125,11 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     """
     Wake up a sleeping store.
 
-    1. Reset metaobject status to "active" and clear slept_at.
+    1. Set metaobject status to "waking" (intermediate state).
     2. Trigger Printful Automation /run to re-create products.
-    3. Return the Printful job_id (or None).
+    3. Only after Printful succeeds → set metaobject status to "active".
+
+    If Printful fails, the status remains "waking" so the admin can retry.
 
     Args:
         handle: store handle string
@@ -152,33 +154,31 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     if not mo_id:
         _log(f"⚠️  No metaobject found for {handle!r} — cannot update status")
     else:
-        # Reset status fields
-        fields_to_update = [
-            {"key": "status", "value": "active"},
-            {"key": "slept_at", "value": ""},
-        ]
+        # Step 1: Set status to "waking" (intermediate state)
         try:
-            _update_metaobject_fields(mo_id, fields_to_update)
-            _log(f"   ✅ Metaobject status reset to active")
+            _update_metaobject_fields(mo_id, [{"key": "status", "value": "waking"}])
+            _log(f"   ✅ Metaobject status set to waking")
         except Exception as e:
-            _log(f"   ⚠️  Failed to update metaobject status in bulk: {e}")
-            # Try each field individually
-            for field in fields_to_update:
-                try:
-                    _update_metaobject_fields(mo_id, [field])
-                    _log(f"   ✅ Updated field {field['key']}")
-                except Exception as e2:
-                    _log(f"   ⚠️  Could not update field {field['key']}: {e2}")
+            _log(f"   ⚠️  Failed to set metaobject status to waking: {e}")
 
-    # Trigger Printful Automation
+    # Step 2: Trigger Printful Automation
     _log(f"   🚀 Triggering Printful Automation for {handle!r}")
     try:
         job_id = _trigger_printful_run(handle)
         _log(f"   ✅ Printful Automation triggered — job_id={job_id!r}")
-        return job_id
     except Exception as e:
         _log(f"   ❌ Failed to trigger Printful Automation: {e}")
         raise
+
+    # Step 3: Only after Printful succeeds → set status to "active"
+    if mo_id:
+        try:
+            _update_metaobject_fields(mo_id, [{"key": "status", "value": "active"}])
+            _log(f"   ✅ Metaobject status set to active")
+        except Exception as e:
+            _log(f"   ⚠️  Failed to set metaobject status to active: {e}")
+
+    return job_id
 
 
 # -----------------------------

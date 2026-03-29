@@ -1526,6 +1526,88 @@ async def admin_store_wakeup(handle: str, request: Request):
     return {"status": "ok", "job_id": job_id}
 
 
+
+@app.post("/admin/store/{handle}/add-member")
+async def admin_store_add_member(handle: str, request: Request):
+    """
+    Admin-only. Add a customer to a store by email (God Mode).
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"email": "user@example.com"}
+    Returns: {"ok": true, "customer_id": "...", "email": "...", "tag_added": "storefront-member--{handle}"}
+         or: {"ok": true, "already_member": true}
+         or: {"error": "Customer not found"} with status 404
+         or: {"error": "..."} with status 502
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    email = (body.get("email") or "").strip()
+    if not email:
+        return JSONResponse({"error": "email is required"}, status_code=400)
+
+    member_tag = f"storefront-member--{handle}"
+
+    try:
+        # Look up customer by email
+        find_q = """
+        query findCustomerByEmail($query: String!) {
+          customers(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                email
+                tags
+              }
+            }
+          }
+        }
+        """
+        data = _shopify_graphql(find_q, {"query": f"email:{email}"})
+        edges = (data.get("customers") or {}).get("edges") or []
+        if not edges:
+            return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+        customer = edges[0]["node"]
+        customer_gid = customer["id"]
+        customer_email = customer["email"]
+        existing_tags = customer.get("tags") or []
+
+        if member_tag in existing_tags:
+            return JSONResponse({"ok": True, "already_member": True})
+
+        # Add the tag (merge-safe)
+        new_tags = existing_tags + [member_tag]
+        update_q = """
+        mutation customerUpdate($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            customer { id tags }
+            userErrors { field message }
+          }
+        }
+        """
+        res = _shopify_graphql(update_q, {"input": {"id": customer_gid, "tags": new_tags}})
+        errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+        return {"ok": True, "customer_id": customer_gid, "email": customer_email, "tag_added": member_tag}
+
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 @app.get("/store/{handle}/status")
 async def store_status(handle: str):
     """
