@@ -1397,7 +1397,7 @@ def _run_sleep_check_job(job_id: str) -> None:
 
 def _run_store_sleep_job(job_id: str, handle: str) -> None:
     """Sleep a single store in the background."""
-    from shopify_sleep import sleep_store, _get_metaobject_id_by_handle  # type: ignore[attr-defined]
+    from shopify_sleep import sleep_store, _get_metaobject_id_by_handle
 
     _job_set(job_id, status="running", started_at=time.time())
     log: list = []
@@ -1407,18 +1407,9 @@ def _run_store_sleep_job(job_id: str, handle: str) -> None:
         print(msg)
 
     try:
-        # We need the metaobject ID for sleep_store; import helper from sleep module
-        from shopify_sleep import _shopify_graphql, METAOBJECT_TYPE  # type: ignore[attr-defined]
-        q = """
-        query getMetaobject($handle: MetaobjectHandleInput!) {
-          metaobjectByHandle(handle: $handle) { id }
-        }
-        """
-        data = _shopify_graphql(q, {"handle": {"type": METAOBJECT_TYPE, "handle": handle}})
-        mo = data.get("metaobjectByHandle")
-        if not mo:
+        mo_id = _get_metaobject_id_by_handle(handle)
+        if not mo_id:
             raise RuntimeError(f"Metaobject not found for handle {handle!r}")
-        mo_id = mo["id"]
         sleep_store(handle, mo_id, log)
         _job_set(job_id, status="done", finished_at=time.time(), log=log)
     except Exception as e:
