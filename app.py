@@ -1397,7 +1397,7 @@ def _run_sleep_check_job(job_id: str) -> None:
 
 def _run_store_sleep_job(job_id: str, handle: str) -> None:
     """Sleep a single store in the background."""
-    from shopify_sleep import sleep_store, _get_metaobject_id_by_handle  # type: ignore[attr-defined]
+    from shopify_sleep import sleep_store  # type: ignore[attr-defined]
 
     _job_set(job_id, status="running", started_at=time.time())
     log: list = []
