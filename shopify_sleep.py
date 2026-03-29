@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import json
-import time
 import datetime
 from typing import Any, Dict, List, Optional
 
@@ -152,7 +151,7 @@ def _store_has_recent_orders(handle: str, days: int) -> bool:
     Returns True if any Shopify order tagged with `handle` was created in the
     last `days` days.  Uses the REST Admin API (orders.json).
     """
-    since = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime(
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
     url = (
@@ -251,7 +250,7 @@ def sleep_store(handle: str, metaobject_id: str, log: List[str]) -> None:
         _log(f"   ⚠️  Product deletion error (non-fatal): {e}")
 
     # --- Update metaobject status ---
-    slept_at = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    slept_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     fields_to_update = [
         {"key": "status", "value": "sleeping"},
         {"key": "slept_at", "value": slept_at},
@@ -291,7 +290,7 @@ def run_sleep_check(log: List[str]) -> None:
         return
 
     _log(f"   Found {len(metaobjects)} store(s) total")
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     threshold = datetime.timedelta(days=SLEEP_INACTIVITY_DAYS)
 
     for mo in metaobjects:
