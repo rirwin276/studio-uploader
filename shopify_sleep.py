@@ -143,6 +143,20 @@ def _update_metaobject_fields(metaobject_id: str, fields: List[Dict[str, str]]) 
         raise RuntimeError(f"metaobjectUpdate userErrors: {json.dumps(errs, indent=2)}")
 
 
+def _get_metaobject_id_by_handle(handle: str) -> Optional[str]:
+    """Look up a metaobject by handle and return its GID."""
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"handle": {"type": METAOBJECT_TYPE, "handle": handle}})
+    mo = data.get("metaobjectByHandle")
+    return mo["id"] if mo else None
+
+
 # -----------------------------
 # Order activity check (REST)
 # -----------------------------
