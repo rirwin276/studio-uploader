@@ -1177,6 +1177,15 @@ def job_status(job_id: str):
     return j
 
 
+@app.get("/admin/job/{job_id}")
+def admin_job_status(job_id: str):
+    """Admin-accessible job status endpoint. Returns status, log, and error fields."""
+    j = _job_get(job_id)
+    if not j:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return {"status": j.get("status"), "log": j.get("log", []), "error": j.get("error")}
+
+
 # ----------------------------
 # Deprovision (nuke) runner
 # ----------------------------
@@ -1428,7 +1437,7 @@ def _run_store_wakeup_job(job_id: str, handle: str) -> None:
             printful_job_id=printful_job_id,
         )
     except Exception as e:
-        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+        _job_set(job_id, status="failed", finished_at=time.time(), error=str(e), log=log)
 
 
 # ----------------------------
