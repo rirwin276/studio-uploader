@@ -22,6 +22,7 @@ STUDIO_UPLOADER_URL = os.getenv(
 
 CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+SLEEP_INACTIVITY_DAYS = int(os.getenv("SLEEP_INACTIVITY_DAYS", "28"))
 
 
 def run() -> None:

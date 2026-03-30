@@ -41,6 +41,7 @@ PRINTFUL_AUTOMATION_URL = _env(
     "PRINTFUL_AUTOMATION_URL",
     default="https://printfulautomation-production.up.railway.app",
 )
+PRINTFUL_AUTOMATION_TOKEN = _env("PRINTFUL_AUTOMATION_TOKEN", default="")
 
 
 # -----------------------------
@@ -104,18 +105,36 @@ def _get_metaobject_id_by_handle(handle: str) -> Optional[str]:
 # -----------------------------
 def _trigger_printful_run(handle: str) -> Optional[str]:
     """
-    POST to Printful Automation /run with the store handle.
-    Returns the job_id string, or None if the response doesn't include one.
+    POST to Printful Automation /run (with /trigger_automation fallback).
+    Sends a bearer token if PRINTFUL_AUTOMATION_TOKEN is set.
+    Returns the job_id string, or None if unavailable.
     """
-    url = f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/run"
-    r = requests.post(
-        url,
-        json={"store_handle": handle},
-        timeout=HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    body = r.json()
-    return str(body.get("job_id") or body.get("id") or "") or None
+    candidates = [
+        f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/run",
+        f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/trigger_automation",
+    ]
+    headers = {"Content-Type": "application/json"}
+    if PRINTFUL_AUTOMATION_TOKEN:
+        headers["Authorization"] = f"Bearer {PRINTFUL_AUTOMATION_TOKEN}"
+
+    last_err = None
+    for url in candidates:
+        try:
+            r = requests.post(
+                url,
+                json={"store_handle": handle},
+                headers=headers,
+                timeout=HTTP_TIMEOUT,
+            )
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            body = r.json()
+            return str(body.get("job_id") or body.get("id") or "") or None
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Printful Automation trigger failed for {handle!r}. Last error: {last_err}")
 
 
 # -----------------------------

@@ -265,22 +265,21 @@ def sleep_store(handle: str, metaobject_id: str, log: List[str]) -> None:
 
     # --- Update metaobject status ---
     slept_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fields_to_update = [
-        {"key": "status", "value": "sleeping"},
-        {"key": "slept_at", "value": slept_at},
-    ]
     try:
-        _update_metaobject_fields(metaobject_id, fields_to_update)
+        _update_metaobject_fields(metaobject_id, [
+            {"key": "status", "value": "sleeping"},
+            {"key": "slept_at", "value": slept_at},
+        ])
         _log(f"   ✅ Metaobject status set to sleeping, slept_at={slept_at}")
     except Exception as e:
-        _log(f"   ⚠️  Failed to update metaobject status/slept_at: {e}")
-        # Try each field individually in case one doesn't exist
-        for field in fields_to_update:
-            try:
-                _update_metaobject_fields(metaobject_id, [field])
-                _log(f"   ✅ Updated field {field['key']}")
-            except Exception as e2:
-                _log(f"   ⚠️  Could not update field {field['key']}: {e2}")
+        _log(f"   ⚠️  Failed to update metaobject status+slept_at: {e}")
+        # slept_at field may not exist in the metaobject definition — always fall back to status-only
+        _log(f"   ↩️  Retrying with status-only update")
+        try:
+            _update_metaobject_fields(metaobject_id, [{"key": "status", "value": "sleeping"}])
+            _log(f"   ✅ Metaobject status set to sleeping (slept_at skipped)")
+        except Exception as e2:
+            _log(f"   ⚠️  Could not update metaobject status: {e2}")
 
 
 # -----------------------------
