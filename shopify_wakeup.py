@@ -129,7 +129,7 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     2. Trigger Printful Automation /run to re-create products.
     3. Only after Printful succeeds → set metaobject status to "active".
 
-    If Printful fails, the status remains "waking" so the admin can retry.
+    If Printful fails, the status is reset back to "sleeping" so the admin can retry.
 
     Args:
         handle: store handle string
@@ -168,6 +168,13 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
         _log(f"   ✅ Printful Automation triggered — job_id={job_id!r}")
     except Exception as e:
         _log(f"   ❌ Failed to trigger Printful Automation: {e}")
+        # Reset status back to sleeping so admin can retry
+        if mo_id:
+            try:
+                _update_metaobject_fields(mo_id, [{"key": "status", "value": "sleeping"}])
+                _log(f"   ↩️  Metaobject status reset back to sleeping (retry is possible)")
+            except Exception as reset_err:
+                _log(f"   ⚠️  Failed to reset metaobject status to sleeping after Printful error: {reset_err}")
         raise
 
     # Step 3: Only after Printful succeeds → set status to "active"
