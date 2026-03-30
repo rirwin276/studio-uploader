@@ -41,6 +41,7 @@ PRINTFUL_AUTOMATION_URL = _env(
     "PRINTFUL_AUTOMATION_URL",
     default="https://printfulautomation-production.up.railway.app",
 )
+PRINTFUL_AUTOMATION_TOKEN = _env("PRINTFUL_AUTOMATION_TOKEN", default="")
 
 
 # -----------------------------
@@ -104,18 +105,74 @@ def _get_metaobject_id_by_handle(handle: str) -> Optional[str]:
 # -----------------------------
 def _trigger_printful_run(handle: str) -> Optional[str]:
     """
-    POST to Printful Automation /run with the store handle.
-    Returns the job_id string, or None if the response doesn't include one.
+    POST to Printful Automation to trigger a run for the given store handle.
+
+    Tries these endpoints in order (stops at the first non-404 response):
+      1) /run
+      2) /api/run
+      3) /trigger_automation
+
+    The store handle is sent both as a JSON body field and as a query param
+    so either convention on the Printful side is satisfied.
+
+    Sends ``Authorization: Bearer <PRINTFUL_AUTOMATION_TOKEN>`` when the env
+    var is set (mirrors how shopify_provision.py calls the same service).
+
+    Returns the job_id string from the response, or None if unavailable.
+    Raises RuntimeError with the full response body logged on non-2xx.
     """
-    url = f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/run"
-    r = requests.post(
-        url,
-        json={"store_handle": handle},
-        timeout=HTTP_TIMEOUT,
+    base = PRINTFUL_AUTOMATION_URL.rstrip("/")
+    candidates = [
+        f"{base}/run",
+        f"{base}/api/run",
+        f"{base}/trigger_automation",
+    ]
+    payload = {"store_handle": handle}
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if PRINTFUL_AUTOMATION_TOKEN:
+        headers["Authorization"] = f"Bearer {PRINTFUL_AUTOMATION_TOKEN}"
+
+    last_resp: Optional[requests.Response] = None
+    for url in candidates:
+        r = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            params={"store_handle": handle},
+            timeout=HTTP_TIMEOUT,
+        )
+        last_resp = r
+        if r.status_code == 404:
+            print(f"⚠️  Printful endpoint not found (404): {url} — trying next…")
+            continue
+        if not r.ok:
+            body_text = ""
+            try:
+                body_text = r.text
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Printful Automation returned HTTP {r.status_code} for {url}: {body_text}"
+            )
+        body = {}
+        try:
+            body = r.json()
+        except Exception:
+            pass
+        job_id = body.get("job_id") or body.get("id")
+        return str(job_id) if job_id else None
+
+    # All candidates returned 404
+    body_text = ""
+    if last_resp is not None:
+        try:
+            body_text = last_resp.text
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"All Printful Automation endpoints returned 404. Last URL tried: {candidates[-1]}. "
+        f"Response body: {body_text}"
     )
-    r.raise_for_status()
-    body = r.json()
-    return str(body.get("job_id") or body.get("id") or "") or None
 
 
 # -----------------------------

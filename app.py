@@ -1514,6 +1514,97 @@ async def admin_store_wakeup(handle: str, request: Request):
     return {"status": "ok", "job_id": job_id}
 
 
+@app.post("/api/store/{handle}/wakeup")
+async def api_store_wakeup(handle: str, request: Request):
+    """
+    Alias for /admin/store/{handle}/wakeup — accepts the same X-Admin-Secret header.
+    Provided so the frontend has two URL options to trigger a store wakeup.
+    """
+    return await admin_store_wakeup(handle, request)
+
+
+@app.get("/admin/store/{handle}/status")
+async def admin_store_status(handle: str, request: Request):
+    """
+    Admin-only debug endpoint. Returns the current metaobject status,
+    the configured PRINTFUL_AUTOMATION_URL, and the last few log lines from
+    any recent wakeup job for this handle.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+    printful_url = os.getenv(
+        "PRINTFUL_AUTOMATION_URL",
+        "https://printfulautomation-production.up.railway.app",
+    ).strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        handle
+        fields { key value }
+      }
+    }
+    """
+    gql_url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            gql_url,
+            headers=headers,
+            json={"query": q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Shopify request failed: {e}"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return JSONResponse({"error": "Store not found"}, status_code=404)
+
+    def _field(key: str):
+        for f in (mo.get("fields") or []):
+            if f.get("key") == key:
+                return f.get("value") or None
+        return None
+
+    # Collect recent log lines from any in-memory wakeup jobs for this handle
+    recent_logs: List[str] = []
+    for job in list(_JOBS.values()):
+        if job.get("handle") == handle:
+            recent_logs.extend(job.get("log") or [])
+    # Return only the last 20 lines to keep the response compact
+    recent_logs = recent_logs[-20:]
+
+    return {
+        "handle": handle,
+        "status": _field("status") or "active",
+        "slept_at": _field("slept_at"),
+        "last_active": _field("last_active"),
+        "printful_automation_url": printful_url,
+        "recent_log": recent_logs,
+    }
+
+
 @app.post("/admin/store/{handle}/reset-status")
 async def admin_store_reset_status(handle: str, request: Request):
     """
