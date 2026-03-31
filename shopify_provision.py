@@ -751,7 +751,7 @@ def provision(
         collection_handle=handle,
         secondary_logo_file_gid=secondary_file_gid,
         type_of_store=type_of_store,
-        is_fully_ready=True,
+        is_fully_ready=False,  # products being built by Printful
         primary_color=primary_color_value,
     )
     print("✅ Metaobject upserted:", metaobject_id)

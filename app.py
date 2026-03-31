@@ -1833,6 +1833,164 @@ async def store_status(handle: str):
     }
 
 
+@app.get("/store/{handle}/ready-status")
+async def store_ready_status(handle: str):
+    """
+    Public. Polling endpoint for the Shopify dashboard frontend.
+    Returns {"ready": true, "handle": "..."} if is_fully_ready == "true",
+    or {"ready": false, "handle": "...", "status": "building"} otherwise.
+    No authentication required.
+    """
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        handle
+        fields { key value }
+      }
+    }
+    """
+    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            url,
+            headers=headers,
+            json={"query": q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception:
+        return JSONResponse({"error": "Shopify request failed"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return JSONResponse({"error": "Store not found"}, status_code=404)
+
+    def _field(key: str) -> Optional[str]:
+        for f in (mo.get("fields") or []):
+            if f.get("key") == key:
+                return f.get("value") or None
+        return None
+
+    is_ready = (_field("is_fully_ready") or "").lower() == "true"
+
+    if is_ready:
+        return {"ready": True, "handle": handle}
+    return {"ready": False, "handle": handle, "status": "building"}
+
+
+@app.post("/store/{handle}/store-ready")
+async def store_mark_ready(handle: str, request: Request):
+    """
+    Called by Printful Automation when products are fully built.
+    Sets is_fully_ready = true on the metaobject for the given handle.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"status": "ok", "handle": "...", "is_fully_ready": true}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    # Look up the metaobject ID by handle
+    lookup_q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        fields { key value }
+      }
+    }
+    """
+    gql_url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    gql_headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            gql_url,
+            headers=gql_headers,
+            json={"query": lookup_q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception:
+        return JSONResponse({"error": "Shopify request failed"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return JSONResponse({"error": "Store not found"}, status_code=404)
+
+    mo_id = mo.get("id")
+
+    # Update is_fully_ready and status to active
+    update_q = """
+    mutation metaobjectUpdate($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+      metaobjectUpdate(id: $id, metaobject: $metaobject) {
+        metaobject { id }
+        userErrors { field message }
+      }
+    }
+    """
+    try:
+        r = requests.post(
+            gql_url,
+            headers=gql_headers,
+            json={
+                "query": update_q,
+                "variables": {
+                    "id": mo_id,
+                    "metaobject": {
+                        "fields": [
+                            {"key": "is_fully_ready", "value": "true"},
+                            {"key": "status", "value": "active"},
+                        ]
+                    },
+                },
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        update_payload = r.json()
+    except Exception:
+        return JSONResponse({"error": "Shopify update failed"}, status_code=502)
+
+    errs = ((update_payload.get("data") or {}).get("metaobjectUpdate") or {}).get("userErrors") or []
+    if errs:
+        return JSONResponse({"error": "Metaobject update errors", "details": errs}, status_code=500)
+
+    return {"status": "ok", "handle": handle, "is_fully_ready": True}
+
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
     request: Request,
