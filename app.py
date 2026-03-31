@@ -1833,6 +1833,71 @@ async def store_status(handle: str):
     }
 
 
+@app.get("/api/store/{handle}/ready-status")
+async def store_ready_status(handle: str):
+    """
+    Public. Polled by the Shopify dashboard frontend every 10 seconds to check
+    whether a store's products are ready.
+    Returns: {"handle": "...", "is_fully_ready": true/false, "status": "active"|"sleeping"|"waking"|"unknown"}
+    """
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        handle
+        fields { key value }
+      }
+    }
+    """
+    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            url,
+            headers=headers,
+            json={"query": q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Shopify request failed: {e}"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return {"handle": handle, "is_fully_ready": False, "status": "unknown"}
+
+    def _field(key: str) -> Optional[str]:
+        for f in (mo.get("fields") or []):
+            if f.get("key") == key:
+                return f.get("value") or None
+        return None
+
+    is_fully_ready = (_field("is_fully_ready") or "").lower() == "true"
+    status_val = _field("status") or "active"
+
+    return {
+        "handle": handle,
+        "is_fully_ready": is_fully_ready,
+        "status": status_val,
+    }
+
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
     request: Request,
