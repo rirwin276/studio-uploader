@@ -226,32 +226,37 @@ def _trigger_printful_run(handle: str, log_fn) -> Optional[str]:
     """
     candidates = [
         f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/run",
+        f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/api/run",
         f"{PRINTFUL_AUTOMATION_URL.rstrip('/')}/trigger_automation",
     ]
     headers = {"Content-Type": "application/json"}
     if PRINTFUL_AUTOMATION_TOKEN:
         headers["Authorization"] = f"Bearer {PRINTFUL_AUTOMATION_TOKEN}"
     payload = {"store_handle": handle}
+    params = {"store_handle": handle}
 
     log_fn(f"   🌐 Printful Automation base URL: {PRINTFUL_AUTOMATION_URL!r}")
     log_fn(f"   📦 Payload: {payload}")
     log_fn(f"   🔑 Auth header present: {bool(PRINTFUL_AUTOMATION_TOKEN)}")
 
-    last_err = None
     for url in candidates:
         log_fn(f"   🔗 Trying: POST {url}")
         try:
             r = requests.post(
                 url,
                 json=payload,
+                params=params,
                 headers=headers,
                 timeout=PRINTFUL_TIMEOUT,
             )
             if r.status_code == 404:
                 log_fn(f"   ⚠️  404 at {url} — trying next endpoint…")
                 continue
+            if not (200 <= r.status_code < 300):
+                raise RuntimeError(
+                    f"Printful returned HTTP {r.status_code} for {url}: {r.text[:1000]}"
+                )
             log_fn(f"   📬 Response: HTTP {r.status_code} — {r.text[:500]!r}")
-            r.raise_for_status()
             try:
                 body = r.json()
             except ValueError:
@@ -259,13 +264,14 @@ def _trigger_printful_run(handle: str, log_fn) -> Optional[str]:
             job_id = str(body.get("job_id") or body.get("id") or "") or None
             log_fn(f"   ✅ Printful Automation triggered via {url} — job_id={job_id!r}")
             return job_id
+        except RuntimeError:
+            raise
         except requests.exceptions.RequestException as e:
             log_fn(f"   ❌ Request failed for {url}: {e}")
-            last_err = e
             continue
     raise RuntimeError(
-        f"Printful Automation trigger failed for {handle!r}. "
-        f"Tried: {', '.join(candidates)}. Last error: {last_err}"
+        f"No valid Printful Automation endpoint found for handle {handle!r}. "
+        f"Tried: {', '.join(candidates)}."
     )
 
 
