@@ -118,6 +118,24 @@ def _get_all_metaobjects() -> List[Dict[str, Any]]:
     return results
 
 
+def _try_update_metaobject_field(metaobject_id: str, key: str, value: str, log: List[str]) -> None:
+    """
+    Try to update a single field on a metaobject.
+    If the field definition does not exist in Shopify, log a warning instead of raising.
+    All other errors are re-raised.
+    """
+    try:
+        _update_metaobject_fields(metaobject_id, [{"key": key, "value": value}])
+    except RuntimeError as e:
+        if "does not exist" in str(e):
+            log.append(
+                f"⚠️ Could not update field '{key}': Field definition does not exist on metaobject. "
+                f"Add '{key}' (single_line_text_field) to your custom_shop metaobject definition in Shopify Admin."
+            )
+        else:
+            raise
+
+
 def _update_metaobject_fields(metaobject_id: str, fields: List[Dict[str, str]]) -> None:
     """
     Update specific fields on a metaobject using metaobjectUpdate mutation.
@@ -264,22 +282,10 @@ def sleep_store(handle: str, metaobject_id: str, log: List[str]) -> None:
         _log(f"   ⚠️  Product deletion error (non-fatal): {e}")
 
     # --- Update metaobject status ---
-    slept_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        _update_metaobject_fields(metaobject_id, [
-            {"key": "status", "value": "sleeping"},
-            {"key": "slept_at", "value": slept_at},
-        ])
-        _log(f"   ✅ Metaobject status set to sleeping, slept_at={slept_at}")
-    except Exception as e:
-        _log(f"   ⚠️  Failed to update metaobject status+slept_at: {e}")
-        # slept_at field may not exist in the metaobject definition — always fall back to status-only
-        _log(f"   ↩️  Retrying with status-only update")
-        try:
-            _update_metaobject_fields(metaobject_id, [{"key": "status", "value": "sleeping"}])
-            _log(f"   ✅ Metaobject status set to sleeping (slept_at skipped)")
-        except Exception as e2:
-            _log(f"   ⚠️  Could not update metaobject status: {e2}")
+    slept_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    _try_update_metaobject_field(metaobject_id, "status", "sleeping", log)
+    _try_update_metaobject_field(metaobject_id, "slept_at", slept_at, log)
+    _log(f"   ✅ Metaobject status set to sleeping, slept_at={slept_at}")
 
 
 # -----------------------------

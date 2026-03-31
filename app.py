@@ -1403,7 +1403,8 @@ def _run_sleep_check_job(job_id: str) -> None:
 
 def _run_store_sleep_job(job_id: str, handle: str) -> None:
     """Sleep a single store in the background."""
-    from shopify_sleep import sleep_store, _get_metaobject_id_by_handle
+    from shopify_sleep import sleep_store
+    from shopify_wakeup import _get_metaobject_id_by_handle
 
     _job_set(job_id, status="running", started_at=time.time())
     log: list = []
@@ -1502,11 +1503,13 @@ async def admin_store_sleep(handle: str, request: Request):
 
 
 @app.post("/admin/store/{handle}/wakeup")
+@app.post("/api/store/{handle}/wakeup")
 async def admin_store_wakeup(handle: str, request: Request):
     """
     Admin-only. Wake up a sleeping store by re-running Printful Automation.
+    Also accessible at POST /api/store/{handle}/wakeup (alias).
     Header: X-Admin-Secret: <ADMIN_SECRET>
-    Returns: {"status": "ok", "job_id": "...", "printful_job_id": "..."}
+    Returns: {"status": "ok", "job_id": "..."}
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -1521,6 +1524,88 @@ async def admin_store_wakeup(handle: str, request: Request):
     t = threading.Thread(target=_run_store_wakeup_job, args=(job_id, handle), daemon=True)
     t.start()
     return {"status": "ok", "job_id": job_id}
+
+
+@app.get("/admin/store/{handle}/status")
+async def admin_store_status(handle: str, request: Request):
+    """
+    Admin-only. Returns metaobject status fields and last 20 log lines from wakeup jobs.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"handle", "status", "slept_at", "last_active", "printful_automation_url", "recent_log"}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+    printful_automation_url = os.getenv(
+        "PRINTFUL_AUTOMATION_URL",
+        "https://printfulautomation-production.up.railway.app",
+    ).strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    q = """
+    query getMetaobject($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        handle
+        fields { key value }
+      }
+    }
+    """
+    gql_url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    gql_headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    try:
+        r = requests.post(
+            gql_url,
+            headers=gql_headers,
+            json={"query": q, "variables": {"handle": {"type": metaobject_type, "handle": handle}}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Shopify request failed: {e}"}, status_code=502)
+
+    mo = (payload.get("data") or {}).get("metaobjectByHandle")
+    if not mo:
+        return JSONResponse({"error": "Store not found"}, status_code=404)
+
+    def _field(key: str) -> Optional[str]:
+        for f in (mo.get("fields") or []):
+            if f.get("key") == key:
+                return f.get("value") or None
+        return None
+
+    # Collect last 20 log lines from any wakeup jobs for this handle
+    recent_log: list = []
+    with _JOBS_LOCK:
+        jobs_snapshot = list(_JOBS.values())
+    for j in jobs_snapshot:
+        if j.get("handle") == handle:
+            recent_log.extend(j.get("log") or [])
+    recent_log = recent_log[-20:]
+
+    return {
+        "handle": handle,
+        "status": _field("status"),
+        "slept_at": _field("slept_at"),
+        "last_active": _field("last_active"),
+        "printful_automation_url": printful_automation_url,
+        "recent_log": recent_log,
+    }
 
 
 @app.post("/admin/store/{handle}/reset-status")
