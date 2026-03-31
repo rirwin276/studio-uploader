@@ -312,10 +312,13 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     if not mo_id:
         _log(f"⚠️  No metaobject found for {handle!r} — cannot update status")
     else:
-        # Step 1: Set status to "waking" (intermediate state)
+        # Step 1: Set status to "waking" and is_fully_ready to false (intermediate state)
         try:
-            _update_metaobject_fields(mo_id, [{"key": "status", "value": "waking"}])
-            _log(f"   ✅ Metaobject status set to waking")
+            _update_metaobject_fields(mo_id, [
+                {"key": "status", "value": "waking"},
+                {"key": "is_fully_ready", "value": "false"},
+            ])
+            _log(f"   ✅ Metaobject status set to waking, is_fully_ready set to false")
         except Exception as e:
             _log(f"   ⚠️  Failed to set metaobject status to waking: {e}")
 

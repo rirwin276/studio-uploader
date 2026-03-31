@@ -285,6 +285,7 @@ def sleep_store(handle: str, metaobject_id: str, log: List[str]) -> None:
     slept_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     _try_update_metaobject_field(metaobject_id, "status", "sleeping", log)
     _try_update_metaobject_field(metaobject_id, "slept_at", slept_at, log)
+    _try_update_metaobject_field(metaobject_id, "is_fully_ready", "false", log)
     _log(f"   ✅ Metaobject status set to sleeping, slept_at={slept_at}")
 
 
