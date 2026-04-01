@@ -285,7 +285,8 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     1. Set metaobject status to "waking" (intermediate state).
     2. Ensure the smart collection exists (create if missing) and publish it.
     3. Trigger Printful Automation /run to re-create products.
-    4. Only after Printful succeeds → set metaobject status to "active".
+    4. Status remains "waking" + is_fully_ready stays false until
+       Printful Automation finishes and sets is_fully_ready=true + status=active.
 
     If Printful fails, the status is reset back to "sleeping" so the admin can retry.
 
@@ -352,13 +353,10 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
                 _log(f"   ⚠️  Failed to reset metaobject status to sleeping after Printful error: {reset_err}")
         raise
 
-    # Step 4: Only after Printful succeeds → set status to "active"
-    if mo_id:
-        try:
-            _update_metaobject_fields(mo_id, [{"key": "status", "value": "active"}])
-            _log(f"   ✅ Metaobject status set to active")
-        except Exception as e:
-            _log(f"   ⚠️  Failed to set metaobject status to active: {e}")
+    # Status remains "waking" and is_fully_ready remains false until
+    # Printful Automation completes and calls _mark_store_ready() which
+    # sets both status=active and is_fully_ready=true together.
+    _log(f"   ⏳ Store is waking — status will stay 'waking' until Printful Automation completes")
 
     return job_id
 
