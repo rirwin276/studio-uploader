@@ -210,6 +210,39 @@ def _publish_collection(collection_id: str) -> None:
         raise RuntimeError(f"publishablePublish userErrors: {json.dumps(errs, indent=2)}")
 
 
+def _update_collection_rule_set(collection_id: str, handle: str, sport_tag: str) -> None:
+    """
+    Update an existing smart collection to use OR logic with two rules:
+    TAG = handle  OR  TAG = sport_tag
+    Only called when sport_tag is non-empty.
+    """
+    q = """
+    mutation collectionUpdate($input: CollectionInput!) {
+      collectionUpdate(input: $input) {
+        collection { id ruleSet { appliedDisjunctively rules { column relation condition } } }
+        userErrors { field message }
+      }
+    }
+    """
+    variables = {
+        "input": {
+            "id": collection_id,
+            "ruleSet": {
+                "appliedDisjunctively": True,
+                "rules": [
+                    {"column": "TAG", "relation": "EQUALS", "condition": handle},
+                    {"column": "TAG", "relation": "EQUALS", "condition": sport_tag},
+                ],
+            },
+        }
+    }
+    data = _shopify_graphql(q, variables)
+    res = data.get("collectionUpdate") or {}
+    errs = res.get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"collectionUpdate userErrors: {json.dumps(errs, indent=2)}")
+
+
 def _ensure_smart_collection(handle: str, title: str, sport_tag: str = "") -> str:
     """
     Ensure a smart collection exists for the store.
@@ -218,6 +251,9 @@ def _ensure_smart_collection(handle: str, title: str, sport_tag: str = "") -> st
     """
     existing = _collection_by_handle(handle)
     if existing:
+        # If a sport_tag is present, update the rule set to OR logic
+        if sport_tag:
+            _update_collection_rule_set(existing["id"], handle, sport_tag)
         return existing["id"]
 
     # Create the collection with a TAG EQUALS handle rule.
