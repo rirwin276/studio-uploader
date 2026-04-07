@@ -125,6 +125,43 @@ def _get_metaobject_name(handle: str) -> Optional[str]:
     return None
 
 
+def _get_metaobject_type_of_store(handle: str) -> Optional[str]:
+    """Return the 'type_of_store' field value from the store's metaobject, or None."""
+    q = """
+    query getMetaobjectFields($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        fields { key value }
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"handle": {"type": METAOBJECT_TYPE, "handle": handle}})
+    mo = data.get("metaobjectByHandle")
+    if not mo:
+        return None
+    for f in (mo.get("fields") or []):
+        if f.get("key") == "type_of_store":
+            return f.get("value") or None
+    return None
+
+
+_SPORT_SLUGS = {
+    "softball", "baseball", "hockey", "soccer", "volleyball",
+    "basketball", "football", "lacrosse", "wrestling", "swimming",
+    "track", "cross-country", "golf", "tennis", "cheer",
+}
+
+
+def _sport_tag_from_type(type_of_store: str) -> str:
+    """
+    Given a type_of_store value (e.g. 'softball'), return 'sport--softball'
+    if it is a recognized sport slug, otherwise return ''.
+    """
+    slug = (type_of_store or "").strip().lower()
+    if slug in _SPORT_SLUGS:
+        return f"sport--{slug}"
+    return ""
+
+
 # -----------------------------
 # Smart collection helpers
 # -----------------------------
@@ -173,7 +210,7 @@ def _publish_collection(collection_id: str) -> None:
         raise RuntimeError(f"publishablePublish userErrors: {json.dumps(errs, indent=2)}")
 
 
-def _ensure_smart_collection(handle: str, title: str) -> str:
+def _ensure_smart_collection(handle: str, title: str, sport_tag: str = "") -> str:
     """
     Ensure a smart collection exists for the store.
     The collection matches products tagged with the store handle.
@@ -198,8 +235,15 @@ def _ensure_smart_collection(handle: str, title: str) -> str:
             "handle": handle,
             "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
             "ruleSet": {
-                "appliedDisjunctively": False,
-                "rules": [{"column": "TAG", "relation": "EQUALS", "condition": handle}],
+                "appliedDisjunctively": bool(sport_tag),
+                "rules": (
+                    [
+                        {"column": "TAG", "relation": "EQUALS", "condition": handle},
+                        {"column": "TAG", "relation": "EQUALS", "condition": sport_tag},
+                    ]
+                    if sport_tag
+                    else [{"column": "TAG", "relation": "EQUALS", "condition": handle}]
+                ),
             },
         }
     }
@@ -327,7 +371,11 @@ def wakeup(handle: str, log: List[str]) -> Optional[str]:
     _log(f"   🗂️  Ensuring smart collection exists for {handle!r}")
     try:
         storefront_name = _get_metaobject_name(handle) or handle
-        collection_id = _ensure_smart_collection(handle, storefront_name)
+        type_of_store = _get_metaobject_type_of_store(handle) or ""
+        sport_tag = _sport_tag_from_type(type_of_store)
+        if sport_tag:
+            _log(f"   🏷️  Sport tag for collection: {sport_tag!r}")
+        collection_id = _ensure_smart_collection(handle, storefront_name, sport_tag)
         _log(f"   ✅ Smart collection ready: {collection_id}")
         try:
             _publish_collection(collection_id)
