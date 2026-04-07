@@ -1042,6 +1042,7 @@ async def storefront_request(
     org_type: str = Form(None),
     military_branch: str = Form(None),
     sport_type: str = Form(None),
+    type_of_store_direct: Optional[str] = Form(None),
     primary_color: Optional[str] = Form(None),
     main_session_id: Optional[str] = Form(None),
     secondary_session_id: Optional[str] = Form(None),
@@ -1056,7 +1057,16 @@ async def storefront_request(
         return JSONResponse({"error": "customer_id is required"}, status_code=400)
 
     owner_customer_id = customer_id.split("/")[-1].strip()
-    type_of_store = (org_type or military_branch or sport_type or "").strip() or None
+    # type_of_store_direct is the pre-computed slug from the hidden field added by the Shopify form.
+    # Use it when present; otherwise derive the slug from org_type + sub-field.
+    if type_of_store_direct and type_of_store_direct.strip():
+        type_of_store = type_of_store_direct.strip()
+    elif (org_type or "").strip() == "Sports Team":
+        type_of_store = (sport_type or "").strip() or None
+    elif (org_type or "").strip() == "Military Unit":
+        type_of_store = (military_branch or "").strip() or None
+    else:
+        type_of_store = (org_type or "").strip() or None
     primary_color_norm = (primary_color or "").strip() or "No preference"
     print("🎨 primary_color received:", repr(primary_color), "-> normalized:", repr(primary_color_norm))
 
