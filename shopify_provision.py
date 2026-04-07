@@ -387,20 +387,38 @@ def collection_by_handle(handle: str) -> Optional[Dict[str, Any]]:
     return data.get("collectionByHandle")
 
 
-def smart_collection_rule_set(tag_value: str) -> Dict[str, Any]:
+def smart_collection_rule_set(tag_value: str, sport_tag: str = "") -> Dict[str, Any]:
     col = _normalize_rule_enum(COLLECTION_RULE_FIELD, "column")
     rel = _normalize_rule_enum(COLLECTION_RULE_RELATION, "relation")
+    rules = [{"column": col, "relation": rel, "condition": tag_value}]
+    if sport_tag:
+        rules.append({"column": col, "relation": rel, "condition": sport_tag})
     return {
-        "appliedDisjunctively": False,
-        "rules": [{
-            "column": col,
-            "relation": rel,
-            "condition": tag_value,
-        }]
+        "appliedDisjunctively": bool(sport_tag),
+        "rules": rules,
     }
 
 
-def collection_create_smart(title: str, handle: str, tag_value: str) -> str:
+# Sports that map to a sport-- tag on catalog products
+_SPORT_SLUGS = {
+    "softball", "baseball", "hockey", "soccer", "volleyball",
+    "basketball", "football", "lacrosse", "wrestling", "swimming",
+    "track", "cross-country", "golf", "tennis", "cheer",
+}
+
+
+def _sport_tag_from_type(type_of_store: str) -> str:
+    """
+    Given a type_of_store value (e.g. 'softball'), return 'sport--softball'
+    if it is a recognized sport slug, otherwise return ''.
+    """
+    slug = (type_of_store or "").strip().lower()
+    if slug in _SPORT_SLUGS:
+        return f"sport--{slug}"
+    return ""
+
+
+def collection_create_smart(title: str, handle: str, tag_value: str, sport_tag: str = "") -> str:
     q = """
     mutation collectionCreate($input: CollectionInput!) {
       collectionCreate(input: $input) {
@@ -414,7 +432,7 @@ def collection_create_smart(title: str, handle: str, tag_value: str) -> str:
             "title": title,
             "handle": handle,
             "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
-            "ruleSet": smart_collection_rule_set(tag_value),
+            "ruleSet": smart_collection_rule_set(tag_value, sport_tag),
         }
     }
     data = shopify_graphql(q, variables)
@@ -428,7 +446,7 @@ def collection_create_smart(title: str, handle: str, tag_value: str) -> str:
     return col["id"]
 
 
-def collection_update_smart(collection_id: str, title: str, handle: str, tag_value: str) -> None:
+def collection_update_smart(collection_id: str, title: str, handle: str, tag_value: str, sport_tag: str = "") -> None:
     q = """
     mutation collectionUpdate($id: ID!, $input: CollectionInput!) {
       collectionUpdate(id: $id, input: $input) {
@@ -443,7 +461,7 @@ def collection_update_smart(collection_id: str, title: str, handle: str, tag_val
             "title": title,
             "handle": handle,
             "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
-            "ruleSet": smart_collection_rule_set(tag_value),
+            "ruleSet": smart_collection_rule_set(tag_value, sport_tag),
         }
     }
     data = shopify_graphql(q, variables)
@@ -680,6 +698,7 @@ def provision(
         handle = slugify_handle(storefront_name)
 
     tag_value = handle
+    sport_tag = _sport_tag_from_type(type_of_store or "")
     primary_color_value = (primary_color or "").strip() or "No preference"
 
     print(f"🧩 Provisioning handle: {handle}")
@@ -723,10 +742,10 @@ def provision(
     if existing:
         collection_gid = existing["id"]
         print("♻️ Collection exists — updating:", collection_gid)
-        collection_update_smart(collection_gid, storefront_name, handle, tag_value)
+        collection_update_smart(collection_gid, storefront_name, handle, tag_value, sport_tag)
     else:
         print("🆕 Creating collection…")
-        collection_gid = collection_create_smart(storefront_name, handle, tag_value)
+        collection_gid = collection_create_smart(storefront_name, handle, tag_value, sport_tag)
 
     print("✅ Collection ready:", collection_gid)
 
