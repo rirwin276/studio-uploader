@@ -1776,6 +1776,192 @@ async def admin_store_add_member(handle: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+@app.get("/admin/store/{handle}/products")
+async def admin_store_list_products(handle: str, request: Request):
+    """
+    Admin-only. List all products tagged with the given store handle.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"handle": "...", "products": [{"id", "title", "status", "hidden", "featured_image"}, ...]}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    gql_url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    gql_headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+
+    q = """
+    query getProductsByTag($query: String!, $after: String) {
+      products(first: 50, query: $query, after: $after) {
+        edges {
+          node {
+            id
+            title
+            status
+            featuredImage { url }
+            tags
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+
+    products = []
+    cursor = None
+    try:
+        while True:
+            variables: Dict[str, Any] = {"query": f"tag:{handle}"}
+            if cursor:
+                variables["after"] = cursor
+            r = requests.post(
+                gql_url,
+                headers=gql_headers,
+                json={"query": q, "variables": variables},
+                timeout=30,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            if payload.get("errors"):
+                raise RuntimeError(f"Shopify GraphQL errors: {json.dumps(payload['errors'])}")
+            data = (payload.get("data") or {}).get("products") or {}
+            for edge in data.get("edges") or []:
+                node = edge["node"]
+                products.append({
+                    "id": node["id"],
+                    "title": node["title"],
+                    "status": node["status"],
+                    "hidden": node["status"] != "ACTIVE",
+                    "featured_image": (node.get("featuredImage") or {}).get("url"),
+                })
+            page_info = data.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                cursor = page_info.get("endCursor")
+            else:
+                break
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+    return {"handle": handle, "products": products}
+
+
+@app.post("/admin/store/{handle}/products/{product_id:path}/hide")
+async def admin_store_hide_product(handle: str, product_id: str, request: Request):
+    """
+    Admin-only. Toggle a product between hidden (DRAFT) and visible (ACTIVE).
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"hidden": true|false}
+    Returns: {"ok": true, "id": "...", "status": "DRAFT"|"ACTIVE", "hidden": true|false}
+    """
+    from urllib.parse import unquote
+
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    product_gid = unquote(product_id).strip()
+    if not product_gid:
+        return JSONResponse({"error": "product_id is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    hidden = body.get("hidden")
+    if hidden is None:
+        return JSONResponse({"error": "hidden field is required"}, status_code=400)
+
+    new_status = "DRAFT" if hidden else "ACTIVE"
+
+    mutation = """
+    mutation productUpdate($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id status }
+        userErrors { field message }
+      }
+    }
+    """
+
+    try:
+        data = _shopify_graphql(mutation, {"input": {"id": product_gid, "status": new_status}})
+        result = (data.get("productUpdate") or {})
+        errs = result.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productUpdate userErrors: {json.dumps(errs)}")
+        product = result.get("product") or {}
+        final_status = product.get("status", new_status)
+        return {"ok": True, "id": product.get("id", product_gid), "status": final_status, "hidden": final_status != "ACTIVE"}
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.delete("/admin/store/{handle}/products/{product_id:path}")
+async def admin_store_delete_product(handle: str, product_id: str, request: Request):
+    """
+    Admin-only. Permanently delete a product.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"ok": true, "deleted_id": "gid://shopify/Product/123"}
+    """
+    from urllib.parse import unquote
+
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    product_gid = unquote(product_id).strip()
+    if not product_gid:
+        return JSONResponse({"error": "product_id is required"}, status_code=400)
+
+    mutation = """
+    mutation productDelete($id: ID!) {
+      productDelete(input: { id: $id }) {
+        deletedProductId
+        userErrors { field message }
+      }
+    }
+    """
+
+    try:
+        data = _shopify_graphql(mutation, {"id": product_gid})
+        result = (data.get("productDelete") or {})
+        errs = result.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"productDelete userErrors: {json.dumps(errs)}")
+        deleted_id = result.get("deletedProductId", product_gid)
+        return {"ok": True, "deleted_id": deleted_id}
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 @app.get("/store/{handle}/status")
 async def store_status(handle: str):
     """
