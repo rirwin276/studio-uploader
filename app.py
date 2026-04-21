@@ -1810,6 +1810,7 @@ async def admin_store_list_products(handle: str, request: Request):
         edges {
           node {
             id
+            handle
             title
             status
             featuredImage { url }
@@ -1843,10 +1844,12 @@ async def admin_store_list_products(handle: str, request: Request):
                 node = edge["node"]
                 products.append({
                     "id": node["id"],
+                    "handle": node.get("handle") or "",
                     "title": node["title"],
                     "status": node["status"],
                     "hidden": node["status"] != "ACTIVE",
                     "featured_image": (node.get("featuredImage") or {}).get("url"),
+                    "tags": node.get("tags") or [],
                 })
             page_info = data.get("pageInfo") or {}
             if page_info.get("hasNextPage"):
