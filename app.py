@@ -1635,7 +1635,7 @@ def _run_store_update_settings_job(
 # Color-selection helpers
 # ----------------------------
 _COLOR_SELECTION_TYPE = "store_color_selection"
-_VALID_SHIRT_VARIANTS = {"bc3413"}
+_VALID_SHIRT_VARIANTS = {"bc3413", "bc3001y", "nl6733", "mc1790", "cc1467y", "m2580"}
 
 
 def _ensure_color_selection_definition() -> None:
