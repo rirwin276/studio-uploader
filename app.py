@@ -1451,6 +1451,102 @@ def _run_store_wakeup_job(job_id: str, handle: str) -> None:
         _job_set(job_id, status="failed", finished_at=time.time(), error=str(e), log=log)
 
 
+def _run_store_update_settings_job(
+    job_id: str,
+    handle: str,
+    store_name: Optional[str],
+    primary_color: Optional[str],
+    main_session_id: Optional[str],
+    needs_rebuild: bool,
+) -> None:
+    """Update store display name, primary color, and/or main logo; optionally trigger sleep+rebuild."""
+    from shopify_provision import upload_png_to_shopify_files, read_session_png
+    from shopify_wakeup import _get_metaobject_id_by_handle
+
+    _job_set(job_id, status="running", started_at=time.time())
+    log: list = []
+
+    def _log(msg: str) -> None:
+        log.append(msg)
+        print(msg)
+
+    try:
+        metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+
+        # 1. Look up the metaobject ID by handle
+        find_q = """
+        query getMetaobject($handle: MetaobjectHandleInput!) {
+          metaobjectByHandle(handle: $handle) { id }
+        }
+        """
+        data = _shopify_graphql(find_q, {"handle": {"type": metaobject_type, "handle": handle}})
+        mo = data.get("metaobjectByHandle")
+        if not mo:
+            raise RuntimeError(f"Store not found: {handle!r}")
+        mo_id = mo["id"]
+        _log(f"✅ Found metaobject: {mo_id}")
+
+        # 2. Upload new logo if a session was provided
+        logo_file_gid: Optional[str] = None
+        if main_session_id:
+            _log(f"📸 Reading session PNG for session {main_session_id}")
+            png_bytes = read_session_png(UPLOAD_DIR, main_session_id)
+            _log("⬆️  Uploading logo to Shopify Files…")
+            logo_file_gid, logo_file_url = upload_png_to_shopify_files(
+                png_bytes,
+                filename=f"{handle}_logo.png",
+                alt=f"{handle} logo",
+            )
+            _log(f"✅ Logo uploaded: {logo_file_gid} — {logo_file_url}")
+
+        # 3. Build mutation fields list — only include fields that are changing
+        fields_to_update = []
+        if store_name:
+            fields_to_update.append({"key": "name", "value": store_name})
+        if primary_color:
+            fields_to_update.append({"key": "primary_color", "value": primary_color})
+        if logo_file_gid:
+            fields_to_update.append({"key": "logo", "value": logo_file_gid})
+
+        # 4. Apply metaobject update if any fields changed
+        if fields_to_update:
+            update_q = """
+            mutation metaobjectUpdate($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+              metaobjectUpdate(id: $id, metaobject: $metaobject) {
+                metaobject { id }
+                userErrors { field message }
+              }
+            }
+            """
+            upd = _shopify_graphql(update_q, {"id": mo_id, "metaobject": {"fields": fields_to_update}})
+            errs = (upd.get("metaobjectUpdate") or {}).get("userErrors") or []
+            if errs:
+                raise RuntimeError(f"metaobjectUpdate userErrors: {json.dumps(errs)}")
+            _log(f"✅ Metaobject updated: {[f['key'] for f in fields_to_update]}")
+        else:
+            _log("ℹ️  No metaobject fields to update")
+
+        # 5. Trigger sleep → wakeup rebuild if logo or color changed
+        if needs_rebuild:
+            from shopify_sleep import sleep_store
+            from shopify_wakeup import wakeup
+
+            _log("😴 Starting sleep (deleting products)…")
+            rebuild_mo_id = _get_metaobject_id_by_handle(handle)
+            if not rebuild_mo_id:
+                raise RuntimeError(f"Metaobject not found for rebuild handle {handle!r}")
+            sleep_store(handle, rebuild_mo_id, log)
+            _log("✅ Store slept — triggering wakeup/rebuild…")
+            printful_job_id = wakeup(handle, log)
+            _log(f"✅ Wakeup triggered (Printful job: {printful_job_id})")
+
+        _job_set(job_id, status="done", finished_at=time.time(), log=log)
+
+    except Exception as e:
+        _log(f"❌ Error: {e}")
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+
+
 # ----------------------------
 # Sleep-mode endpoints
 # ----------------------------
@@ -1534,6 +1630,93 @@ async def admin_store_wakeup(handle: str, request: Request):
     t = threading.Thread(target=_run_store_wakeup_job, args=(job_id, handle), daemon=True)
     t.start()
     return {"status": "ok", "job_id": job_id}
+
+
+@app.post("/admin/store/{handle}/update-settings")
+async def admin_store_update_settings(
+    handle: str,
+    request: Request,
+    store_name: Optional[str] = Form(None),
+    primary_color: Optional[str] = Form(None),
+    main_session_id: Optional[str] = Form(None),
+    storefront_logo_file: Optional[UploadFile] = File(None),
+):
+    """
+    Admin-only. Update a store's display name, primary color, and/or main logo image.
+    If logo or color changes, triggers a sleep+rebuild (delete all products → Printful rebuild).
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body: multipart/form-data with optional fields:
+      store_name, primary_color, main_session_id, storefront_logo_file
+    Returns: {"status": "ok", "job_id": "...", "needs_rebuild": bool}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    store_name = (store_name or "").strip() or None
+    primary_color = (primary_color or "").strip() or None
+    main_session_id = (main_session_id or "").strip() or None
+
+    has_file = storefront_logo_file is not None and (storefront_logo_file.filename or "").strip()
+    if not any([store_name, primary_color, main_session_id, has_file]):
+        return JSONResponse(
+            {"error": "At least one of store_name, primary_color, main_session_id, or storefront_logo_file is required"},
+            status_code=400,
+        )
+
+    # If a direct file upload was provided (and no session_id), create a session for it
+    if has_file and not main_session_id:
+        try:
+            ct = (storefront_logo_file.content_type or "").lower()
+            if ct and not ct.startswith("image/"):
+                return JSONResponse({"error": "storefront_logo_file is not a valid image"}, status_code=400)
+
+            file_bytes = await _read_upload_limited(storefront_logo_file, MAX_UPLOAD_BYTES)
+            if not file_bytes:
+                return JSONResponse({"error": "storefront_logo_file upload was empty"}, status_code=400)
+            img = _pil_open_safe(file_bytes)
+        except ValueError as e:
+            if str(e) == "too_large":
+                return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
+            if str(e) == "too_many_pixels":
+                return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
+            return JSONResponse({"error": "storefront_logo_file is not a valid image"}, status_code=400)
+
+        main_session_id = str(uuid.uuid4())
+        mp = _paths(main_session_id)
+        _save_png(img, mp["orig_master"])
+        _build_original_assets(main_session_id)
+        _write_active_files(main_session_id, "original")
+
+        _sess_set(
+            main_session_id,
+            status="uploaded",
+            stage="uploaded",
+            created_at=time.time(),
+            quality_flags=[],
+            finalized=False,
+            processing=False,
+            processed_available=False,
+            active_version="original",
+            selected=True,
+            error="",
+        )
+
+    needs_rebuild = bool(primary_color or main_session_id)
+
+    job_id = str(uuid.uuid4())
+    _job_set(job_id, status="queued", handle=handle, created_at=time.time(), log=[])
+    t = threading.Thread(
+        target=_run_store_update_settings_job,
+        args=(job_id, handle, store_name, primary_color, main_session_id, needs_rebuild),
+        daemon=True,
+    )
+    t.start()
+    return {"status": "ok", "job_id": job_id, "needs_rebuild": needs_rebuild}
 
 
 @app.get("/admin/store/{handle}/status")
