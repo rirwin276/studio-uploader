@@ -5,6 +5,7 @@ import os
 import json
 import uuid
 import time
+import secrets
 import threading
 import subprocess
 from io import BytesIO
@@ -1953,19 +1954,16 @@ async def admin_store_color_selections(handle: str, request: Request):
     """
     Admin-only. Save up to 3 shirt color selections for a store to a Shopify metaobject,
     then optionally trigger a sleep+rebuild.
-    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Auth: X-Admin-Secret header OR "secret" key in JSON body.
     Body JSON:
       {
-        "shirt_variant": "bc3413",
+        "shirt_variant": "bc3413",   (optional — defaults to "bc3413")
         "colors": ["Solid Black Triblend", "Navy Triblend", "Grey Triblend"],
-        "rebuild": true
+        "rebuild": true,
+        "secret": "<ADMIN_SECRET>"   (optional — alternative to X-Admin-Secret header)
       }
     Returns: {"status": "ok", "saved_colors": [...], "job_id": "..." or null}
     """
-    denied = _require_admin_secret(request)
-    if denied is not None:
-        return denied
-
     handle = handle.strip()
     if not handle:
         return JSONResponse({"error": "handle is required"}, status_code=400)
@@ -1975,7 +1973,15 @@ async def admin_store_color_selections(handle: str, request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
+    # Auth: accept X-Admin-Secret header OR "secret" field in the JSON body
+    header_secret = request.headers.get("X-Admin-Secret", "").strip()
+    body_secret = (body.get("secret") or "").strip()
+    if not secrets.compare_digest(header_secret, _ADMIN_SECRET) and not secrets.compare_digest(body_secret, _ADMIN_SECRET):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     shirt_variant = (body.get("shirt_variant") or "").strip()
+    if not shirt_variant:
+        shirt_variant = "bc3413"
     if shirt_variant not in _VALID_SHIRT_VARIANTS:
         return JSONResponse(
             {"error": f"shirt_variant must be one of: {sorted(_VALID_SHIRT_VARIANTS)}"},
@@ -2058,6 +2064,37 @@ async def admin_store_get_color_selections(handle: str, request: Request, shirt_
     fields = {f["key"]: f["value"] for f in (mo.get("fields") or [])}
     colors = [fields[k] for k in ("color_1", "color_2", "color_3") if fields.get(k)]
     return {"colors": colors if colors else None}
+
+
+@app.get("/admin/store/{handle}/color-rebuild-status")
+async def admin_store_color_rebuild_status(
+    handle: str,
+    request: Request,
+    job_id: str = Query(...),
+    secret: str = Query(...),
+):
+    """
+    Poll the status of a color-rebuild job launched by POST /admin/store/{handle}/color-selections.
+    Auth: secret query param validated against ADMIN_SECRET (no custom header needed — browser-safe).
+    Query params:
+      job_id  — the job UUID returned by the color-selections POST
+      secret  — ADMIN_SECRET value
+    Returns:
+      {"status": "queued"|"running"|"done"|"error", "log": [...], "error": null|"..."}
+      {"status": "not_found"} when job_id is unknown
+    """
+    if not secrets.compare_digest((secret or "").strip(), _ADMIN_SECRET):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    job = _job_get((job_id or "").strip())
+    if not job:
+        return {"status": "not_found"}
+
+    return {
+        "status": job.get("status", "unknown"),
+        "log": job.get("log", []),
+        "error": job.get("error", None),
+    }
 
 
 @app.get("/admin/store/{handle}/status")
