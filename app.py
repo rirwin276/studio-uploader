@@ -5,6 +5,7 @@ import os
 import json
 import uuid
 import time
+import secrets
 import threading
 import subprocess
 from io import BytesIO
@@ -1975,7 +1976,7 @@ async def admin_store_color_selections(handle: str, request: Request):
     # Auth: accept X-Admin-Secret header OR "secret" field in the JSON body
     header_secret = request.headers.get("X-Admin-Secret", "").strip()
     body_secret = (body.get("secret") or "").strip()
-    if header_secret != _ADMIN_SECRET and body_secret != _ADMIN_SECRET:
+    if not secrets.compare_digest(header_secret, _ADMIN_SECRET) and not secrets.compare_digest(body_secret, _ADMIN_SECRET):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     shirt_variant = (body.get("shirt_variant") or "").strip()
@@ -2082,7 +2083,7 @@ async def admin_store_color_rebuild_status(
       {"status": "queued"|"running"|"done"|"error", "log": [...], "error": null|"..."}
       {"status": "not_found"} when job_id is unknown
     """
-    if (secret or "").strip() != _ADMIN_SECRET:
+    if not secrets.compare_digest((secret or "").strip(), _ADMIN_SECRET):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     job = _job_get((job_id or "").strip())
