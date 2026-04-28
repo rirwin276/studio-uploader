@@ -1461,7 +1461,6 @@ def _run_store_update_settings_job(
 ) -> None:
     """Update store display name, primary color, and/or main logo; optionally trigger sleep+rebuild."""
     from shopify_provision import upload_png_to_shopify_files, read_session_png
-    from shopify_wakeup import _get_metaobject_id_by_handle
 
     _job_set(job_id, status="running", started_at=time.time())
     log: list = []
@@ -1532,10 +1531,7 @@ def _run_store_update_settings_job(
             from shopify_wakeup import wakeup
 
             _log("😴 Starting sleep (deleting products)…")
-            rebuild_mo_id = _get_metaobject_id_by_handle(handle)
-            if not rebuild_mo_id:
-                raise RuntimeError(f"Metaobject not found for rebuild handle {handle!r}")
-            sleep_store(handle, rebuild_mo_id, log)
+            sleep_store(handle, mo_id, log)
             _log("✅ Store slept — triggering wakeup/rebuild…")
             printful_job_id = wakeup(handle, log)
             _log(f"✅ Wakeup triggered (Printful job: {printful_job_id})")
@@ -1706,6 +1702,8 @@ async def admin_store_update_settings(
             error="",
         )
 
+    # needs_rebuild is True when logo or color changes; note that when a direct file upload
+    # is provided, main_session_id is assigned above before this check, so it is included.
     needs_rebuild = bool(primary_color or main_session_id)
 
     job_id = str(uuid.uuid4())
