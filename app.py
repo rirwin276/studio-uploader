@@ -1451,6 +1451,90 @@ def _run_store_wakeup_job(job_id: str, handle: str) -> None:
         _job_set(job_id, status="failed", finished_at=time.time(), error=str(e), log=log)
 
 
+def _delete_placement_overrides_for_store(handle: str, log: list) -> int:
+    """
+    Delete all placement_override metaobjects for a given store handle.
+    Returns the count of deleted overrides.
+    Called before a logo-change rebuild so the new image uses Titan auto-placement.
+    """
+    def _log(msg: str) -> None:
+        log.append(msg)
+        print(msg)
+
+    list_query = """
+    query ListPlacementOverrides($after: String) {
+      metaobjects(type: "placement_override", first: 50, after: $after) {
+        edges {
+          node {
+            id
+            handle
+            fields { key value }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+
+    delete_mutation = """
+    mutation DeleteMetaobject($id: ID!) {
+      metaobjectDelete(id: $id) {
+        deletedId
+        userErrors { field message }
+      }
+    }
+    """
+
+    to_delete = []
+    cursor = None
+
+    try:
+        while True:
+            variables: Dict[str, Any] = {}
+            if cursor:
+                variables["after"] = cursor
+            data = _shopify_graphql(list_query, variables)
+            metaobjects = (data.get("metaobjects") or {})
+
+            for edge in (metaobjects.get("edges") or []):
+                node = edge["node"]
+                fields = {f["key"]: f["value"] for f in (node.get("fields") or [])}
+                product_handle = fields.get("product_handle", "")
+                if product_handle == handle or product_handle.startswith(handle + "-"):
+                    to_delete.append({"id": node["id"], "handle": node["handle"]})
+
+            page_info = metaobjects.get("pageInfo") or {}
+            if page_info.get("hasNextPage"):
+                cursor = page_info.get("endCursor")
+            else:
+                break
+    except Exception as e:
+        _log(f"⚠️ Failed to list placement overrides: {e}")
+        return 0
+
+    if not to_delete:
+        _log(f"ℹ️ No placement overrides found for store {handle!r} — nothing to clear")
+        return 0
+
+    _log(f"🗑️ Clearing {len(to_delete)} placement override(s) for {handle!r} (logo changed)")
+
+    deleted = 0
+    for item in to_delete:
+        try:
+            result = _shopify_graphql(delete_mutation, {"id": item["id"]})
+            errs = (result.get("metaobjectDelete") or {}).get("userErrors") or []
+            if errs:
+                _log(f"  ⚠️ Delete {item['handle']}: userErrors {errs}")
+            else:
+                _log(f"  ✅ Deleted override: {item['handle']}")
+                deleted += 1
+        except Exception as e:
+            _log(f"  ⚠️ Failed to delete {item['handle']}: {e}")
+
+    _log(f"✅ Cleared {deleted}/{len(to_delete)} placement overrides for {handle!r}")
+    return deleted
+
+
 def _run_store_update_settings_job(
     job_id: str,
     handle: str,
@@ -1529,6 +1613,10 @@ def _run_store_update_settings_job(
         if needs_rebuild:
             from shopify_sleep import sleep_store
             from shopify_wakeup import wakeup
+
+            # If logo changed, clear placement overrides so new image uses Titan auto-placement
+            if main_session_id:
+                _delete_placement_overrides_for_store(handle, log)
 
             _log("😴 Starting sleep (deleting products)…")
             sleep_store(handle, mo_id, log)
