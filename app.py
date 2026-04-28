@@ -1630,6 +1630,149 @@ def _run_store_update_settings_job(
         _log(f"❌ Error: {e}")
         _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
 
+# ----------------------------
+# Color-selection helpers
+# ----------------------------
+_COLOR_SELECTION_TYPE = "store_color_selection"
+_VALID_SHIRT_VARIANTS = {"bc3413"}
+
+
+def _ensure_color_selection_definition() -> None:
+    """
+    Ensure the store_color_selection metaobject definition exists in Shopify.
+    Creates it with the required fields if it does not exist yet.
+    """
+    check_q = """
+    query GetMetaobjectDefinition($type: String!) {
+      metaobjectDefinitionByType(type: $type) { id type }
+    }
+    """
+    data = _shopify_graphql(check_q, {"type": _COLOR_SELECTION_TYPE})
+    if (data.get("metaobjectDefinitionByType") or {}).get("id"):
+        return  # already exists
+
+    create_q = """
+    mutation CreateMetaobjectDefinition($definition: MetaobjectDefinitionCreateInput!) {
+      metaobjectDefinitionCreate(definition: $definition) {
+        metaobjectDefinition { id type }
+        userErrors { field message }
+      }
+    }
+    """
+    field_defs = [
+        {"key": "store_handle", "type": "single_line_text_field"},
+        {"key": "shirt_variant", "type": "single_line_text_field"},
+        {"key": "color_1", "type": "single_line_text_field"},
+        {"key": "color_2", "type": "single_line_text_field"},
+        {"key": "color_3", "type": "single_line_text_field"},
+        {"key": "updated_at", "type": "single_line_text_field"},
+    ]
+    result = _shopify_graphql(
+        create_q,
+        {
+            "definition": {
+                "type": _COLOR_SELECTION_TYPE,
+                "name": "Store Color Selection",
+                "fieldDefinitions": field_defs,
+            }
+        },
+    )
+    errs = (result.get("metaobjectDefinitionCreate") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"metaobjectDefinitionCreate userErrors: {json.dumps(errs)}")
+
+
+def _upsert_color_selection(store_handle: str, shirt_variant: str, colors: list) -> None:
+    """
+    Upsert a store_color_selection metaobject for the given store + shirt variant.
+    handle format: {store_handle}--{shirt_variant}
+    """
+    mo_handle = f"{store_handle}--{shirt_variant}"
+    now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    fields = [
+        {"key": "store_handle", "value": store_handle},
+        {"key": "shirt_variant", "value": shirt_variant},
+        {"key": "color_1", "value": colors[0] if len(colors) > 0 else ""},
+        {"key": "color_2", "value": colors[1] if len(colors) > 1 else ""},
+        {"key": "color_3", "value": colors[2] if len(colors) > 2 else ""},
+        {"key": "updated_at", "value": now_str},
+    ]
+
+    # Check if it already exists
+    find_q = """
+    query GetColorSelection($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) { id }
+    }
+    """
+    data = _shopify_graphql(find_q, {"handle": {"type": _COLOR_SELECTION_TYPE, "handle": mo_handle}})
+    existing = (data.get("metaobjectByHandle") or {}).get("id")
+
+    if existing:
+        update_q = """
+        mutation UpdateColorSelection($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+          metaobjectUpdate(id: $id, metaobject: $metaobject) {
+            metaobject { id }
+            userErrors { field message }
+          }
+        }
+        """
+        result = _shopify_graphql(update_q, {"id": existing, "metaobject": {"fields": fields}})
+        errs = (result.get("metaobjectUpdate") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"metaobjectUpdate userErrors: {json.dumps(errs)}")
+    else:
+        create_q = """
+        mutation CreateColorSelection($metaobject: MetaobjectCreateInput!) {
+          metaobjectCreate(metaobject: $metaobject) {
+            metaobject { id }
+            userErrors { field message }
+          }
+        }
+        """
+        result = _shopify_graphql(
+            create_q,
+            {
+                "metaobject": {
+                    "type": _COLOR_SELECTION_TYPE,
+                    "handle": mo_handle,
+                    "fields": fields,
+                }
+            },
+        )
+        errs = (result.get("metaobjectCreate") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"metaobjectCreate userErrors: {json.dumps(errs)}")
+
+
+def _run_store_color_rebuild_job(job_id: str, handle: str) -> None:
+    """Sleep then wake up a store to apply new color selections."""
+    from shopify_sleep import sleep_store
+    from shopify_wakeup import wakeup, _get_metaobject_id_by_handle
+
+    _job_set(job_id, status="running", started_at=time.time())
+    log: list = []
+
+    def _log(msg: str) -> None:
+        log.append(msg)
+        print(msg)
+
+    try:
+        mo_id = _get_metaobject_id_by_handle(handle)
+        if not mo_id:
+            raise RuntimeError(f"Metaobject not found for handle {handle!r}")
+
+        _log("😴 Starting sleep (deleting products)…")
+        sleep_store(handle, mo_id, log)
+        _log("✅ Store slept — triggering wakeup/rebuild…")
+        printful_job_id = wakeup(handle, log)
+        _log(f"✅ Wakeup triggered (Printful job: {printful_job_id})")
+
+        _job_set(job_id, status="done", finished_at=time.time(), log=log)
+    except Exception as e:
+        _log(f"❌ Error: {e}")
+        _job_set(job_id, status="error", finished_at=time.time(), error=str(e), log=log)
+
 
 # ----------------------------
 # Sleep-mode endpoints
@@ -1803,6 +1946,118 @@ async def admin_store_update_settings(
     )
     t.start()
     return {"status": "ok", "job_id": job_id, "needs_rebuild": needs_rebuild}
+
+
+@app.post("/admin/store/{handle}/color-selections")
+async def admin_store_color_selections(handle: str, request: Request):
+    """
+    Admin-only. Save up to 3 shirt color selections for a store to a Shopify metaobject,
+    then optionally trigger a sleep+rebuild.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON:
+      {
+        "shirt_variant": "bc3413",
+        "colors": ["Solid Black Triblend", "Navy Triblend", "Grey Triblend"],
+        "rebuild": true
+      }
+    Returns: {"status": "ok", "saved_colors": [...], "job_id": "..." or null}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    shirt_variant = (body.get("shirt_variant") or "").strip()
+    if shirt_variant not in _VALID_SHIRT_VARIANTS:
+        return JSONResponse(
+            {"error": f"shirt_variant must be one of: {sorted(_VALID_SHIRT_VARIANTS)}"},
+            status_code=400,
+        )
+
+    colors = body.get("colors")
+    if not isinstance(colors, list) or not (1 <= len(colors) <= 3):
+        return JSONResponse({"error": "colors must be a list of 1–3 items"}, status_code=400)
+    colors = [str(c).strip() for c in colors]
+    if any(not c for c in colors):
+        return JSONResponse({"error": "colors must not contain empty strings"}, status_code=400)
+
+    rebuild = body.get("rebuild", True)
+    if not isinstance(rebuild, bool):
+        rebuild = bool(rebuild)
+
+    try:
+        _ensure_color_selection_definition()
+        _upsert_color_selection(store_handle=handle, shirt_variant=shirt_variant, colors=colors)
+    except Exception as e:
+        print(f"[color-selections] Failed to save: {e}")
+        return JSONResponse({"error": "Failed to save color selections"}, status_code=500)
+
+    job_id = None
+    if rebuild:
+        job_id = str(uuid.uuid4())
+        _job_set(job_id, status="queued", handle=handle, created_at=time.time(), log=[])
+        t = threading.Thread(
+            target=_run_store_color_rebuild_job,
+            args=(job_id, handle),
+            daemon=True,
+        )
+        t.start()
+
+    return {"status": "ok", "saved_colors": colors, "job_id": job_id}
+
+
+@app.get("/admin/store/{handle}/color-selections")
+async def admin_store_get_color_selections(handle: str, request: Request, shirt_variant: str = Query(...)):
+    """
+    Admin-only. Return the current saved color selections for a store + shirt variant.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Query param: shirt_variant (e.g. bc3413)
+    Returns: {"colors": ["...", "..."] or null}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    shirt_variant = (shirt_variant or "").strip()
+    if shirt_variant not in _VALID_SHIRT_VARIANTS:
+        return JSONResponse(
+            {"error": f"shirt_variant must be one of: {sorted(_VALID_SHIRT_VARIANTS)}"},
+            status_code=400,
+        )
+
+    mo_handle = f"{handle}--{shirt_variant}"
+    find_q = """
+    query GetColorSelection($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        fields { key value }
+      }
+    }
+    """
+    try:
+        data = _shopify_graphql(find_q, {"handle": {"type": _COLOR_SELECTION_TYPE, "handle": mo_handle}})
+    except Exception as e:
+        print(f"[color-selections] Shopify request failed: {e}")
+        return JSONResponse({"error": "Shopify request failed"}, status_code=502)
+
+    mo = data.get("metaobjectByHandle")
+    if not mo:
+        return {"colors": None}
+
+    fields = {f["key"]: f["value"] for f in (mo.get("fields") or [])}
+    colors = [fields[k] for k in ("color_1", "color_2", "color_3") if fields.get(k)]
+    return {"colors": colors if colors else None}
 
 
 @app.get("/admin/store/{handle}/status")
