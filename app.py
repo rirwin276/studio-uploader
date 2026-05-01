@@ -56,6 +56,10 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 
+# Printful Automation proxy (for Shopify file uploads)
+PRINTFUL_AUTOMATION_URL = (os.getenv("PRINTFUL_AUTOMATION_URL") or "").strip().rstrip("/")
+EDITOR_SECRET = (os.getenv("EDITOR_SECRET") or "").strip()
+
 # PhotoRoom
 PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
 PHOTOROOM_ENDPOINT = (os.getenv("PHOTOROOM_ENDPOINT") or "https://sdk.photoroom.com/v1/segment").strip()
@@ -926,6 +930,69 @@ def finalize_post(session_id: str):
         return JSONResponse({"error": "Not found"}, status_code=404)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/upload-to-files/{session_id}")
+async def upload_to_files(session_id: str):
+    """
+    Upload the finalized PNG for this session to Shopify Files via
+    Printful_Automation's /editor/pro-shirt/bc3413/upload-logo proxy endpoint.
+    Returns {"cdn_url": "https://cdn.shopify.com/..."}.
+
+    Requires env var PRINTFUL_AUTOMATION_URL (e.g. https://printful-automation.up.railway.app)
+    and EDITOR_SECRET to be set.
+    """
+    if not _session_exists(session_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    s = _sess_get(session_id)
+    if not s.get("finalized"):
+        return JSONResponse({"error": "Session not finalized — call /finalize first"}, status_code=409)
+
+    p = _paths(session_id)
+    if p["final"].exists():
+        final_file_path = p["final"]
+    elif p["curr"].exists():
+        final_file_path = p["curr"]
+    else:
+        final_file_path = None
+
+    if not final_file_path:
+        return JSONResponse({"error": "Final PNG not found on disk"}, status_code=404)
+
+    if not PRINTFUL_AUTOMATION_URL:
+        return JSONResponse({"error": "PRINTFUL_AUTOMATION_URL env var not set"}, status_code=500)
+    if not EDITOR_SECRET:
+        return JSONResponse({"error": "EDITOR_SECRET env var not set"}, status_code=500)
+
+    try:
+        png_bytes = final_file_path.read_bytes()
+        filename = f"logo_{session_id[:8]}.png"
+
+        resp = requests.post(
+            f"{PRINTFUL_AUTOMATION_URL}/editor/pro-shirt/bc3413/upload-logo",
+            params={"secret": EDITOR_SECRET},
+            files={"file": (filename, png_bytes, "image/png")},
+            timeout=120,
+        )
+
+        if resp.status_code != 200:
+            return JSONResponse(
+                {"error": f"upload-logo proxy failed: HTTP {resp.status_code}: {resp.text[:300]}"},
+                status_code=502,
+            )
+
+        data = resp.json()
+        cdn_url = data.get("cdn_url") or ""
+        if not cdn_url:
+            return JSONResponse({"error": "No cdn_url in upload-logo response"}, status_code=502)
+
+        _sess_set(session_id, cdn_url=cdn_url)
+
+        return {"status": "ok", "cdn_url": cdn_url}
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
