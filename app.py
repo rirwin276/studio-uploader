@@ -57,8 +57,8 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 
 # Printful Automation proxy (for Shopify file uploads)
-PRINTFUL_AUTOMATION_URL = (os.getenv("PRINTFUL_AUTOMATION_URL") or "").strip().rstrip("/")
-EDITOR_SECRET = (os.getenv("EDITOR_SECRET") or "").strip()
+PRINTFUL_AUTOMATION_URL = (os.getenv("PRINTFUL_AUTOMATION_URL") or "https://printfulautomation-production.up.railway.app").strip().rstrip("/")
+EDITOR_SECRET = (os.getenv("EDITOR_SECRET") or "stellasage-god-mode-2026-xK9mP").strip()
 
 # PhotoRoom
 PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
@@ -961,11 +961,6 @@ async def upload_to_files(session_id: str):
 
     if not final_file_path:
         return JSONResponse({"error": "Final PNG not found on disk"}, status_code=404)
-
-    if not PRINTFUL_AUTOMATION_URL:
-        return JSONResponse({"error": "PRINTFUL_AUTOMATION_URL env var not set"}, status_code=500)
-    if not EDITOR_SECRET:
-        return JSONResponse({"error": "EDITOR_SECRET env var not set"}, status_code=500)
 
     try:
         png_bytes = final_file_path.read_bytes()
