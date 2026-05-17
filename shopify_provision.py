@@ -541,6 +541,8 @@ def metaobject_upsert_custom_shop(
 
     primary_color_value = (primary_color or "").strip() or "No preference"
 
+    status_value = "active" if is_fully_ready else "building"
+
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
@@ -548,6 +550,7 @@ def metaobject_upsert_custom_shop(
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
+        {"key": "status", "value": status_value},
         {"key": "primary_color", "value": primary_color_value},
     ]
 
@@ -642,8 +645,8 @@ def trigger_printful_automation(store_handle: str, type_of_store: str, primary_c
     }
 
     candidates = [
-        f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/run",
         f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/trigger_automation",
+        f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/run",
     ]
 
     last_resp: Optional[requests.Response] = None

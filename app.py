@@ -2661,6 +2661,8 @@ async def store_ready_status(handle: str):
     Public. Polling endpoint for the Shopify dashboard frontend.
     Returns {"ready": true, "handle": "..."} if is_fully_ready == "true",
     or {"ready": false, "handle": "...", "status": "building"} otherwise.
+    Also returns can_show_card=true as soon as the store metaobject exists so
+    UI handoff can end without waiting for full readiness.
     No authentication required.
     """
     handle = handle.strip()
@@ -2712,10 +2714,23 @@ async def store_ready_status(handle: str):
         return None
 
     is_ready = (_field("is_fully_ready") or "").lower() == "true"
+    status_val = (_field("status") or "").strip().lower() or ("active" if is_ready else "building")
 
     if is_ready:
-        return {"ready": True, "handle": handle}
-    return {"ready": False, "handle": handle, "status": "building"}
+        return {
+            "ready": True,
+            "is_fully_ready": True,
+            "can_show_card": True,
+            "status": status_val,
+            "handle": handle,
+        }
+    return {
+        "ready": False,
+        "is_fully_ready": False,
+        "can_show_card": True,
+        "status": "building" if status_val == "building" else status_val,
+        "handle": handle,
+    }
 
 
 @app.post("/store/{handle}/store-ready")
@@ -2830,15 +2845,17 @@ def ui(
   <title>Studio Uploader</title>
   <style>
     :root {
-      --bg0: #f7f8fb;
-      --bg1: #edf2f7;
-      --card: rgba(255,255,255,0.82);
-      --card-2: rgba(255,255,255,0.66);
-      --border: rgba(15,23,42,0.08);
-      --text: #0f172a;
-      --muted: #667085;
-      --muted-2: #64748b;
-      --shadow-lg: 0 28px 80px rgba(15,23,42,0.10);
+      --bg0: #fbf8f1;
+      --bg1: #f6efdf;
+      --card: rgba(255,255,255,0.84);
+      --card-2: rgba(255,255,255,0.72);
+      --border: rgba(183,163,106,0.26);
+      --text: #1c1710;
+      --muted: #75654a;
+      --muted-2: #6d5b3c;
+      --shadow-lg: 0 28px 80px rgba(17,16,14,0.10);
+      --gold: #b7a36a;
+      --gold-soft: rgba(183,163,106,0.22);
       --green1: #34d399;
       --green2: #10b981;
       --blue1: #0f172a;
@@ -2865,8 +2882,10 @@ def ui(
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(900px 420px at 50% -130px, rgba(255,255,255,0.95), rgba(255,255,255,0) 60%),
-        linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 100%);
+        radial-gradient(circle at 8% -6%, rgba(183,163,106,0.20), rgba(183,163,106,0) 36%),
+        radial-gradient(circle at 92% 0%, rgba(255,255,255,0.95), rgba(255,255,255,0) 28%),
+        radial-gradient(circle at 50% 105%, rgba(183,163,106,0.12), rgba(183,163,106,0) 34%),
+        linear-gradient(180deg, var(--bg0) 0%, #fffdfa 44%, var(--bg1) 100%);
       -webkit-font-smoothing: antialiased;
       text-rendering: optimizeLegibility;
     }
@@ -2960,7 +2979,7 @@ def ui(
     .review-wrap {
       width: min(980px, 100%);
       background: var(--card);
-      backdrop-filter: blur(22px) saturate(1.08);
+      backdrop-filter: blur(22px) saturate(1.05);
       border: 1px solid var(--border);
       border-radius: 30px;
       box-shadow: var(--shadow-lg);
@@ -2979,7 +2998,7 @@ def ui(
       border-radius: 24px;
       padding: 28px 18px;
       text-align: center;
-      border: 1.5px dashed rgba(15,23,42,0.11);
+      border: 1.5px dashed rgba(183,163,106,0.34);
       background: var(--card-2);
       overflow: hidden;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.85);
@@ -3019,7 +3038,7 @@ def ui(
 
     .guide-card {
       border-radius: 20px;
-      background: rgba(255,255,255,0.74);
+      background: linear-gradient(145deg, rgba(255,255,255,0.88), rgba(249,245,236,0.82));
       border: 1px solid var(--border);
       padding: 11px 13px;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.82);
@@ -3028,7 +3047,7 @@ def ui(
     .guide-title {
       font-size: 13px;
       font-weight: 800;
-      color: #0f172a;
+      color: #2a1f10;
       margin-bottom: 4px;
       letter-spacing: -0.01em;
     }
@@ -3065,7 +3084,7 @@ def ui(
       gap: 10px;
       border-radius: 20px;
       padding: 12px 14px;
-      background: var(--warn-bg);
+      background: linear-gradient(145deg, rgba(255,255,255,0.75), var(--warn-bg));
       border: 1px solid var(--warn-border);
       color: var(--warn-text);
       font-size: 12px;
@@ -3275,7 +3294,9 @@ def ui(
       flex-direction: column;
       gap: 12px;
       text-align: center;
-      background: linear-gradient(180deg, rgba(255,255,255,0.80), rgba(255,255,255,0.92));
+      background:
+        radial-gradient(circle at 50% 6%, rgba(183,163,106,0.24), rgba(183,163,106,0) 42%),
+        linear-gradient(180deg, rgba(255,255,255,0.80), rgba(255,253,248,0.94));
       backdrop-filter: blur(8px);
       padding: 22px;
     }
@@ -3286,8 +3307,8 @@ def ui(
       width: 46px;
       height: 46px;
       border-radius: 999px;
-      border: 3px solid rgba(15,23,42,0.10);
-      border-top-color: rgba(15,23,42,0.82);
+      border: 3px solid var(--gold-soft);
+      border-top-color: var(--gold);
       animation: spin 0.9s linear infinite;
     }
 
@@ -3300,7 +3321,7 @@ def ui(
       font-size: 16px;
       font-weight: 800;
       letter-spacing: -0.02em;
-      color: #0f172a;
+      color: #2a1f10;
     }
 
     .overlay-sub {
