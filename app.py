@@ -39,7 +39,7 @@ app.add_middleware(
     allow_origins=allow_origins_list,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Admin-Secret"],
 )
 
 
@@ -2327,7 +2327,7 @@ async def admin_store_add_member(handle: str, request: Request):
     Returns: {"ok": true, "customer_id": "...", "email": "...", "tag_added": "storefront-member--{handle}"}
          or: {"ok": true, "already_member": true}
          or: {"error": "..."} with status 502
-    If the customer does not exist in Shopify, they are created automatically.
+    Returns 404 with a helpful message if the customer does not exist in Shopify.
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -2367,24 +2367,14 @@ async def admin_store_add_member(handle: str, request: Request):
         edges = (data.get("customers") or {}).get("edges") or []
 
         if not edges:
-            # Customer not found — create with member tag
-            print(f"[add-member] Customer not found, creating: {email}", flush=True)
-            create_q = """
-            mutation customerCreate($input: CustomerInput!) {
-              customerCreate(input: $input) {
-                customer { id email tags }
-                userErrors { field message }
-              }
-            }
-            """
-            create_res = _shopify_graphql(create_q, {"input": {"email": email, "tags": [member_tag]}})
-            create_errs = (create_res.get("customerCreate") or {}).get("userErrors") or []
-            if create_errs:
-                raise RuntimeError(f"customerCreate userErrors: {json.dumps(create_errs)}")
-            new_customer = (create_res.get("customerCreate") or {}).get("customer")
-            if not new_customer:
-                raise RuntimeError("customerCreate returned no customer")
-            return {"ok": True, "customer_id": new_customer["id"], "email": new_customer["email"], "tag_added": member_tag}
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "No account found. Ask them to create an account at stellasageco.com then try again.",
+                    "not_found": True,
+                },
+                status_code=404,
+            )
 
         customer = edges[0]["node"]
         customer_gid = customer["id"]
@@ -2424,7 +2414,7 @@ async def admin_store_add_admin(handle: str, request: Request):
     Adds BOTH storefront-admin--{handle} AND storefront-member--{handle} tags.
     Header: X-Admin-Secret: <ADMIN_SECRET>
     Body JSON: {"email": "user@example.com"}
-    If the customer does not exist, they are created with both tags.
+    Returns 404 with a helpful message if the customer does not exist in Shopify.
     Returns: {"ok": true, "email": "...", "tags_added": [...]}
     """
     denied = _require_admin_secret(request)
@@ -2466,24 +2456,14 @@ async def admin_store_add_admin(handle: str, request: Request):
         edges = (data.get("customers") or {}).get("edges") or []
 
         if not edges:
-            # Customer not found — create with both tags
-            print(f"[add-admin] Customer not found, creating: {email}", flush=True)
-            create_q = """
-            mutation customerCreate($input: CustomerInput!) {
-              customerCreate(input: $input) {
-                customer { id email tags }
-                userErrors { field message }
-              }
-            }
-            """
-            create_res = _shopify_graphql(create_q, {"input": {"email": email, "tags": desired_tags}})
-            create_errs = (create_res.get("customerCreate") or {}).get("userErrors") or []
-            if create_errs:
-                raise RuntimeError(f"customerCreate userErrors: {json.dumps(create_errs)}")
-            new_customer = (create_res.get("customerCreate") or {}).get("customer")
-            if not new_customer:
-                raise RuntimeError("customerCreate returned no customer")
-            return {"ok": True, "email": new_customer["email"], "tags_added": desired_tags}
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "No account found. Ask them to create an account at stellasageco.com then try again.",
+                    "not_found": True,
+                },
+                status_code=404,
+            )
 
         customer = edges[0]["node"]
         customer_gid = customer["id"]
