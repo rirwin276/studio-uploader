@@ -1672,7 +1672,16 @@ def _run_store_update_settings_job(
         else:
             _log("ℹ️  No metaobject fields to update")
 
-        # 5. Trigger sleep → wakeup rebuild if logo or color changed
+        # 5. Clear placement overrides when logo changed (non-fatal)
+        if main_session_id:
+            try:
+                from studio_utils.placement_overrides import delete_placement_overrides_for_store
+                deleted = delete_placement_overrides_for_store(handle)
+                _log(f"🗑️ Cleared {deleted} placement override(s) for {handle} — new logo will use default positioning")
+            except Exception as _e:
+                _log(f"⚠️ Could not clear placement overrides (non-fatal): {_e}")
+
+        # 6. Trigger sleep → wakeup rebuild if logo or color changed
         if needs_rebuild:
             from shopify_sleep import sleep_store
             from shopify_wakeup import wakeup
