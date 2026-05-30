@@ -2472,7 +2472,7 @@ async def admin_store_add_admin(handle: str, request: Request):
 
         tags_added = [t for t in desired_tags if t not in existing_tags]
         if not tags_added:
-            return JSONResponse({"ok": True, "email": customer_email, "tags_added": []})
+            return {"ok": True, "email": customer_email, "tags_added": []}
 
         new_tags = existing_tags + tags_added
         update_q = """
@@ -2581,7 +2581,7 @@ async def admin_store_remove_admin(handle: str, request: Request):
     Blocked if the customer is the last admin of the store.
     Header: X-Admin-Secret: <ADMIN_SECRET>
     Body JSON: {"email": "user@example.com"}
-    Returns: {"ok": true, "email": "...", "remaining_admins": N}
+    Returns: {"ok": true, "email": "..."}
          or: {"error": "Cannot remove the last admin of a store"} with status 400
          or: {"error": "Customer not found"} with status 404
     """
@@ -2628,38 +2628,25 @@ async def admin_store_remove_admin(handle: str, request: Request):
         customer_email = customer["email"]
         existing_tags = customer.get("tags") or []
 
-        if admin_tag not in existing_tags:
-            # Already not an admin — count remaining admins and return
-            admins_q = """
-            query findAdmins($query: String!) {
-              customers(first: 250, query: $query) {
-                edges { node { id } }
-              }
-            }
-            """
-            admins_data = _shopify_graphql(admins_q, {"query": f"tag:{admin_tag}"})
-            remaining = len((admins_data.get("customers") or {}).get("edges") or [])
-            return JSONResponse({"ok": True, "email": customer_email, "remaining_admins": remaining})
-
-        # Check if there is at least one OTHER admin for this store
-        other_admins_q = """
-        query findOtherAdmins($query: String!) {
-          customers(first: 250, query: $query) {
-            edges {
-              node {
+        admins_q = f"""
+        query {{
+          customers(first: 10, query: "tag:{admin_tag}") {{
+            edges {{
+              node {{
                 id
                 email
-              }
-            }
-          }
-        }
+              }}
+            }}
+          }}
+        }}
         """
-        other_data = _shopify_graphql(other_admins_q, {"query": f"tag:{admin_tag}"})
-        all_admin_edges = (other_data.get("customers") or {}).get("edges") or []
-        other_admins = [e for e in all_admin_edges if e["node"]["id"] != customer_gid]
-
-        if not other_admins:
+        admins_data = _shopify_graphql(admins_q, {})
+        all_admin_edges = (admins_data.get("customers") or {}).get("edges") or []
+        if len(all_admin_edges) == 1 and all_admin_edges[0]["node"]["id"] == customer_gid:
             return JSONResponse({"error": "Cannot remove the last admin of a store"}, status_code=400)
+
+        if admin_tag not in existing_tags:
+            return {"ok": True, "email": customer_email}
 
         # Remove only the admin tag
         new_tags = [t for t in existing_tags if t != admin_tag]
@@ -2676,7 +2663,7 @@ async def admin_store_remove_admin(handle: str, request: Request):
         if errs:
             raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
 
-        return {"ok": True, "email": customer_email, "remaining_admins": len(other_admins)}
+        return {"ok": True, "email": customer_email}
 
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=502)
