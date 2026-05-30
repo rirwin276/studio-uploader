@@ -59,6 +59,11 @@ MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(40_000_000)))  # 40MP
 # Printful Automation proxy (for Shopify file uploads)
 PRINTFUL_AUTOMATION_URL = (os.getenv("PRINTFUL_AUTOMATION_URL") or "https://printfulautomation-production.up.railway.app").strip().rstrip("/")
 EDITOR_SECRET = (os.getenv("EDITOR_SECRET") or "stellasage-god-mode-2026-xK9mP").strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "ryan.irwin@stellaandsagecompany.com")
 
 # PhotoRoom
 PHOTOROOM_API_KEY = (os.getenv("PHOTOROOM_API_KEY") or "").strip()
@@ -96,6 +101,43 @@ DEPROVISION_TIMEOUT = int(os.getenv("DEPROVISION_TIMEOUT", "900"))  # 15 min: nu
 _SHOPIFY_SHOP = os.getenv("SHOP", "").strip()
 _SHOPIFY_API_VERSION = os.getenv("API_VERSION", "2026-01").strip()
 _SHOPIFY_ACCESS_TOKEN = os.getenv("CLIENT_SECRET", "").strip()
+
+
+def _send_new_store_email(handle: str, store_name: str) -> None:
+    """Send a notification email when a new store finishes building. Never raises."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print(f"[email] SMTP not configured — skipping notification for {handle}")
+        return
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        store_url = f"https://stellasageco.com/collections/{handle}"
+        god_mode_url = "https://stellasageco.com/pages/super-admin"
+        subject = f"🆕 New store built: {store_name}"
+        body = (
+            f"New store finished building on Stella & Sage.\n\n"
+            f"Store: {store_name}\n"
+            f"Handle: {handle}\n\n"
+            f"View storefront: {store_url}\n"
+            f"God Mode: {god_mode_url}\n\n"
+            f"This is an automated notification from Studio Uploader."
+        )
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIFY_EMAIL
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+        print(f"[email] Notification sent for store {handle}")
+    except Exception as exc:
+        print(f"[email] Failed to send notification for {handle}: {exc}")
 
 
 # ----------------------------
@@ -3120,6 +3162,14 @@ async def store_mark_ready(handle: str, request: Request):
     if not mo:
         return JSONResponse({"error": "Store not found"}, status_code=404)
 
+    store_name = handle
+    for f in (mo.get("fields") or []):
+        if f.get("key") in ("name", "title"):
+            maybe_name = (f.get("value") or "").strip()
+            if maybe_name:
+                store_name = maybe_name
+                break
+
     mo_id = mo.get("id")
 
     # Update is_fully_ready and status to active
@@ -3157,6 +3207,12 @@ async def store_mark_ready(handle: str, request: Request):
     errs = ((update_payload.get("data") or {}).get("metaobjectUpdate") or {}).get("userErrors") or []
     if errs:
         return JSONResponse({"error": "Metaobject update errors", "details": errs}, status_code=500)
+
+    threading.Thread(
+        target=_send_new_store_email,
+        args=(handle, store_name),
+        daemon=True,
+    ).start()
 
     return {"status": "ok", "handle": handle, "is_fully_ready": True}
 
