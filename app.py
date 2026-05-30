@@ -2326,8 +2326,8 @@ async def admin_store_add_member(handle: str, request: Request):
     Body JSON: {"email": "user@example.com"}
     Returns: {"ok": true, "customer_id": "...", "email": "...", "tag_added": "storefront-member--{handle}"}
          or: {"ok": true, "already_member": true}
-         or: {"error": "Customer not found"} with status 404
          or: {"error": "..."} with status 502
+    If the customer does not exist in Shopify, they are created automatically.
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -2365,8 +2365,26 @@ async def admin_store_add_member(handle: str, request: Request):
         """
         data = _shopify_graphql(find_q, {"query": f"email:{email}"})
         edges = (data.get("customers") or {}).get("edges") or []
+
         if not edges:
-            return JSONResponse({"error": "Customer not found"}, status_code=404)
+            # Customer not found — create with member tag
+            print(f"[add-member] Customer not found, creating: {email}", flush=True)
+            create_q = """
+            mutation customerCreate($input: CustomerInput!) {
+              customerCreate(input: $input) {
+                customer { id email tags }
+                userErrors { field message }
+              }
+            }
+            """
+            create_res = _shopify_graphql(create_q, {"input": {"email": email, "tags": [member_tag]}})
+            create_errs = (create_res.get("customerCreate") or {}).get("userErrors") or []
+            if create_errs:
+                raise RuntimeError(f"customerCreate userErrors: {json.dumps(create_errs)}")
+            new_customer = (create_res.get("customerCreate") or {}).get("customer")
+            if not new_customer:
+                raise RuntimeError("customerCreate returned no customer")
+            return {"ok": True, "customer_id": new_customer["id"], "email": new_customer["email"], "tag_added": member_tag}
 
         customer = edges[0]["node"]
         customer_gid = customer["id"]
@@ -2392,6 +2410,354 @@ async def admin_store_add_member(handle: str, request: Request):
             raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
 
         return {"ok": True, "customer_id": customer_gid, "email": customer_email, "tag_added": member_tag}
+
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/admin/store/{handle}/add-admin")
+async def admin_store_add_admin(handle: str, request: Request):
+    """
+    Admin-only. Add a customer as an admin of a store by email.
+    Adds BOTH storefront-admin--{handle} AND storefront-member--{handle} tags.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"email": "user@example.com"}
+    If the customer does not exist, they are created with both tags.
+    Returns: {"ok": true, "email": "...", "tags_added": [...]}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    email = (body.get("email") or "").strip()
+    if not email:
+        return JSONResponse({"error": "email is required"}, status_code=400)
+
+    member_tag = f"storefront-member--{handle}"
+    admin_tag = f"storefront-admin--{handle}"
+    desired_tags = [member_tag, admin_tag]
+
+    try:
+        find_q = """
+        query findCustomerByEmail($query: String!) {
+          customers(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                email
+                tags
+              }
+            }
+          }
+        }
+        """
+        data = _shopify_graphql(find_q, {"query": f"email:{email}"})
+        edges = (data.get("customers") or {}).get("edges") or []
+
+        if not edges:
+            # Customer not found — create with both tags
+            print(f"[add-admin] Customer not found, creating: {email}", flush=True)
+            create_q = """
+            mutation customerCreate($input: CustomerInput!) {
+              customerCreate(input: $input) {
+                customer { id email tags }
+                userErrors { field message }
+              }
+            }
+            """
+            create_res = _shopify_graphql(create_q, {"input": {"email": email, "tags": desired_tags}})
+            create_errs = (create_res.get("customerCreate") or {}).get("userErrors") or []
+            if create_errs:
+                raise RuntimeError(f"customerCreate userErrors: {json.dumps(create_errs)}")
+            new_customer = (create_res.get("customerCreate") or {}).get("customer")
+            if not new_customer:
+                raise RuntimeError("customerCreate returned no customer")
+            return {"ok": True, "email": new_customer["email"], "tags_added": desired_tags}
+
+        customer = edges[0]["node"]
+        customer_gid = customer["id"]
+        customer_email = customer["email"]
+        existing_tags = customer.get("tags") or []
+
+        tags_added = [t for t in desired_tags if t not in existing_tags]
+        if not tags_added:
+            return JSONResponse({"ok": True, "email": customer_email, "tags_added": []})
+
+        new_tags = existing_tags + tags_added
+        update_q = """
+        mutation customerUpdate($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            customer { id tags }
+            userErrors { field message }
+          }
+        }
+        """
+        res = _shopify_graphql(update_q, {"input": {"id": customer_gid, "tags": new_tags}})
+        errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+        return {"ok": True, "email": customer_email, "tags_added": tags_added}
+
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/admin/store/{handle}/remove-member")
+async def admin_store_remove_member(handle: str, request: Request):
+    """
+    Admin-only. Fully remove a customer from a store (removes both member and admin tags).
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"email": "user@example.com"}
+    Returns 404 if customer not found.
+    Returns: {"ok": true, "email": "..."}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    email = (body.get("email") or "").strip()
+    if not email:
+        return JSONResponse({"error": "email is required"}, status_code=400)
+
+    member_tag = f"storefront-member--{handle}"
+    admin_tag = f"storefront-admin--{handle}"
+
+    try:
+        find_q = """
+        query findCustomerByEmail($query: String!) {
+          customers(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                email
+                tags
+              }
+            }
+          }
+        }
+        """
+        data = _shopify_graphql(find_q, {"query": f"email:{email}"})
+        edges = (data.get("customers") or {}).get("edges") or []
+        if not edges:
+            return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+        customer = edges[0]["node"]
+        customer_gid = customer["id"]
+        customer_email = customer["email"]
+        existing_tags = customer.get("tags") or []
+
+        tags_to_remove = {member_tag, admin_tag}
+        new_tags = [t for t in existing_tags if t not in tags_to_remove]
+
+        if len(new_tags) < len(existing_tags):
+            update_q = """
+            mutation customerUpdate($input: CustomerInput!) {
+              customerUpdate(input: $input) {
+                customer { id tags }
+                userErrors { field message }
+              }
+            }
+            """
+            res = _shopify_graphql(update_q, {"input": {"id": customer_gid, "tags": new_tags}})
+            errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+            if errs:
+                raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+        return {"ok": True, "email": customer_email}
+
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/admin/store/{handle}/remove-admin")
+async def admin_store_remove_admin(handle: str, request: Request):
+    """
+    Admin-only. Demote an admin to a regular member (removes admin tag, keeps member tag).
+    Blocked if the customer is the last admin of the store.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"email": "user@example.com"}
+    Returns: {"ok": true, "email": "...", "remaining_admins": N}
+         or: {"error": "Cannot remove the last admin of a store"} with status 400
+         or: {"error": "Customer not found"} with status 404
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    email = (body.get("email") or "").strip()
+    if not email:
+        return JSONResponse({"error": "email is required"}, status_code=400)
+
+    admin_tag = f"storefront-admin--{handle}"
+
+    try:
+        find_q = """
+        query findCustomerByEmail($query: String!) {
+          customers(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                email
+                tags
+              }
+            }
+          }
+        }
+        """
+        data = _shopify_graphql(find_q, {"query": f"email:{email}"})
+        edges = (data.get("customers") or {}).get("edges") or []
+        if not edges:
+            return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+        customer = edges[0]["node"]
+        customer_gid = customer["id"]
+        customer_email = customer["email"]
+        existing_tags = customer.get("tags") or []
+
+        if admin_tag not in existing_tags:
+            # Already not an admin — count remaining admins and return
+            admins_q = """
+            query findAdmins($query: String!) {
+              customers(first: 250, query: $query) {
+                edges { node { id } }
+              }
+            }
+            """
+            admins_data = _shopify_graphql(admins_q, {"query": f"tag:{admin_tag}"})
+            remaining = len((admins_data.get("customers") or {}).get("edges") or [])
+            return JSONResponse({"ok": True, "email": customer_email, "remaining_admins": remaining})
+
+        # Check if there is at least one OTHER admin for this store
+        other_admins_q = """
+        query findOtherAdmins($query: String!) {
+          customers(first: 250, query: $query) {
+            edges {
+              node {
+                id
+                email
+              }
+            }
+          }
+        }
+        """
+        other_data = _shopify_graphql(other_admins_q, {"query": f"tag:{admin_tag}"})
+        all_admin_edges = (other_data.get("customers") or {}).get("edges") or []
+        other_admins = [e for e in all_admin_edges if e["node"]["id"] != customer_gid]
+
+        if not other_admins:
+            return JSONResponse({"error": "Cannot remove the last admin of a store"}, status_code=400)
+
+        # Remove only the admin tag
+        new_tags = [t for t in existing_tags if t != admin_tag]
+        update_q = """
+        mutation customerUpdate($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            customer { id tags }
+            userErrors { field message }
+          }
+        }
+        """
+        res = _shopify_graphql(update_q, {"input": {"id": customer_gid, "tags": new_tags}})
+        errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+        return {"ok": True, "email": customer_email, "remaining_admins": len(other_admins)}
+
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/admin/store/{handle}/members")
+async def admin_store_list_members(handle: str, request: Request):
+    """
+    Admin-only. List all members and admins for a store.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Returns: {"ok": true, "members": [{"email": "...", "is_admin": bool}], "total": N}
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    member_tag = f"storefront-member--{handle}"
+    admin_tag = f"storefront-admin--{handle}"
+
+    try:
+        search_q = """
+        query findCustomersByTag($query: String!) {
+          customers(first: 250, query: $query) {
+            edges {
+              node {
+                id
+                email
+                tags
+              }
+            }
+          }
+        }
+        """
+
+        # Fetch members and admins in parallel via separate queries
+        members_data = _shopify_graphql(search_q, {"query": f"tag:{member_tag}"})
+        admins_data = _shopify_graphql(search_q, {"query": f"tag:{admin_tag}"})
+
+        member_edges = (members_data.get("customers") or {}).get("edges") or []
+        admin_edges = (admins_data.get("customers") or {}).get("edges") or []
+
+        # Build a combined deduplicated map keyed by customer GID
+        customer_map: Dict[str, Dict[str, Any]] = {}
+        for edge in member_edges:
+            node = edge["node"]
+            customer_map[node["id"]] = {"email": node["email"], "is_admin": False}
+        for edge in admin_edges:
+            node = edge["node"]
+            if node["id"] in customer_map:
+                customer_map[node["id"]]["is_admin"] = True
+            else:
+                customer_map[node["id"]] = {"email": node["email"], "is_admin": True}
+
+        members_list = sorted(customer_map.values(), key=lambda x: x["email"])
+        return {"ok": True, "members": members_list, "total": len(members_list)}
 
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=502)
