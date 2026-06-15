@@ -1418,10 +1418,14 @@ async def storefront_leave(handle: str, request: Request):
 @app.post("/api/storefront/{handle}/nuke")
 async def storefront_nuke(handle: str, request: Request):
     """
-    Admin-only store nuke. Runs as a background job.
-    Body JSON: {"customer_id": "<id>"} — customer_id is optional.
-    If customer_id is provided, validates it holds storefront-admin--{handle}.
-    If omitted (e.g. called from the Shopify admin page), proceeds directly.
+    Admin-only store nuke (destructive). Runs as a background job.
+
+    Authorization (required — see the authorization block below):
+      - Send header  X-Admin-Secret: <ADMIN_SECRET>   (super-admin / Admin Powers page), OR
+      - Send body    {"customer_id": "<id>"}  where that customer holds
+        storefront-admin--{handle} or the super-admin tag (store owner / Danger tab).
+      A request with neither is rejected with 401 (no more unauthenticated nukes).
+
     Returns {"job_id": "<uuid>"}; poll GET /api/job/{job_id} for status + log lines.
     """
     body = {}
@@ -1436,9 +1440,20 @@ async def storefront_nuke(handle: str, request: Request):
 
     customer_id = (body.get("customer_id") or "").strip()
 
-    # Only verify the admin tag if a customer_id was supplied.
-    # Admin-page initiated nukes omit customer_id — trust is enforced at the UI layer.
-    if customer_id:
+    # Authorization — closes the previous "no customer_id = no check" bypass that let
+    # an unauthenticated empty-body POST destroy any store. A nuke is now allowed only
+    # if the caller proves admin rights one of two ways:
+    #   1. A valid X-Admin-Secret header  -> super-admin / Admin Powers page
+    #   2. customer_id holding storefront-admin--{handle} OR the super-admin tag
+    #      -> the store's own owner (Danger tab)
+    # Anything else is rejected with 401.
+    #
+    # NOTE: the Shopify Admin Powers nuke button must send X-Admin-Secret for path (1)
+    # to work — deploy the theme change that adds that header BEFORE deploying this.
+    has_admin_secret = _require_admin_secret(request) is None
+
+    authorized = has_admin_secret
+    if not authorized and customer_id:
         customer_gid = _ensure_gid_customer(customer_id)
         admin_tag = f"storefront-admin--{handle}"
 
@@ -1450,11 +1465,14 @@ async def storefront_nuke(handle: str, request: Request):
         if tags is None:
             return JSONResponse({"error": "Customer not found"}, status_code=404)
 
-        if admin_tag not in tags:
-            return JSONResponse(
-                {"error": "Only store admins can nuke a store"},
-                status_code=403,
-            )
+        if admin_tag in tags or "super-admin" in tags:
+            authorized = True
+
+    if not authorized:
+        return JSONResponse(
+            {"error": "Unauthorized: a valid admin secret or a store-admin customer is required to nuke a store"},
+            status_code=401,
+        )
 
     job_id = str(uuid.uuid4())
     _job_set(
