@@ -296,6 +296,7 @@ def _save_png(img: Image.Image, path: Path):
 def _pil_open_safe(data: bytes) -> Image.Image:
     try:
         img = Image.open(BytesIO(data))
+        img.load()  # force full pixel decode — catches truncated images before they reach the build pipeline
         w, h = img.size
         if (w * h) > MAX_IMAGE_PIXELS:
             raise ValueError("too_many_pixels")
