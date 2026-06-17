@@ -1497,14 +1497,26 @@ async def storefront_nuke(handle: str, request: Request):
 # ----------------------------
 # Admin secret + cron secret helpers
 # ----------------------------
-_ADMIN_SECRET = os.getenv("ADMIN_SECRET", "stellasage-god-mode-2026-xK9mP").strip()
+# Fail closed: if ADMIN_SECRET is not explicitly configured, fall back to an
+# unguessable random value (NOT the public editor secret) so the X-Admin-Secret
+# path can never authenticate until the env var is set. Store-admin auth via the
+# customer's storefront-admin--{handle} tag still works independently. This
+# removes the previous footgun where ADMIN_SECRET defaulted to the editor secret,
+# which is published in the storefront page source.
+_ADMIN_SECRET = (os.getenv("ADMIN_SECRET") or "").strip()
+if not _ADMIN_SECRET:
+    print(
+        "⚠️ ADMIN_SECRET not set — admin-secret auth disabled (fail closed). "
+        "Set ADMIN_SECRET to enable the Admin Powers / relay path."
+    )
+    _ADMIN_SECRET = "unset-" + secrets.token_urlsafe(32)
 _CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 
 
 def _require_admin_secret(request: Request) -> Optional[JSONResponse]:
     """Return a 401 JSONResponse if X-Admin-Secret header is missing or wrong."""
     secret = request.headers.get("X-Admin-Secret", "").strip()
-    if secret != _ADMIN_SECRET:
+    if not secrets.compare_digest(secret, _ADMIN_SECRET):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return None
 
