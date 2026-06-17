@@ -1371,7 +1371,16 @@ async def storefront_leave(handle: str, request: Request):
     Body JSON: {"customer_id": "<id>"}
     Returns 403 if the customer is also an admin (must nuke instead).
     Returns 200 {"ok": true} on success.
+
+    Auth: requires X-Admin-Secret. Reached only through the Printful_Automation
+    relay, which verifies the App Proxy signature and injects the VERIFIED
+    logged-in customer id — so the customer_id here is trusted and a caller can
+    only remove themselves, not an arbitrary member by guessing their id.
     """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
     body = {}
     try:
         body = await request.json()
@@ -1420,11 +1429,14 @@ async def storefront_nuke(handle: str, request: Request):
     """
     Admin-only store nuke (destructive). Runs as a background job.
 
-    Authorization (required — see the authorization block below):
-      - Send header  X-Admin-Secret: <ADMIN_SECRET>   (super-admin / Admin Powers page), OR
-      - Send body    {"customer_id": "<id>"}  where that customer holds
-        storefront-admin--{handle} or the super-admin tag (store owner / Danger tab).
-      A request with neither is rejected with 401 (no more unauthenticated nukes).
+    Authorization (required):
+      - Send header  X-Admin-Secret: <ADMIN_SECRET>.
+      A request without it is rejected with 401.
+
+    Legitimate storefront-admin / super-admin nukes arrive through the
+    Printful_Automation App Proxy relay, which verifies the Shopify proxy
+    signature + the customer's admin tag server-side, then forwards here with
+    the private ADMIN_SECRET. The relay is the only authorized initiator.
 
     Returns {"job_id": "<uuid>"}; poll GET /api/job/{job_id} for status + log lines.
     """
@@ -1432,7 +1444,7 @@ async def storefront_nuke(handle: str, request: Request):
     try:
         body = await request.json()
     except Exception:
-        body = {}  # Empty body is fine — admin page sends no body
+        body = {}  # Empty body is fine — the relay sends no body
 
     handle = handle.strip()
     if not handle:
@@ -1440,37 +1452,16 @@ async def storefront_nuke(handle: str, request: Request):
 
     customer_id = (body.get("customer_id") or "").strip()
 
-    # Authorization — closes the previous "no customer_id = no check" bypass that let
-    # an unauthenticated empty-body POST destroy any store. A nuke is now allowed only
-    # if the caller proves admin rights one of two ways:
-    #   1. A valid X-Admin-Secret header  -> super-admin / Admin Powers page
-    #   2. customer_id holding storefront-admin--{handle} OR the super-admin tag
-    #      -> the store's own owner (Danger tab)
-    # Anything else is rejected with 401.
+    # Authorization — require a valid X-Admin-Secret header.
     #
-    # NOTE: the Shopify Admin Powers nuke button must send X-Admin-Secret for path (1)
-    # to work — deploy the theme change that adds that header BEFORE deploying this.
-    has_admin_secret = _require_admin_secret(request) is None
-
-    authorized = has_admin_secret
-    if not authorized and customer_id:
-        customer_gid = _ensure_gid_customer(customer_id)
-        admin_tag = f"storefront-admin--{handle}"
-
-        try:
-            tags = _get_customer_tags(customer_gid)
-        except Exception as e:
-            return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
-
-        if tags is None:
-            return JSONResponse({"error": "Customer not found"}, status_code=404)
-
-        if admin_tag in tags or "super-admin" in tags:
-            authorized = True
-
-    if not authorized:
+    # The previous "customer_id in body holds the admin tag" path was removed: it
+    # trusted an unverified customer_id, so anyone who knew a store-admin's numeric
+    # customer id could nuke that store with a direct call, bypassing the App Proxy
+    # signature. Store-admin nukes now go through the relay (which proves identity
+    # via the proxy signature) and reach here with the private admin secret.
+    if _require_admin_secret(request) is not None:
         return JSONResponse(
-            {"error": "Unauthorized: a valid admin secret or a store-admin customer is required to nuke a store"},
+            {"error": "Unauthorized: a valid admin secret is required to nuke a store"},
             status_code=401,
         )
 
