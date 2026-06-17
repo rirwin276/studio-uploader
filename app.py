@@ -1486,6 +1486,197 @@ async def storefront_nuke(handle: str, request: Request):
 
 
 # ----------------------------
+# Fundraising — metaobject persistence (type: store_fundraising)
+# ----------------------------
+# One singleton metaobject per store, keyed by the store handle. The full
+# wizard/launch state is stored as a single JSON blob in the `data` field. This
+# is deliberately schemaless (like global_pricing's `prices` field) so partial
+# drafts — empty goal, empty end date, Stripe connected but not launched — all
+# round-trip without per-field type validation headaches.
+#
+# Reached only through the Printful_Automation relay, which verifies the App
+# Proxy signature + admin tag and injects X-Admin-Secret. We re-check the secret
+# here so a direct call without it is rejected.
+_FR_METAOBJECT_TYPE = "store_fundraising"
+
+# Fields the client is allowed to set. Anything else in the body is ignored so a
+# caller can't write arbitrary keys into the metaobject.
+_FR_ALLOWED_FIELDS = (
+    "cause_name", "amount", "goal", "end_date", "show_bar",
+    "stripe_account_id", "stripe_connected", "setup_step",
+)
+
+
+def _ensure_fundraising_definition() -> None:
+    """Idempotently create the store_fundraising metaobject definition."""
+    check = """
+    query CheckFundraisingDef($type: String!) {
+      metaobjectDefinitionByType(type: $type) { id }
+    }
+    """
+    data = _shopify_graphql(check, {"type": _FR_METAOBJECT_TYPE})
+    existing = data.get("metaobjectDefinitionByType") or {}
+    if existing.get("id"):
+        return
+
+    create = """
+    mutation CreateFundraisingDef($definition: MetaobjectDefinitionCreateInput!) {
+      metaobjectDefinitionCreate(definition: $definition) {
+        metaobjectDefinition { id }
+        userErrors { field message code }
+      }
+    }
+    """
+    variables = {
+        "definition": {
+            "type": _FR_METAOBJECT_TYPE,
+            "name": "Store Fundraising",
+            # Storefront PUBLIC_READ so the public progress bar can read it later
+            # via Liquid / the Storefront API without going through the relay.
+            "access": {"storefront": "PUBLIC_READ"},
+            "fieldDefinitions": [
+                {"key": "data", "name": "Data", "type": "json", "required": False},
+            ],
+        }
+    }
+    res = _shopify_graphql(create, variables)
+    errs = ((res.get("metaobjectDefinitionCreate") or {}).get("userErrors")) or []
+    if errs:
+        raise RuntimeError(f"metaobjectDefinitionCreate userErrors: {json.dumps(errs)}")
+
+
+def _fr_get_state(handle: str) -> Dict[str, Any]:
+    """Return the stored fundraising state dict for a store, or {} if none."""
+    q = """
+    query GetFundraising($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        fields { key value }
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"handle": {"type": _FR_METAOBJECT_TYPE, "handle": handle}})
+    node = data.get("metaobjectByHandle")
+    if not node:
+        return {}
+    fields = {f["key"]: f["value"] for f in (node.get("fields") or [])}
+    raw = fields.get("data")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fr_set_state(handle: str, state: Dict[str, Any]) -> None:
+    """Upsert the fundraising metaobject for a store with the given state dict."""
+    m = """
+    mutation UpsertFundraising($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
+      metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
+        metaobject { id handle }
+        userErrors { field message code }
+      }
+    }
+    """
+    variables = {
+        "handle": {"type": _FR_METAOBJECT_TYPE, "handle": handle},
+        "metaobject": {"fields": [{"key": "data", "value": json.dumps(state)}]},
+    }
+    res = _shopify_graphql(m, variables)
+    errs = ((res.get("metaobjectUpsert") or {}).get("userErrors")) or []
+    if errs:
+        raise RuntimeError(f"metaobjectUpsert userErrors: {json.dumps(errs)}")
+
+
+@app.get("/api/fundraising/{handle}")
+async def fundraising_get(handle: str, request: Request):
+    """Load a store's fundraising state. Requires X-Admin-Secret (via relay)."""
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = (handle or "").strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        _ensure_fundraising_definition()
+        state = _fr_get_state(handle)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to load fundraising state: {e}"}, status_code=502)
+
+    if not state:
+        # A store that has never set up fundraising.
+        return JSONResponse({"ok": True, "enabled": False})
+
+    state["ok"] = True
+    return JSONResponse(state)
+
+
+@app.post("/api/fundraising/{handle}")
+async def fundraising_post(handle: str, request: Request):
+    """
+    Save / launch / stop a store's fundraiser. Requires X-Admin-Secret (via relay).
+
+    Body is merged onto the stored state (so a partial draft save doesn't wipe
+    fields). `enabled` drives launch (true) vs stop (false). Whitelisted fields
+    only — see _FR_ALLOWED_FIELDS.
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = (handle or "").strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+
+    try:
+        _ensure_fundraising_definition()
+        current = _fr_get_state(handle)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read current state: {e}"}, status_code=502)
+
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    state = dict(current)
+    for k in _FR_ALLOWED_FIELDS:
+        if k in body:
+            state[k] = body[k]
+
+    enabled = bool(body.get("enabled"))
+    state["enabled"] = enabled
+    # total_raised is owned by the order webhook (phase 2); never clobber it here.
+    state["total_raised"] = current.get("total_raised", 0)
+    if enabled and not current.get("created_at"):
+        state["created_at"] = now_iso
+    state["updated_at"] = now_iso
+
+    # NOTE: product repricing and Stripe transfers are intentionally NOT done
+    # here yet — this endpoint persists state to the metaobject so the wizard,
+    # resume, launch and stop flows are authoritative server-side. Reprice-on-
+    # launch / revert-on-stop and Stripe Connect land in phase 2.
+
+    try:
+        _fr_set_state(handle, state)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to save fundraising state: {e}"}, status_code=502)
+
+    out = dict(state)
+    out["ok"] = True
+    return JSONResponse(out)
+
+
+# ----------------------------
 # Admin secret + cron secret helpers
 # ----------------------------
 # Fail closed: if ADMIN_SECRET is not explicitly configured, fall back to an
