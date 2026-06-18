@@ -1661,6 +1661,15 @@ async def fundraising_post(handle: str, request: Request):
         state["created_at"] = now_iso
     state["updated_at"] = now_iso
 
+    # Determine whether pricing will actually need to change so we can set the
+    # right initial pricing_status before the background thread runs.
+    desired_add = (int(state.get("amount") or 0) + 1) if enabled else 0
+    applied_add = int(current.get("markup_add") or 0)
+    pricing_will_run = desired_add != applied_add
+    state["pricing_status"] = "pending" if pricing_will_run else "skipped"
+    state["pricing_error"] = ""
+    state["pricing_updated_at"] = now_iso
+
     try:
         _fr_set_state(handle, state)
     except Exception as e:
@@ -1669,7 +1678,8 @@ async def fundraising_post(handle: str, request: Request):
     # Reprice products to match the new state (raise on launch, restore on stop).
     # Runs in the background so the launch/stop response stays fast; the metaobject
     # already reflects the committed state above. Idempotent (see _fr_sync_pricing).
-    threading.Thread(target=_fr_sync_pricing, args=(handle,), daemon=True).start()
+    if pricing_will_run:
+        threading.Thread(target=_fr_sync_pricing, args=(handle,), daemon=True).start()
 
     out = dict(state)
     out["ok"] = True
@@ -2001,20 +2011,24 @@ def _fr_list_variants(handle: str) -> list:
 def _fr_restore_prices(state: Dict[str, Any]) -> None:
     """Restore every variant to its snapshotted base price (mutates state)."""
     base = state.get("base_prices") or {}
+    errors = []
     for vgid, price in base.items():
         try:
             _variant_set_price(vgid, str(price))
         except Exception as e:
-            print(f"[fundraising] restore price failed for {vgid}: {e}")
+            errors.append(f"{vgid}: {e}")
         time.sleep(0.3)
     state["base_prices"] = {}
     state["markup_add"] = 0
+    if errors:
+        raise RuntimeError("; ".join(errors[:10]))
 
 
 def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
     """Snapshot base prices then raise every variant by `add` (mutates state)."""
     variants = _fr_list_variants(handle)
     base = {}
+    errors = []
     for v in variants:
         gid = v["gid"]
         try:
@@ -2025,10 +2039,12 @@ def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
         try:
             _variant_set_price(gid, f"{orig + add:.2f}")
         except Exception as e:
-            print(f"[fundraising] markup price failed for {gid}: {e}")
+            errors.append(f"{gid}: {e}")
         time.sleep(0.3)
     state["base_prices"] = base
     state["markup_add"] = add
+    if errors:
+        raise RuntimeError("; ".join(errors[:10]))
 
 
 def _fr_sync_pricing(handle: str) -> None:
@@ -2036,22 +2052,39 @@ def _fr_sync_pricing(handle: str) -> None:
     Bring a store's product prices in line with current fundraiser state.
     Idempotent: compares desired markup (amount+1 when enabled, else 0) against
     the markup already applied. Runs in a background thread off launch/stop.
+    Updates pricing_status/pricing_error in the metaobject when done.
     """
+    from datetime import datetime, timezone
+    def _save_pricing_status(state: Dict[str, Any], status: str, error: str = "") -> None:
+        state["pricing_status"] = status
+        state["pricing_error"] = error
+        state["pricing_updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            _fr_set_state(handle, state)
+        except Exception as ex:
+            print(f"[fundraising] failed to persist pricing_status for {handle}: {ex}")
+
     try:
         state = _fr_get_state(handle)
         enabled = bool(state.get("enabled"))
         desired_add = (int(state.get("amount") or 0) + 1) if enabled else 0
         applied_add = int(state.get("markup_add") or 0)
         if desired_add == applied_add:
+            _save_pricing_status(state, "skipped")
             return
         if applied_add > 0:
             _fr_restore_prices(state)        # back to base first
         if desired_add > 0:
             _fr_apply_markup(handle, desired_add, state)
-        _fr_set_state(handle, state)
+        _save_pricing_status(state, "succeeded")
         print(f"[fundraising] reprice synced for {handle}: add={desired_add}")
     except Exception as e:
         print(f"[fundraising] reprice sync failed for {handle}: {e}")
+        try:
+            state = _fr_get_state(handle)
+            _save_pricing_status(state, "failed", str(e)[:500])
+        except Exception as ex:
+            print(f"[fundraising] could not persist pricing failure for {handle}: {ex}")
 
 
 # ----------------------------
