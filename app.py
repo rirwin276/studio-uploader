@@ -1661,19 +1661,503 @@ async def fundraising_post(handle: str, request: Request):
         state["created_at"] = now_iso
     state["updated_at"] = now_iso
 
-    # NOTE: product repricing and Stripe transfers are intentionally NOT done
-    # here yet — this endpoint persists state to the metaobject so the wizard,
-    # resume, launch and stop flows are authoritative server-side. Reprice-on-
-    # launch / revert-on-stop and Stripe Connect land in phase 2.
-
     try:
         _fr_set_state(handle, state)
     except Exception as e:
         return JSONResponse({"error": f"Failed to save fundraising state: {e}"}, status_code=502)
 
+    # Reprice products to match the new state (raise on launch, restore on stop).
+    # Runs in the background so the launch/stop response stays fast; the metaobject
+    # already reflects the committed state above. Idempotent (see _fr_sync_pricing).
+    threading.Thread(target=_fr_sync_pricing, args=(handle,), daemon=True).start()
+
     out = dict(state)
     out["ok"] = True
     return JSONResponse(out)
+
+
+# ----------------------------
+# Fundraising — Stripe Connect (Express) onboarding + payouts
+# ----------------------------
+# The platform (Stella & Sage) collects on every sale via Shopify Payments, then
+# routes each cause's accumulated share to a connected Express account with a
+# Stripe Transfer. Recipients onboard their own bank through Stripe-hosted
+# onboarding — we never see their banking details.
+#
+# STRIPE_SECRET_KEY (sk_test_… / sk_live_…) lives ONLY on this service.
+_STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+# Days a contribution is held before it's eligible for payout.
+_FR_HOLD_DAYS = int(os.getenv("FUNDRAISING_HOLD_DAYS", "7"))
+
+
+def _stripe():
+    """Return the configured stripe module, or raise if not set up."""
+    if not _STRIPE_KEY:
+        raise RuntimeError("STRIPE_SECRET_KEY is not configured on this service")
+    import stripe  # lazy import so the app boots even before the dep is installed
+    stripe.api_key = _STRIPE_KEY
+    return stripe
+
+
+@app.post("/api/fundraising/{handle}/stripe/connect")
+async def fundraising_stripe_connect(handle: str, request: Request):
+    """
+    Create (or reuse) the recipient's Stripe Express account and return a hosted
+    onboarding URL. Body may include {"return_url": "...", "refresh_url": "..."}.
+    Requires X-Admin-Secret (via relay).
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = (handle or "").strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return_url = (body.get("return_url") or "").strip()
+    refresh_url = (body.get("refresh_url") or return_url).strip()
+    if not return_url:
+        return JSONResponse({"error": "return_url is required"}, status_code=400)
+
+    try:
+        stripe = _stripe()
+        _ensure_fundraising_definition()
+        state = _fr_get_state(handle)
+
+        acct_id = state.get("stripe_account_id")
+        if not acct_id:
+            acct = stripe.Account.create(
+                type="express",
+                capabilities={"transfers": {"requested": True}},
+                business_profile={"name": state.get("cause_name") or handle},
+                metadata={"store_handle": handle},
+            )
+            acct_id = acct.id
+            state["stripe_account_id"] = acct_id
+            state["stripe_connected"] = False
+            _fr_set_state(handle, state)
+
+        link = stripe.AccountLink.create(
+            account=acct_id,
+            refresh_url=refresh_url,
+            return_url=return_url,
+            type="account_onboarding",
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"Stripe connect failed: {e}"}, status_code=502)
+
+    return JSONResponse({"ok": True, "url": link.url, "account_id": acct_id})
+
+
+@app.get("/api/fundraising/{handle}/stripe/status")
+async def fundraising_stripe_status(handle: str, request: Request):
+    """
+    Re-check the connected account and persist stripe_connected. 'connected' means
+    the account can receive payouts (details submitted + payouts enabled).
+    Requires X-Admin-Secret (via relay).
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = (handle or "").strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    try:
+        _ensure_fundraising_definition()
+        state = _fr_get_state(handle)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to read state: {e}"}, status_code=502)
+
+    acct_id = state.get("stripe_account_id")
+    if not acct_id:
+        return JSONResponse({"ok": True, "connected": False})
+
+    try:
+        stripe = _stripe()
+        acct = stripe.Account.retrieve(acct_id)
+        connected = bool(getattr(acct, "details_submitted", False) and getattr(acct, "payouts_enabled", False))
+        if connected != bool(state.get("stripe_connected")):
+            state["stripe_connected"] = connected
+            _fr_set_state(handle, state)
+    except Exception as e:
+        return JSONResponse({"error": f"Stripe status failed: {e}"}, status_code=502)
+
+    return JSONResponse({
+        "ok": True,
+        "connected": connected,
+        "account_id": acct_id,
+        "details_submitted": bool(getattr(acct, "details_submitted", False)),
+        "payouts_enabled": bool(getattr(acct, "payouts_enabled", False)),
+    })
+
+
+@app.post("/api/fundraising/payouts/run")
+async def fundraising_payouts_run(request: Request):
+    """
+    Weekly batched payout job (cron-triggered; requires X-Cron-Secret).
+
+    For every store fundraiser, sum unpaid ledger contributions whose 7-day hold
+    has elapsed and issue ONE Stripe Transfer per connected account (never per
+    order). Marks those ledger rows paid and bumps total_paid_out.
+
+    The ledger lives in the metaobject `data.ledger` array, appended by the
+    order-paid webhook. Pass {"handle": "..."} to run a single store, or omit to
+    run all stores that have a fundraiser metaobject.
+    """
+    denied = _require_cron_secret(request)
+    if denied is not None:
+        return denied
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    handles = []
+    one = (body.get("handle") or "").strip()
+    if one:
+        handles = [one]
+    else:
+        try:
+            handles = _fr_all_handles()
+        except Exception as e:
+            return JSONResponse({"error": f"Failed to enumerate fundraisers: {e}"}, status_code=502)
+
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=_FR_HOLD_DAYS)
+
+    results = []
+    for h in handles:
+        try:
+            state = _fr_get_state(h)
+            acct_id = state.get("stripe_account_id")
+            if not acct_id or not state.get("stripe_connected"):
+                results.append({"handle": h, "skipped": "no connected stripe account"})
+                continue
+
+            ledger = state.get("ledger") or []
+            due_cents = 0
+            due_idx = []
+            for i, row in enumerate(ledger):
+                if row.get("paid"):
+                    continue
+                created = row.get("created_at") or ""
+                try:
+                    when = datetime.fromisoformat(created)
+                except Exception:
+                    continue
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                if when <= cutoff:
+                    due_cents += int(round(float(row.get("amount", 0)) * 100))
+                    due_idx.append(i)
+
+            if due_cents <= 0:
+                results.append({"handle": h, "transferred": 0})
+                continue
+
+            stripe = _stripe()
+            transfer = stripe.Transfer.create(
+                amount=due_cents,
+                currency="usd",
+                destination=acct_id,
+                metadata={"store_handle": h, "rows": str(len(due_idx))},
+            )
+            for i in due_idx:
+                ledger[i]["paid"] = True
+                ledger[i]["transfer_id"] = transfer.id
+            state["ledger"] = ledger
+            state["total_paid_out"] = float(state.get("total_paid_out", 0)) + (due_cents / 100.0)
+            _fr_set_state(h, state)
+            results.append({"handle": h, "transferred": due_cents / 100.0, "transfer_id": transfer.id})
+        except Exception as e:
+            results.append({"handle": h, "error": str(e)})
+
+    return JSONResponse({"ok": True, "results": results})
+
+
+def _fr_all_handles() -> list:
+    """Return all store handles that have a store_fundraising metaobject."""
+    q = """
+    query AllFundraisers($type: String!, $cursor: String) {
+      metaobjects(type: $type, first: 100, after: $cursor) {
+        edges { node { handle } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    handles = []
+    cursor = None
+    while True:
+        data = _shopify_graphql(q, {"type": _FR_METAOBJECT_TYPE, "cursor": cursor})
+        mo = data.get("metaobjects") or {}
+        for edge in (mo.get("edges") or []):
+            h = (edge.get("node") or {}).get("handle")
+            if h:
+                handles.append(h)
+        page = mo.get("pageInfo") or {}
+        if page.get("hasNextPage") and page.get("endCursor"):
+            cursor = page["endCursor"]
+        else:
+            break
+    return handles
+
+
+# ----------------------------
+# Fundraising — product repricing (launch raises prices, stop restores them)
+# ----------------------------
+# A store's products are scoped by the bare tag == handle (same filter the
+# storefront product list and sleep mode use). On launch we snapshot each
+# active variant's price into the metaobject's `base_prices` map, then raise it
+# by (amount + $1 fee). On stop we restore from the snapshot exactly. The whole
+# thing is idempotent and keyed on `markup_add` so editing the amount re-syncs.
+
+def _shopify_rest_put(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not _SHOPIFY_SHOP or not _SHOPIFY_ACCESS_TOKEN:
+        raise RuntimeError("Shopify Admin API credentials not configured (SHOP / CLIENT_SECRET)")
+    url = f"https://{_SHOPIFY_SHOP}/admin/api/{_SHOPIFY_API_VERSION}/{path.lstrip('/')}"
+    headers = {"Content-Type": "application/json", "X-Shopify-Access-Token": _SHOPIFY_ACCESS_TOKEN}
+    for attempt in range(5):
+        r = requests.put(url, headers=headers, json=payload, timeout=30)
+        if r.status_code == 429:  # rate limited — back off and retry
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"Shopify REST PUT rate-limited after retries: {path}")
+
+
+def _variant_set_price(variant_gid: str, price: str) -> None:
+    vid = str(variant_gid).split("/")[-1]
+    _shopify_rest_put(f"variants/{vid}.json", {"variant": {"id": int(vid), "price": str(price)}})
+
+
+def _fr_list_variants(handle: str) -> list:
+    """All active variants for a store: [{'gid':..., 'price':'20.00'}]."""
+    q = """
+    query StoreVariants($query: String!, $cursor: String) {
+      products(first: 50, query: $query, after: $cursor) {
+        edges { node { id variants(first: 100) { edges { node { id price } } } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    out = []
+    cursor = None
+    while True:
+        data = _shopify_graphql(q, {"query": f"tag:{handle} status:active", "cursor": cursor})
+        prods = data.get("products") or {}
+        for edge in (prods.get("edges") or []):
+            node = edge.get("node") or {}
+            for ve in ((node.get("variants") or {}).get("edges") or []):
+                vn = ve.get("node") or {}
+                if vn.get("id") and vn.get("price") is not None:
+                    out.append({"gid": vn["id"], "price": str(vn["price"])})
+        page = prods.get("pageInfo") or {}
+        if page.get("hasNextPage") and page.get("endCursor"):
+            cursor = page["endCursor"]
+        else:
+            break
+    return out
+
+
+def _fr_restore_prices(state: Dict[str, Any]) -> None:
+    """Restore every variant to its snapshotted base price (mutates state)."""
+    base = state.get("base_prices") or {}
+    for vgid, price in base.items():
+        try:
+            _variant_set_price(vgid, str(price))
+        except Exception as e:
+            print(f"[fundraising] restore price failed for {vgid}: {e}")
+        time.sleep(0.3)
+    state["base_prices"] = {}
+    state["markup_add"] = 0
+
+
+def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
+    """Snapshot base prices then raise every variant by `add` (mutates state)."""
+    variants = _fr_list_variants(handle)
+    base = {}
+    for v in variants:
+        gid = v["gid"]
+        try:
+            orig = float(v["price"])
+        except Exception:
+            continue
+        base[gid] = f"{orig:.2f}"
+        try:
+            _variant_set_price(gid, f"{orig + add:.2f}")
+        except Exception as e:
+            print(f"[fundraising] markup price failed for {gid}: {e}")
+        time.sleep(0.3)
+    state["base_prices"] = base
+    state["markup_add"] = add
+
+
+def _fr_sync_pricing(handle: str) -> None:
+    """
+    Bring a store's product prices in line with current fundraiser state.
+    Idempotent: compares desired markup (amount+1 when enabled, else 0) against
+    the markup already applied. Runs in a background thread off launch/stop.
+    """
+    try:
+        state = _fr_get_state(handle)
+        enabled = bool(state.get("enabled"))
+        desired_add = (int(state.get("amount") or 0) + 1) if enabled else 0
+        applied_add = int(state.get("markup_add") or 0)
+        if desired_add == applied_add:
+            return
+        if applied_add > 0:
+            _fr_restore_prices(state)        # back to base first
+        if desired_add > 0:
+            _fr_apply_markup(handle, desired_add, state)
+        _fr_set_state(handle, state)
+        print(f"[fundraising] reprice synced for {handle}: add={desired_add}")
+    except Exception as e:
+        print(f"[fundraising] reprice sync failed for {handle}: {e}")
+
+
+# ----------------------------
+# Fundraising — order-paid webhook (grows total_raised + escrow ledger)
+# ----------------------------
+_SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "").strip()
+
+
+def _verify_shopify_webhook(raw: bytes, header_hmac: str) -> bool:
+    if not _SHOPIFY_WEBHOOK_SECRET:
+        return False
+    import hmac as _hmac, hashlib, base64
+    digest = _hmac.new(_SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()
+    computed = base64.b64encode(digest).decode("utf-8")
+    return _hmac.compare_digest(computed, header_hmac or "")
+
+
+def _product_tags(product_id) -> list:
+    pid = str(product_id)
+    gid = pid if pid.startswith("gid://") else f"gid://shopify/Product/{pid}"
+    q = "query($id: ID!) { product(id: $id) { tags } }"
+    try:
+        data = _shopify_graphql(q, {"id": gid})
+    except Exception:
+        return []
+    return (data.get("product") or {}).get("tags") or []
+
+
+def _fr_send_goal_email(handle: str, state: Dict[str, Any]) -> None:
+    """Notify the admin when a fundraiser hits its goal. Never raises."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print(f"[email] SMTP not configured — skipping goal-met email for {handle}")
+        return
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        cause = state.get("cause_name") or handle
+        raised = float(state.get("total_raised", 0))
+        goal = float(state.get("goal", 0))
+        subject = f"🎉 Goal met: {cause} raised ${raised:.0f}"
+        body = (
+            f"The fundraiser for {cause} ({handle}) just hit its goal.\n\n"
+            f"Raised: ${raised:.2f}\n"
+            f"Goal:   ${goal:.2f}\n\n"
+            f"You can close it or set a new goal from Admin Powers.\n\n"
+            f"This is an automated notification from Studio Uploader."
+        )
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIFY_EMAIL
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, [NOTIFY_EMAIL], msg.as_string())
+    except Exception as e:
+        print(f"[email] goal-met email failed for {handle}: {e}")
+
+
+@app.post("/webhooks/fundraising/order-paid")
+async def fundraising_order_paid(request: Request):
+    """
+    Shopify orders/paid webhook. Verifies HMAC (SHOPIFY_WEBHOOK_SECRET), then for
+    each line item whose product carries a fundraiser-active store tag, adds
+    amount × qty to that store's total_raised and appends an escrow ledger row.
+    Idempotent per order id.
+    """
+    raw = await request.body()
+    if not _verify_shopify_webhook(raw, request.headers.get("X-Shopify-Hmac-Sha256", "")):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    try:
+        order = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+
+    order_id = str(order.get("id") or "")
+    prod_qty: Dict[str, int] = {}
+    for li in (order.get("line_items") or []):
+        pid = li.get("product_id")
+        if pid is None:
+            continue
+        prod_qty[str(pid)] = prod_qty.get(str(pid), 0) + int(li.get("quantity") or 0)
+    if not prod_qty:
+        return JSONResponse({"ok": True, "skipped": "no products"})
+
+    # Which fundraiser-active store(s) do this order's products belong to?
+    handle_qty: Dict[str, int] = {}
+    for pid, qty in prod_qty.items():
+        for tag in _product_tags(pid):
+            st = _fr_get_state(tag)
+            if st.get("enabled"):
+                handle_qty[tag] = handle_qty.get(tag, 0) + qty
+
+    if not handle_qty:
+        return JSONResponse({"ok": True, "updated": []})
+
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = []
+    for handle, qty in handle_qty.items():
+        try:
+            state = _fr_get_state(handle)
+            if not state.get("enabled"):
+                continue
+            ledger = state.get("ledger") or []
+            if order_id and any(r.get("order_id") == order_id for r in ledger):
+                continue  # already counted this order
+            amount = int(state.get("amount") or 0)
+            contribution = amount * qty
+            if contribution <= 0:
+                continue
+            ledger.append({
+                "order_id": order_id, "amount": contribution, "qty": qty,
+                "created_at": now_iso, "paid": False,
+            })
+            state["ledger"] = ledger
+            state["total_raised"] = float(state.get("total_raised", 0)) + contribution
+
+            goal = float(state.get("goal") or 0)
+            hit_goal = goal > 0 and state["total_raised"] >= goal and not state.get("goal_met_notified")
+            if hit_goal:
+                state["goal_met_notified"] = True
+
+            _fr_set_state(handle, state)
+            if hit_goal:
+                _fr_send_goal_email(handle, state)
+            updated.append(handle)
+        except Exception as e:
+            print(f"[fundraising] order-paid update failed for {handle}: {e}")
+
+    return JSONResponse({"ok": True, "updated": updated})
 
 
 # ----------------------------
