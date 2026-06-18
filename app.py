@@ -1904,6 +1904,25 @@ async def fundraising_payouts_run(request: Request):
                 continue
 
             stripe = _stripe()
+
+            # Guard: Stripe Transfers require available balance in the platform
+            # account. Storefront payments go through Shopify Payments, so the
+            # platform Stripe balance may not be funded. Skip rather than fail
+            # with a Stripe error and leave ledger rows unpaid.
+            balance = stripe.Balance.retrieve()
+            available_usd = next(
+                (b["amount"] for b in (balance.get("available") or []) if b.get("currency") == "usd"),
+                0,
+            )
+            if available_usd < due_cents:
+                results.append({
+                    "handle": h,
+                    "skipped": "insufficient_stripe_balance",
+                    "due_cents": due_cents,
+                    "available_cents": available_usd,
+                })
+                continue
+
             transfer = stripe.Transfer.create(
                 amount=due_cents,
                 currency="usd",
