@@ -1631,7 +1631,8 @@ async def fundraising_get(handle: str, request: Request):
         _ensure_fundraising_definition()
         state = _fr_get_state(handle)
     except Exception as e:
-        return JSONResponse({"error": f"Failed to load fundraising state: {e}"}, status_code=502)
+        print(f"[fundraising/get] state load error for {handle}: {e}")
+        return JSONResponse({"ok": False, "error": f"Failed to load fundraising state: {e}"})
 
     if not state:
         return JSONResponse({"ok": True, "enabled": False})
@@ -1698,7 +1699,8 @@ async def fundraising_post(handle: str, request: Request):
     try:
         _fr_set_state(handle, state)
     except Exception as e:
-        return JSONResponse({"error": f"Failed to save fundraising state: {e}"}, status_code=502)
+        print(f"[fundraising/post] state save error for {handle}: {e}")
+        return JSONResponse({"ok": False, "error": f"Failed to save fundraising state: {e}"})
 
     # Reprice products to match the new state (raise on launch, restore on stop).
     # Runs in the background so the launch/stop response stays fast; the metaobject
@@ -1812,7 +1814,12 @@ async def fundraising_stripe_connect(handle: str, request: Request):
             type="account_onboarding",
         )
     except Exception as e:
-        return JSONResponse({"error": f"Stripe connect failed: {e}"}, status_code=502)
+        # Log the full error so it appears in Railway logs — the App Proxy
+        # swallows non-200 response bodies before they reach the browser.
+        print(f"[stripe/connect] error for {handle}: {type(e).__name__}: {e}")
+        # Return 200 so the App Proxy forwards the JSON body to the browser.
+        # The frontend checks j.ok rather than HTTP status.
+        return JSONResponse({"ok": False, "error": f"Stripe connect failed: {e}"})
 
     return JSONResponse({"ok": True, "url": link.url, "account_id": acct_id})
 
@@ -1850,7 +1857,8 @@ async def fundraising_stripe_status(handle: str, request: Request):
             state["stripe_connected"] = connected
             _fr_set_state(handle, state)
     except Exception as e:
-        return JSONResponse({"error": f"Stripe status failed: {e}"}, status_code=502)
+        print(f"[stripe/status] error for {handle}: {type(e).__name__}: {e}")
+        return JSONResponse({"ok": False, "connected": False, "error": f"Stripe status failed: {e}"})
 
     return JSONResponse({
         "ok": True,
@@ -1892,7 +1900,8 @@ async def fundraising_payouts_run(request: Request):
         try:
             handles = _fr_all_handles()
         except Exception as e:
-            return JSONResponse({"error": f"Failed to enumerate fundraisers: {e}"}, status_code=502)
+            print(f"[payouts/run] failed to enumerate fundraisers: {e}")
+            return JSONResponse({"ok": False, "error": f"Failed to enumerate fundraisers: {e}"})
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=_FR_HOLD_DAYS)
