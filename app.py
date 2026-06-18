@@ -8,6 +8,7 @@ import time
 import secrets
 import threading
 import subprocess
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -1499,12 +1500,37 @@ async def storefront_nuke(handle: str, request: Request):
 # here so a direct call without it is rejected.
 _FR_METAOBJECT_TYPE = "store_fundraising"
 
+# Platform fee added on top of the fundraising amount on launch.
+# Defined once here so both the POST handler and _fr_sync_pricing stay in sync.
+_FR_PLATFORM_FEE = 1
+
 # Fields the client is allowed to set. Anything else in the body is ignored so a
 # caller can't write arbitrary keys into the metaobject.
 _FR_ALLOWED_FIELDS = (
     "cause_name", "amount", "goal", "end_date", "show_bar",
     "stripe_account_id", "stripe_connected", "setup_step",
 )
+
+# Fields returned to the browser by fundraising_get(). Internal tracking data
+# (base_prices, ledger, markup_add, total_paid_out) is never sent to the client.
+_FR_PUBLIC_FIELDS = frozenset({
+    "ok", "enabled", "cause_name", "amount", "goal", "end_date", "show_bar",
+    "total_raised", "stripe_account_id", "stripe_connected", "setup_step",
+    "pricing_status", "pricing_error", "pricing_updated_at",
+    "created_at", "updated_at",
+})
+
+
+def _fr_desired_markup(state: Dict[str, Any]) -> int:
+    """Dollar markup that should be applied given the current fundraiser state."""
+    if not bool(state.get("enabled")):
+        return 0
+    return int(state.get("amount") or 0) + _FR_PLATFORM_FEE
+
+
+def _fr_applied_markup(state: Dict[str, Any]) -> int:
+    """Dollar markup currently recorded as applied in the state."""
+    return int(state.get("markup_add") or 0)
 
 
 def _ensure_fundraising_definition() -> None:
@@ -1608,11 +1634,11 @@ async def fundraising_get(handle: str, request: Request):
         return JSONResponse({"error": f"Failed to load fundraising state: {e}"}, status_code=502)
 
     if not state:
-        # A store that has never set up fundraising.
         return JSONResponse({"ok": True, "enabled": False})
 
-    state["ok"] = True
-    return JSONResponse(state)
+    out = {k: v for k, v in state.items() if k in _FR_PUBLIC_FIELDS}
+    out["ok"] = True
+    return JSONResponse(out)
 
 
 @app.post("/api/fundraising/{handle}")
@@ -1645,7 +1671,6 @@ async def fundraising_post(handle: str, request: Request):
     except Exception as e:
         return JSONResponse({"error": f"Failed to read current state: {e}"}, status_code=502)
 
-    from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
 
     state = dict(current)
@@ -1663,8 +1688,8 @@ async def fundraising_post(handle: str, request: Request):
 
     # Determine whether pricing will actually need to change so we can set the
     # right initial pricing_status before the background thread runs.
-    desired_add = (int(state.get("amount") or 0) + 1) if enabled else 0
-    applied_add = int(current.get("markup_add") or 0)
+    desired_add = _fr_desired_markup(state)
+    applied_add = _fr_applied_markup(current)
     pricing_will_run = desired_add != applied_add
     state["pricing_status"] = "pending" if pricing_will_run else "skipped"
     state["pricing_error"] = ""
@@ -1681,7 +1706,7 @@ async def fundraising_post(handle: str, request: Request):
     if pricing_will_run:
         threading.Thread(target=_fr_sync_pricing, args=(handle,), daemon=True).start()
 
-    out = dict(state)
+    out = {k: v for k, v in state.items() if k in _FR_PUBLIC_FIELDS}
     out["ok"] = True
     return JSONResponse(out)
 
@@ -1869,7 +1894,6 @@ async def fundraising_payouts_run(request: Request):
         except Exception as e:
             return JSONResponse({"error": f"Failed to enumerate fundraisers: {e}"}, status_code=502)
 
-    from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=_FR_HOLD_DAYS)
 
@@ -2028,7 +2052,11 @@ def _fr_list_variants(handle: str) -> list:
 
 
 def _fr_restore_prices(state: Dict[str, Any]) -> None:
-    """Restore every variant to its snapshotted base price (mutates state)."""
+    """
+    Restore every variant to its snapshotted base price (mutates state).
+    Only clears base_prices/markup_add after ALL restores succeed so the
+    snapshot is preserved for retry if any individual restore fails.
+    """
     base = state.get("base_prices") or {}
     errors = []
     for vgid, price in base.items():
@@ -2037,31 +2065,43 @@ def _fr_restore_prices(state: Dict[str, Any]) -> None:
         except Exception as e:
             errors.append(f"{vgid}: {e}")
         time.sleep(0.3)
-    state["base_prices"] = {}
-    state["markup_add"] = 0
     if errors:
         raise RuntimeError("; ".join(errors[:10]))
+    # Only clear after full success — partial failure leaves snapshot intact for retry.
+    state["base_prices"] = {}
+    state["markup_add"] = 0
 
 
 def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
-    """Snapshot base prices then raise every variant by `add` (mutates state)."""
+    """
+    Snapshot all base prices, persist them to the metaobject, then raise
+    every variant price by `add` (mutates state).
+
+    The snapshot is persisted BEFORE any Shopify price writes so that a
+    mid-loop failure still leaves base_prices in the metaobject, allowing
+    a subsequent Stop to restore prices correctly.
+    """
     variants = _fr_list_variants(handle)
     base = {}
-    errors = []
     for v in variants:
-        gid = v["gid"]
         try:
             orig = float(v["price"])
         except Exception:
             continue
-        base[gid] = f"{orig:.2f}"
+        base[v["gid"]] = f"{orig:.2f}"
+
+    # Persist snapshot before touching any live prices.
+    state["base_prices"] = base
+    state["markup_add"] = add
+    _fr_set_state(handle, state)
+
+    errors = []
+    for gid, orig_str in base.items():
         try:
-            _variant_set_price(gid, f"{orig + add:.2f}")
+            _variant_set_price(gid, f"{float(orig_str) + add:.2f}")
         except Exception as e:
             errors.append(f"{gid}: {e}")
         time.sleep(0.3)
-    state["base_prices"] = base
-    state["markup_add"] = add
     if errors:
         raise RuntimeError("; ".join(errors[:10]))
 
@@ -2069,30 +2109,29 @@ def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
 def _fr_sync_pricing(handle: str) -> None:
     """
     Bring a store's product prices in line with current fundraiser state.
-    Idempotent: compares desired markup (amount+1 when enabled, else 0) against
-    the markup already applied. Runs in a background thread off launch/stop.
-    Updates pricing_status/pricing_error in the metaobject when done.
+    Idempotent: compares desired markup against the markup already applied.
+    Runs in a background thread off launch/stop.
+    Writes pricing_status / pricing_error / pricing_updated_at when done.
     """
-    from datetime import datetime, timezone
-    def _save_pricing_status(state: Dict[str, Any], status: str, error: str = "") -> None:
-        state["pricing_status"] = status
-        state["pricing_error"] = error
-        state["pricing_updated_at"] = datetime.now(timezone.utc).isoformat()
+    def _save_pricing_status(st: Dict[str, Any], status: str, error: str = "") -> None:
+        st["pricing_status"] = status
+        st["pricing_error"] = error
+        st["pricing_updated_at"] = datetime.now(timezone.utc).isoformat()
         try:
-            _fr_set_state(handle, state)
+            _fr_set_state(handle, st)
         except Exception as ex:
             print(f"[fundraising] failed to persist pricing_status for {handle}: {ex}")
 
+    state: Optional[Dict[str, Any]] = None
     try:
         state = _fr_get_state(handle)
-        enabled = bool(state.get("enabled"))
-        desired_add = (int(state.get("amount") or 0) + 1) if enabled else 0
-        applied_add = int(state.get("markup_add") or 0)
+        desired_add = _fr_desired_markup(state)
+        applied_add = _fr_applied_markup(state)
         if desired_add == applied_add:
             _save_pricing_status(state, "skipped")
             return
         if applied_add > 0:
-            _fr_restore_prices(state)        # back to base first
+            _fr_restore_prices(state)
         if desired_add > 0:
             _fr_apply_markup(handle, desired_add, state)
         _save_pricing_status(state, "succeeded")
@@ -2100,7 +2139,11 @@ def _fr_sync_pricing(handle: str) -> None:
     except Exception as e:
         print(f"[fundraising] reprice sync failed for {handle}: {e}")
         try:
-            state = _fr_get_state(handle)
+            # Use the in-memory state if available — it may contain a freshly
+            # computed base_prices snapshot that was not yet persisted. Only
+            # fall back to a fresh metaobject read if state was never fetched.
+            if state is None:
+                state = _fr_get_state(handle)
             _save_pricing_status(state, "failed", str(e)[:500])
         except Exception as ex:
             print(f"[fundraising] could not persist pricing failure for {handle}: {ex}")
@@ -2203,7 +2246,6 @@ async def fundraising_order_paid(request: Request):
     if not handle_qty:
         return JSONResponse({"ok": True, "updated": []})
 
-    from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
     updated = []
     for handle, qty in handle_qty.items():
@@ -2272,7 +2314,7 @@ def _require_cron_secret(request: Request) -> Optional[JSONResponse]:
     secret = request.headers.get("X-Cron-Secret", "").strip()
     if not _CRON_SECRET:
         return JSONResponse({"error": "CRON_SECRET not configured on server"}, status_code=401)
-    if secret != _CRON_SECRET:
+    if not secrets.compare_digest(secret, _CRON_SECRET):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return None
 
