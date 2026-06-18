@@ -1699,6 +1699,34 @@ def _stripe():
     return stripe
 
 
+@app.get("/api/fundraising/{handle}/public")
+async def fundraising_public(handle: str):
+    """
+    Public, unauthenticated read for the storefront progress bar. Returns only
+    display-safe fields, and only when the fundraiser is enabled AND show_bar is
+    on. No secret required — this is the same info shown to shoppers.
+    """
+    handle = (handle or "").strip()
+    if not handle:
+        return JSONResponse({"ok": True, "enabled": False})
+    try:
+        state = _fr_get_state(handle)
+    except Exception:
+        return JSONResponse({"ok": True, "enabled": False})
+
+    if not state.get("enabled") or not state.get("show_bar"):
+        return JSONResponse({"ok": True, "enabled": False})
+
+    return JSONResponse({
+        "ok": True,
+        "enabled": True,
+        "cause_name": state.get("cause_name") or "",
+        "goal": float(state.get("goal") or 0),
+        "total_raised": float(state.get("total_raised") or 0),
+        "end_date": state.get("end_date") or "",
+    })
+
+
 @app.post("/api/fundraising/{handle}/stripe/connect")
 async def fundraising_stripe_connect(handle: str, request: Request):
     """
