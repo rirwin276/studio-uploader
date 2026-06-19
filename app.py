@@ -2065,9 +2065,14 @@ def _fr_summarize_rows(state: Dict[str, Any], as_of_friday: Any) -> Dict[str, An
 @app.get("/api/fundraising/{handle}/public")
 async def fundraising_public(handle: str):
     """
-    Public, unauthenticated read for the storefront progress bar. Returns only
-    display-safe fields, and only when the fundraiser is enabled AND show_bar is
-    on. No secret required — this is the same info shown to shoppers.
+    Public, unauthenticated read for the storefront progress bar and the
+    seller dashboard "Active Fundraiser" badge. No secret required — this is the
+    same info shoppers can already infer from prices.
+
+    When a fundraiser is enabled we always report enabled:true plus the show_bar
+    flag (shoppers always see that a fundraiser is "Active"). The cause name,
+    amounts, goal, and end date are only included when the seller chose to show
+    the progress bar publicly — otherwise those stay private.
     """
     handle = (handle or "").strip()
     if not handle:
@@ -2077,17 +2082,17 @@ async def fundraising_public(handle: str):
     except Exception:
         return JSONResponse({"ok": True, "enabled": False})
 
-    if not state.get("enabled") or not state.get("show_bar"):
+    if not state.get("enabled"):
         return JSONResponse({"ok": True, "enabled": False})
 
-    return JSONResponse({
-        "ok": True,
-        "enabled": True,
-        "cause_name": state.get("cause_name") or "",
-        "goal": float(state.get("goal") or 0),
-        "total_raised": float(state.get("total_raised") or 0),
-        "end_date": state.get("end_date") or "",
-    })
+    show_bar = bool(state.get("show_bar"))
+    out = {"ok": True, "enabled": True, "show_bar": show_bar}
+    if show_bar:
+        out["cause_name"] = state.get("cause_name") or ""
+        out["goal"] = float(state.get("goal") or 0)
+        out["total_raised"] = float(state.get("total_raised") or 0)
+        out["end_date"] = state.get("end_date") or ""
+    return JSONResponse(out)
 
 
 @app.post("/api/fundraising/{handle}/stripe/connect")
