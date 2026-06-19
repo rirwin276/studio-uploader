@@ -184,6 +184,100 @@ This closes the previous bug where an empty `order_id` bypassed the deduplicatio
 
 ---
 
-## Payout cron
+## Payout summary dashboard
 
-The payout cron (`POST /api/fundraising/payouts/run`, requires `X-Cron-Secret`) is **OFF**. No transfer logic was changed in this PR. The cron is a separate follow-up.
+### `GET /api/fundraising/payouts/summary`
+
+Read-only endpoint for the platform founder. Returns the upcoming Friday payout date, per-store eligibility breakdown, current Stripe balance, and how much needs to be loaded by Thursday.
+
+**Auth:** `X-Admin-Secret` must pass AND the caller must be a super-admin (`X-SS-Superadmin: 1` or `X-SS-Customer-Id` in `FUNDRAISING_SUPERADMIN_CUSTOMER_IDS`). Returns 403 otherwise.
+
+**This endpoint never moves money.** The only Stripe call it makes is `stripe.Balance.retrieve()`.
+
+#### Friday/Thursday business model
+
+Payouts settle weekly on **Friday**. The platform founder funds the Stripe platform balance on **Thursday** so transfers clear by Friday. The dashboard answers, any day of the week:
+
+- What is the **next Friday** (upcoming payout date)?
+- For each store: how much is **eligible to be paid this coming Friday** (unpaid rows whose 7-day hold will have cleared by that Friday), how much is **still on hold**, and the store's total unpaid amount.
+- Platform-wide **total to pay this Friday**, **current Stripe available balance**, and **shortfall to load** = max(0, total_eligible_by_friday − stripe_available).
+
+A row is counted as "eligible by Friday" when `created_at <= (next_friday − FUNDRAISING_HOLD_DAYS)`. If today is Friday, today is used as the payout date.
+
+If `stripe.Balance.retrieve()` fails, `stripe_available` is `null` and `stripe_error` is set, but the per-store breakdown is still returned (the dashboard does not 500 because Stripe is unavailable).
+
+#### Response shape
+
+```json
+{
+  "ok": true,
+  "next_payday": "2026-06-26",
+  "stripe_available": 0.00,
+  "stripe_error": null,
+  "totals": {
+    "total_eligible_by_friday": 0.00,
+    "total_eligible_including_unconnected": 0.00,
+    "total_on_hold": 0.00,
+    "load_needed": 0.00
+  },
+  "stores": [
+    {
+      "handle": "...",
+      "cause_name": "...",
+      "stripe_connected": true,
+      "stripe_account_id": "acct_...",
+      "eligible_by_friday": 0.00,
+      "on_hold": 0.00,
+      "total_unpaid": 0.00,
+      "eligible_row_count": 0
+    }
+  ]
+}
+```
+
+`total_eligible_by_friday` sums only `stripe_connected` stores (only connected accounts can receive transfers). `total_eligible_including_unconnected` shows money owed to stores not yet onboarded. `load_needed` is `null` when `stripe_available` is null.
+
+---
+
+## Payout cron safety (payout_batches state field)
+
+The payout cron (`POST /api/fundraising/payouts/run`, requires `X-Cron-Secret`) is **OFF**. The cron will not run automatically and no transfers are triggered by this PR.
+
+The function has been hardened with two money-safety improvements:
+
+### 1. Stripe idempotency key
+
+`stripe.Transfer.create` now receives an `idempotency_key` derived from `(handle, next_friday_iso, sorted_order_ids_hash)`:
+
+```
+fr-payout:{handle}:{friday_iso}:{md5_of_sorted_order_ids[:12]}
+```
+
+Re-running the cron on the same Friday for the same handle with the same eligible rows will produce the same key. Stripe's idempotency guarantee prevents a second transfer from being created.
+
+### 2. Durable payout batch marker (`payout_batches`)
+
+Before creating a transfer, the cron writes a `"pending"` record to `state["payout_batches"]` and persists it. If the server crashes after the transfer is created but before the ledger rows are marked paid, a retry will find the pending marker, re-issue the transfer call with the same idempotency key (Stripe returns the original transfer), and complete the mark-as-paid step.
+
+`payout_batches` is a server-managed array of records:
+
+| Field | Type | Description |
+|---|---|---|
+| `batch_id` | str | Stable idempotency key (see format above) |
+| `handle` | str | Store handle |
+| `friday` | str | ISO date of the payout Friday |
+| `order_ids` | list[str] | Sorted eligible order ids |
+| `amount` | float | USD amount transferred |
+| `status` | str | `"pending"` or `"paid"` |
+| `transfer_id` | str | Stripe transfer id (set when status → `"paid"`) |
+| `created_at` | str | ISO timestamp of when the batch was written |
+
+A handle with a `"paid"` batch record for the current Friday is skipped entirely — no Stripe call, no duplicate mark.
+
+Skipped handles (insufficient balance) never receive a pending marker, so there are no dangling pending records.
+
+### State field reference update
+
+| Field | Type | Writable by | Notes |
+|---|---|---|---|
+| `payout_batches` | list | **server only** | Written by `fundraising_payouts_run`; tracks pending/paid transfer batches for double-pay prevention |

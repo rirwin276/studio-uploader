@@ -2002,6 +2002,66 @@ def _stripe():
     return stripe
 
 
+def _fr_next_friday(today: Optional[Any] = None) -> Any:
+    """Return the date of the upcoming Friday (UTC).
+
+    If today is already Friday, today is returned (same-day payout date).
+    Pass a datetime.date for testing; defaults to today in UTC.
+    """
+    from datetime import date as _date
+    d = today if today is not None else datetime.now(timezone.utc).date()
+    # weekday(): Monday=0 … Friday=4 … Sunday=6
+    days_ahead = (4 - d.weekday()) % 7
+    return d + timedelta(days=days_ahead)
+
+
+def _fr_summarize_rows(state: Dict[str, Any], as_of_friday: Any) -> Dict[str, Any]:
+    """Compute per-store payout eligibility relative to the given Friday date.
+
+    A ledger row is "eligible by Friday" when its 7-day hold has elapsed by
+    that Friday, i.e.  created_at <= (as_of_friday - HOLD_DAYS).
+    Rows already marked paid are excluded.
+
+    Returns a dict with keys:
+        eligible_by_friday  (float USD)
+        on_hold             (float USD)
+        total_unpaid        (float USD)
+        eligible_row_count  (int)
+    """
+    cutoff = datetime(
+        as_of_friday.year, as_of_friday.month, as_of_friday.day,
+        tzinfo=timezone.utc,
+    ) - timedelta(days=_FR_HOLD_DAYS)
+
+    eligible_cents = 0
+    on_hold_cents = 0
+    eligible_row_count = 0
+
+    for row in (state.get("ledger") or []):
+        if row.get("paid"):
+            continue
+        created = row.get("created_at") or ""
+        try:
+            when = datetime.fromisoformat(created)
+        except Exception:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        cents = int(round(float(row.get("amount", 0)) * 100))
+        if when <= cutoff:
+            eligible_cents += cents
+            eligible_row_count += 1
+        else:
+            on_hold_cents += cents
+
+    return {
+        "eligible_by_friday": round(eligible_cents / 100.0, 2),
+        "on_hold": round(on_hold_cents / 100.0, 2),
+        "total_unpaid": round((eligible_cents + on_hold_cents) / 100.0, 2),
+        "eligible_row_count": eligible_row_count,
+    }
+
+
 @app.get("/api/fundraising/{handle}/public")
 async def fundraising_public(handle: str):
     """
@@ -2186,6 +2246,10 @@ async def fundraising_payouts_run(request: Request):
             return JSONResponse({"ok": False, "error": f"Failed to enumerate fundraisers: {e}"})
 
     now = datetime.now(timezone.utc)
+    friday = _fr_next_friday()
+    friday_iso = friday.isoformat()
+    # Real-time cutoff for the payout run (now, not Friday) — rows must have
+    # cleared the hold by the time we actually run the job.
     cutoff = now - timedelta(days=_FR_HOLD_DAYS)
 
     results = []
@@ -2236,25 +2300,165 @@ async def fundraising_payouts_run(request: Request):
                     "due_cents": due_cents,
                     "available_cents": available_usd,
                 })
+                # Do NOT write a pending marker for a skipped handle.
                 continue
+
+            # --- Money-safety: idempotency key + durable batch marker ---
+            #
+            # Derive a stable batch id from (handle, friday, eligible order ids).
+            # The same eligible set on the same Friday always produces the same key,
+            # so re-running the cron on the same Friday cannot double-pay.
+            import hashlib as _hashlib
+            sorted_order_ids = sorted(str(ledger[i].get("order_id", i)) for i in due_idx)
+            ids_hash = _hashlib.md5("|".join(sorted_order_ids).encode()).hexdigest()[:12]
+            batch_id = f"fr-payout:{h}:{friday_iso}:{ids_hash}"
+
+            # Check for an existing batch record for this key.
+            batches: list = state.get("payout_batches") or []
+            existing_batch = next((b for b in batches if b.get("batch_id") == batch_id), None)
+            if existing_batch and existing_batch.get("status") == "paid":
+                # Already paid on a previous run — skip without creating a transfer.
+                results.append({"handle": h, "skipped": "already_paid_this_batch", "batch_id": batch_id})
+                continue
+
+            if not existing_batch:
+                # Write a "pending" marker BEFORE creating the transfer so a
+                # crash after transfer creation but before the second persist
+                # does NOT cause a duplicate transfer on retry (the idempotency
+                # key is the backstop; the marker tells us a transfer attempt
+                # was made).
+                batch_record: Dict[str, Any] = {
+                    "batch_id": batch_id,
+                    "handle": h,
+                    "friday": friday_iso,
+                    "order_ids": sorted_order_ids,
+                    "amount": round(due_cents / 100.0, 2),
+                    "status": "pending",
+                    "created_at": now.isoformat(),
+                }
+                batches.append(batch_record)
+                state["payout_batches"] = batches
+                _fr_set_state(h, state)  # persist pending marker first
+            else:
+                # Existing pending marker — a previous run created a transfer but
+                # the second persist may have failed.  Re-use the same record;
+                # the idempotency key below will return the original transfer.
+                batch_record = existing_batch
 
             transfer = stripe.Transfer.create(
                 amount=due_cents,
                 currency="usd",
                 destination=acct_id,
-                metadata={"store_handle": h, "rows": str(len(due_idx))},
+                metadata={"store_handle": h, "rows": str(len(due_idx)), "batch_id": batch_id},
+                idempotency_key=batch_id,
             )
+
+            # Mark rows paid and update the batch record atomically in one persist.
+            batch_record["status"] = "paid"
+            batch_record["transfer_id"] = transfer.id
             for i in due_idx:
                 ledger[i]["paid"] = True
                 ledger[i]["transfer_id"] = transfer.id
             state["ledger"] = ledger
             state["total_paid_out"] = float(state.get("total_paid_out", 0)) + (due_cents / 100.0)
             _fr_set_state(h, state)
-            results.append({"handle": h, "transferred": due_cents / 100.0, "transfer_id": transfer.id})
+            results.append({"handle": h, "transferred": round(due_cents / 100.0, 2), "transfer_id": transfer.id})
         except Exception as e:
             results.append({"handle": h, "error": str(e)})
 
     return JSONResponse({"ok": True, "results": results})
+
+
+@app.get("/api/fundraising/payouts/summary")
+async def fundraising_payouts_summary(request: Request):
+    """
+    Read-only super-admin payout dashboard.
+
+    Returns per-store eligibility breakdown relative to the upcoming Friday
+    payout date, plus the platform Stripe balance and how much needs to be
+    loaded by Thursday.
+
+    Auth: X-Admin-Secret must pass AND the caller must be a super-admin
+    (X-SS-Superadmin: 1  OR  X-SS-Customer-Id in FUNDRAISING_SUPERADMIN_CUSTOMER_IDS).
+
+    This endpoint NEVER moves money.  The only Stripe call is Balance.retrieve().
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+    if not _fr_caller_is_superadmin(request):
+        return JSONResponse({"ok": False, "error": "Super-admin access required"}, status_code=403)
+
+    friday = _fr_next_friday()
+    friday_iso = friday.isoformat()
+
+    # Enumerate all fundraiser stores.
+    try:
+        handles = _fr_all_handles()
+    except Exception as e:
+        print(f"[payouts/summary] failed to enumerate fundraisers: {e}")
+        return JSONResponse({"ok": False, "error": "Failed to enumerate fundraisers"}, status_code=500)
+
+    stores = []
+    for h in handles:
+        try:
+            state = _fr_get_state(h)
+        except Exception:
+            state = {}
+        summary = _fr_summarize_rows(state, friday)
+        stores.append({
+            "handle": h,
+            "cause_name": state.get("cause_name") or "",
+            "stripe_connected": bool(state.get("stripe_connected")),
+            "stripe_account_id": state.get("stripe_account_id") or "",
+            "eligible_by_friday": summary["eligible_by_friday"],
+            "on_hold": summary["on_hold"],
+            "total_unpaid": summary["total_unpaid"],
+            "eligible_row_count": summary["eligible_row_count"],
+        })
+
+    # Read platform Stripe balance (best-effort — don't 500 if Stripe is down).
+    stripe_available = None
+    stripe_error = None
+    try:
+        stripe_mod = _stripe()
+        balance = stripe_mod.Balance.retrieve()
+        stripe_available = round(
+            sum(
+                b["amount"] for b in (balance.get("available") or [])
+                if b.get("currency") == "usd"
+            ) / 100.0,
+            2,
+        )
+    except Exception as e:
+        print(f"[payouts/summary] stripe balance error: {e}")
+        stripe_error = "Stripe balance unavailable"
+
+    # Totals — only stripe_connected stores count toward what can actually be paid.
+    total_eligible_connected = round(
+        sum(s["eligible_by_friday"] for s in stores if s["stripe_connected"]), 2
+    )
+    total_eligible_all = round(sum(s["eligible_by_friday"] for s in stores), 2)
+    total_on_hold = round(sum(s["on_hold"] for s in stores), 2)
+    load_needed = (
+        round(max(0.0, total_eligible_connected - stripe_available), 2)
+        if stripe_available is not None
+        else None
+    )
+
+    return JSONResponse({
+        "ok": True,
+        "next_payday": friday_iso,
+        "stripe_available": stripe_available,
+        "stripe_error": stripe_error,
+        "totals": {
+            "total_eligible_by_friday": total_eligible_connected,
+            "total_eligible_including_unconnected": total_eligible_all,
+            "total_on_hold": total_on_hold,
+            "load_needed": load_needed,
+        },
+        "stores": stores,
+    })
 
 
 def _fr_all_handles() -> list:
