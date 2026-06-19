@@ -1308,6 +1308,29 @@ def admin_job_status(job_id: str):
 def _run_shopify_deprovision_job(job_id: str, handle: str):
     _job_set(job_id, status="running", started_at=time.time())
 
+    # Defense-in-depth: re-check for an active fundraiser before shelling out.
+    # This guards against a race where the route check passed but the fundraiser
+    # was launched in the tiny window before the background thread ran, and also
+    # ensures a direct call (not through the route) cannot bypass the guard.
+    try:
+        fr_check = _fr_get_state(handle)
+        if fr_check.get("enabled"):
+            print(
+                f"🛑 [deprovision] Aborting job {job_id} for {handle!r}: "
+                f"fundraiser is still active. Stop it before nuking."
+            )
+            _job_set(
+                job_id,
+                status="error",
+                finished_at=time.time(),
+                error="Active fundraiser detected — nuke aborted. Stop the fundraiser first.",
+            )
+            return
+    except Exception as e:
+        # If the check itself fails, log and continue rather than silently abort
+        # a legitimate nuke (the route guard already ran).
+        print(f"[deprovision] fundraiser pre-check warning for {handle}: {e}")
+
     if not DEPROVISION_SCRIPT.exists():
         _job_set(job_id, status="error", error=f"Deprovision script not found: {DEPROVISION_SCRIPT}")
         return
@@ -1439,6 +1462,16 @@ async def storefront_nuke(handle: str, request: Request):
     signature + the customer's admin tag server-side, then forwards here with
     the private ADMIN_SECRET. The relay is the only authorized initiator.
 
+    Fundraiser guard:
+      - Returns 409 if the store has an active fundraiser (enabled=true).
+        The fundraiser must be stopped before nuking.
+      - Returns 409 if the store has unpaid ledger rows.
+        Payouts must be settled before nuking.
+      - Super-admin force override: send {"force": true} in the body AND the
+        request must carry a super-admin signal (X-SS-Superadmin: 1 or a
+        matching id in FUNDRAISING_SUPERADMIN_CUSTOMER_IDS). Force nukes are
+        logged loudly so they are always auditable.
+
     Returns {"job_id": "<uuid>"}; poll GET /api/job/{job_id} for status + log lines.
     """
     body = {}
@@ -1465,6 +1498,40 @@ async def storefront_nuke(handle: str, request: Request):
             {"error": "Unauthorized: a valid admin secret is required to nuke a store"},
             status_code=401,
         )
+
+    # ── Fundraiser guard ─────────────────────────────────────────────────────
+    # Do NOT deprovision a store that has an active fundraiser or unpaid ledger
+    # rows — money could still be owed.  A super-admin can force-override with
+    # {"force": true} in the body; this is logged loudly for auditability.
+    force = bool(body.get("force"))
+    try:
+        fr_state = _fr_get_state(handle)
+    except Exception as e:
+        print(f"[nuke] could not load fundraiser state for {handle}: {e}")
+        fr_state = {}
+
+    if fr_state.get("enabled"):
+        if force and _fr_caller_is_superadmin(request):
+            print(
+                f"⚠️ [nuke] SUPER-ADMIN FORCE NUKE for {handle!r} — "
+                f"fundraiser is ACTIVE (force=True). Proceeding."
+            )
+        else:
+            return JSONResponse(
+                {"error": "This store has an active fundraiser. Stop the fundraiser before deleting the store."},
+                status_code=409,
+            )
+    elif any(not r.get("paid") for r in (fr_state.get("ledger") or [])):
+        if force and _fr_caller_is_superadmin(request):
+            print(
+                f"⚠️ [nuke] SUPER-ADMIN FORCE NUKE for {handle!r} — "
+                f"store has UNPAID ledger rows (force=True). Proceeding."
+            )
+        else:
+            return JSONResponse(
+                {"error": "This store has unpaid fundraiser payouts in the ledger. Settle payouts before deleting the store."},
+                status_code=409,
+            )
 
     job_id = str(uuid.uuid4())
     _job_set(
@@ -1508,8 +1575,11 @@ _FR_PLATFORM_FEE = 1
 # caller can't write arbitrary keys into the metaobject.
 _FR_ALLOWED_FIELDS = (
     "cause_name", "amount", "goal", "end_date", "show_bar",
-    "stripe_account_id", "stripe_connected", "setup_step",
+    "setup_step",
 )
+# stripe_account_id and stripe_connected are intentionally excluded — they are
+# server-managed truth written ONLY by fundraising_stripe_connect /
+# fundraising_stripe_status. A browser POST body cannot overwrite them.
 
 # Fields returned to the browser by fundraising_get(). Internal tracking data
 # (base_prices, ledger, markup_add, total_paid_out) is never sent to the client.
@@ -1518,7 +1588,137 @@ _FR_PUBLIC_FIELDS = frozenset({
     "total_raised", "stripe_account_id", "stripe_connected", "setup_step",
     "pricing_status", "pricing_error", "pricing_updated_at",
     "created_at", "updated_at",
+    "owner_customer_id", "owner_email",
 })
+
+# ----------------------------
+# Fundraising — owner / super-admin enforcement
+# ----------------------------
+# Comma-separated list of numeric Shopify customer IDs that are always allowed
+# to manage any fundraiser (the platform founder / support team).
+# Example: FUNDRAISING_SUPERADMIN_CUSTOMER_IDS=12345,67890
+_FR_SUPERADMIN_IDS: frozenset = frozenset(
+    cid.strip()
+    for cid in os.getenv("FUNDRAISING_SUPERADMIN_CUSTOMER_IDS", "").split(",")
+    if cid.strip()
+)
+
+
+def _fr_normalize_customer_id(raw: str) -> str:
+    """Return the bare numeric id from a gid:// or plain numeric string."""
+    raw = (raw or "").strip()
+    if raw.startswith("gid://"):
+        return raw.split("/")[-1]
+    return raw.split("/")[-1]
+
+
+def _fr_caller_is_superadmin(request: Request) -> bool:
+    """
+    Returns True when the caller is a super-admin.
+
+    Super-admin signals (checked in order):
+    1. X-SS-Customer-Id header matches a numeric id in FUNDRAISING_SUPERADMIN_CUSTOMER_IDS.
+    2. X-SS-Superadmin header is the literal string "1" (relay may set this for
+       the platform founder — the relay must be behind _require_admin_secret).
+
+    Both headers are ONLY honored when the request also passed _require_admin_secret,
+    i.e. the call came through the authenticated relay.  Do not call this helper
+    before that check.
+    """
+    caller_id = _fr_normalize_customer_id(request.headers.get("X-SS-Customer-Id", ""))
+    if caller_id and caller_id in _FR_SUPERADMIN_IDS:
+        return True
+    if request.headers.get("X-SS-Superadmin", "").strip() == "1":
+        return True
+    return False
+
+
+def _fr_require_owner(handle: str, request: Request, state: Dict[str, Any]) -> Optional[JSONResponse]:
+    """
+    Ownership gate for fundraiser mutations.
+
+    Contract
+    --------
+    - Call ONLY after _require_admin_secret has already passed (so the relay
+      has verified the App Proxy signature and the request is trusted).
+    - Returns None when the caller is allowed to mutate; returns a 403
+      JSONResponse otherwise.
+
+    Allowed when ANY of:
+    a) There is no owner yet (first launch — let through so owner can be stamped).
+    b) Caller's X-SS-Customer-Id matches the stored owner_customer_id.
+    c) Caller is a super-admin (FUNDRAISING_SUPERADMIN_CUSTOMER_IDS env var or
+       X-SS-Superadmin: 1 header set by the relay for the platform founder).
+
+    If an owner IS set and neither (b) nor (c) applies, deny with 403 and a
+    message that names the rule clearly.  This ensures non-owner co-admins
+    cannot mutate an owned fundraiser, but the platform founder can always
+    intervene via the super-admin override.
+    """
+    owner_id = _fr_normalize_customer_id(state.get("owner_customer_id") or "")
+    if not owner_id:
+        # No owner yet — allow (owner will be stamped on launch by the caller).
+        return None
+
+    # Super-admin bypass.
+    if _fr_caller_is_superadmin(request):
+        return None
+
+    # Owner match.
+    caller_id = _fr_normalize_customer_id(request.headers.get("X-SS-Customer-Id", ""))
+    if caller_id and caller_id == owner_id:
+        return None
+
+    return JSONResponse(
+        {"ok": False, "error": "Only the fundraiser organizer can change this."},
+        status_code=403,
+    )
+
+
+def _fr_get_owner_from_custom_shop(handle: str) -> str:
+    """
+    Fallback: read owner_customer_id from the store's custom_shop metaobject
+    (set during provisioning).  Returns the bare numeric id string, or "".
+    """
+    try:
+        metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+        q = """
+        query GetCustomShop($handle: MetaobjectHandleInput!) {
+          metaobjectByHandle(handle: $handle) {
+            fields { key value }
+          }
+        }
+        """
+        data = _shopify_graphql(q, {"handle": {"type": metaobject_type, "handle": handle}})
+        node = data.get("metaobjectByHandle")
+        if not node:
+            return ""
+        fields = {f["key"]: f["value"] for f in (node.get("fields") or [])}
+        raw = (fields.get("owner_customer_id") or "").strip()
+        return _fr_normalize_customer_id(raw)
+    except Exception as e:
+        print(f"[fundraising] could not read custom_shop owner for {handle}: {e}")
+        return ""
+
+
+def _fr_get_customer_email(customer_id: str) -> str:
+    """
+    Best-effort: return the email for a Shopify customer id.  Returns "" on any
+    error so callers can proceed without the email.
+    """
+    try:
+        gid = _ensure_gid_customer(customer_id)
+        q = """
+        query GetCustomerEmail($id: ID!) {
+          customer(id: $id) { email }
+        }
+        """
+        data = _shopify_graphql(q, {"id": gid})
+        email = ((data.get("customer") or {}).get("email") or "").strip()
+        return email
+    except Exception as e:
+        print(f"[fundraising] could not fetch email for customer {customer_id}: {e}")
+        return ""
 
 
 def _fr_desired_markup(state: Dict[str, Any]) -> int:
@@ -1650,6 +1850,20 @@ async def fundraising_post(handle: str, request: Request):
     Body is merged onto the stored state (so a partial draft save doesn't wipe
     fields). `enabled` drives launch (true) vs stop (false). Whitelisted fields
     only — see _FR_ALLOWED_FIELDS.
+
+    Owner / super-admin enforcement
+    --------------------------------
+    - First launch (no owner yet): anyone with admin secret can launch; the
+      caller's X-SS-Customer-Id is stamped as owner_customer_id.
+    - Once an owner is set: only the owner or a super-admin may mutate the
+      fundraiser (launch again, stop, or edit).
+    - X-SS-Customer-Id is only honored when the request passes _require_admin_secret.
+
+    One-at-a-time rule
+    ------------------
+    A new launch (enabled=true in body) is rejected 409 if a fundraiser is
+    already running (current enabled=true). Editing an already-active fundraiser
+    by the owner is still allowed.
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -1672,6 +1886,41 @@ async def fundraising_post(handle: str, request: Request):
     except Exception as e:
         return JSONResponse({"error": f"Failed to read current state: {e}"}, status_code=502)
 
+    incoming_enabled = bool(body.get("enabled"))
+    currently_enabled = bool(current.get("enabled"))
+
+    # ── One-at-a-time check ──────────────────────────────────────────────────
+    # Reject a NEW launch if a fundraiser is already running.  Editing an
+    # already-active fundraiser (owner or super-admin) is allowed.
+    if incoming_enabled and currently_enabled and not current.get("owner_customer_id"):
+        # No owner yet but already enabled — treat as a re-launch attempt.
+        return JSONResponse(
+            {"ok": False, "error": "A fundraiser is already running for this store. Stop it before starting a new one."},
+            status_code=409,
+        )
+    if incoming_enabled and currently_enabled and current.get("owner_customer_id"):
+        # There is already an active fundraiser with an owner.  Only allowed if
+        # caller is owner/super-admin (editing, not starting a second one).
+        # If the caller is NOT owner/super-admin _fr_require_owner will deny below;
+        # for clarity also return the one-at-a-time error for non-owner callers.
+        caller_id = _fr_normalize_customer_id(request.headers.get("X-SS-Customer-Id", ""))
+        owner_id = _fr_normalize_customer_id(current.get("owner_customer_id") or "")
+        is_owner = caller_id and caller_id == owner_id
+        if not is_owner and not _fr_caller_is_superadmin(request):
+            return JSONResponse(
+                {"ok": False, "error": "A fundraiser is already running for this store. Stop it before starting a new one."},
+                status_code=409,
+            )
+
+    # ── Owner / super-admin enforcement ──────────────────────────────────────
+    # For a stop or an edit of an owned fundraiser the caller must be
+    # owner or super-admin.  The very first launch where no owner exists yet is
+    # exempted (owner will be stamped below).
+    if not (incoming_enabled and not current.get("owner_customer_id")):
+        denied = _fr_require_owner(handle, request, current)
+        if denied is not None:
+            return denied
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     state = dict(current)
@@ -1679,14 +1928,31 @@ async def fundraising_post(handle: str, request: Request):
         if k in body:
             state[k] = body[k]
 
-    enabled = bool(body.get("enabled"))
-    state["enabled"] = enabled
-    # total_raised is owned by the order webhook (phase 2); never clobber it here.
+    state["enabled"] = incoming_enabled
+    # total_raised is owned by the order webhook; never clobber it here.
     state["total_raised"] = current.get("total_raised", 0)
-    if enabled and not current.get("created_at"):
+    if incoming_enabled and not current.get("created_at"):
         state["created_at"] = now_iso
     state["updated_at"] = now_iso
 
+    # ── Owner capture on first launch ────────────────────────────────────────
+    # Stamp owner_customer_id exactly once — on the first launch.
+    # Priority: (1) trusted X-SS-Customer-Id header; (2) custom_shop metaobject.
+    if incoming_enabled and not current.get("owner_customer_id"):
+        header_id = _fr_normalize_customer_id(request.headers.get("X-SS-Customer-Id", ""))
+        if header_id:
+            owner_id = header_id
+        else:
+            owner_id = _fr_get_owner_from_custom_shop(handle)
+
+        if owner_id:
+            state["owner_customer_id"] = owner_id
+            # Best-effort email lookup — do not fail launch if it errors.
+            email = _fr_get_customer_email(owner_id)
+            if email:
+                state["owner_email"] = email
+
+    # ── Pricing ──────────────────────────────────────────────────────────────
     # Determine whether pricing will actually need to change so we can set the
     # right initial pricing_status before the background thread runs.
     desired_add = _fr_desired_markup(state)
@@ -1770,6 +2036,9 @@ async def fundraising_stripe_connect(handle: str, request: Request):
     Create (or reuse) the recipient's Stripe Express account and return a hosted
     onboarding URL. Body may include {"return_url": "...", "refresh_url": "..."}.
     Requires X-Admin-Secret (via relay).
+
+    Owner enforcement: once a fundraiser has an owner, only the owner or a
+    super-admin may trigger Stripe onboarding.
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -1793,6 +2062,11 @@ async def fundraising_stripe_connect(handle: str, request: Request):
         stripe = _stripe()
         _ensure_fundraising_definition()
         state = _fr_get_state(handle)
+
+        # Owner / super-admin enforcement (once owner is set).
+        denied = _fr_require_owner(handle, request, state)
+        if denied is not None:
+            return denied
 
         acct_id = state.get("stripe_account_id")
         if not acct_id:
@@ -1830,6 +2104,9 @@ async def fundraising_stripe_status(handle: str, request: Request):
     Re-check the connected account and persist stripe_connected. 'connected' means
     the account can receive payouts (details submitted + payouts enabled).
     Requires X-Admin-Secret (via relay).
+
+    Owner enforcement: once a fundraiser has an owner, only the owner or a
+    super-admin may poll Stripe status (this triggers a state write).
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -1844,6 +2121,11 @@ async def fundraising_stripe_status(handle: str, request: Request):
         state = _fr_get_state(handle)
     except Exception as e:
         return JSONResponse({"error": f"Failed to read state: {e}"}, status_code=502)
+
+    # Owner / super-admin enforcement (once owner is set).
+    denied = _fr_require_owner(handle, request, state)
+    if denied is not None:
+        return denied
 
     acct_id = state.get("stripe_account_id")
     if not acct_id:
@@ -2224,6 +2506,13 @@ async def fundraising_order_paid(request: Request):
     each line item whose product carries a fundraiser-active store tag, adds
     amount × qty to that store's total_raised and appends an escrow ledger row.
     Idempotent per order id.
+
+    Idempotency key derivation (order_id may be empty on some test payloads):
+    1. Use order["id"] (numeric Shopify order id) when present.
+    2. Fall back to order["admin_graphql_api_id"] (e.g. gid://shopify/Order/N).
+    3. Fall back to order["order_number"] as a string.
+    4. If truly nothing identifying exists, skip appending and log a warning —
+       never blind-append an unidentifiable row.
     """
     raw = await request.body()
     if not _verify_shopify_webhook(raw, request.headers.get("X-Shopify-Hmac-Sha256", "")):
@@ -2234,7 +2523,20 @@ async def fundraising_order_paid(request: Request):
     except Exception:
         return JSONResponse({"error": "bad json"}, status_code=400)
 
-    order_id = str(order.get("id") or "")
+    # Derive a stable idempotency key — never fall through to an empty string.
+    _raw_order_id = str(order.get("id") or "").strip()
+    if not _raw_order_id:
+        _raw_order_id = str(order.get("admin_graphql_api_id") or "").strip()
+    if not _raw_order_id:
+        _raw_order_id = str(order.get("order_number") or "").strip()
+    if not _raw_order_id:
+        print(
+            "[fundraising] order-paid webhook received with no identifiable order id — "
+            "skipping to prevent uncounted duplicate rows."
+        )
+        return JSONResponse({"ok": True, "skipped": "no_order_id"})
+    order_id = _raw_order_id
+
     prod_qty: Dict[str, int] = {}
     for li in (order.get("line_items") or []):
         pid = li.get("product_id")
@@ -2263,7 +2565,7 @@ async def fundraising_order_paid(request: Request):
             if not state.get("enabled"):
                 continue
             ledger = state.get("ledger") or []
-            if order_id and any(r.get("order_id") == order_id for r in ledger):
+            if any(r.get("order_id") == order_id for r in ledger):
                 continue  # already counted this order
             amount = int(state.get("amount") or 0)
             contribution = amount * qty
