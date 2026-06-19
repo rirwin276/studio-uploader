@@ -2086,13 +2086,16 @@ async def fundraising_public(handle: str):
         return JSONResponse({"ok": True, "enabled": False})
 
     show_bar = bool(state.get("show_bar"))
-    out = {"ok": True, "enabled": True, "show_bar": show_bar}
+    # Include the handle so the browser can verify the response matches the
+    # store it requested — guards against CDN caching one store's response
+    # and serving it to a different store's request from the same page URL.
+    out = {"ok": True, "enabled": True, "show_bar": show_bar, "handle": handle}
     if show_bar:
         out["cause_name"] = state.get("cause_name") or ""
         out["goal"] = float(state.get("goal") or 0)
         out["total_raised"] = float(state.get("total_raised") or 0)
         out["end_date"] = state.get("end_date") or ""
-    return JSONResponse(out)
+    return JSONResponse(out, headers={"Cache-Control": "no-store, no-cache"})
 
 
 @app.post("/api/fundraising/{handle}/stripe/connect")
