@@ -4620,6 +4620,144 @@ async def store_mark_ready(handle: str, request: Request):
     return {"status": "ok", "handle": handle, "is_fully_ready": True}
 
 
+# ----------------------------
+# Notice acknowledgement routes
+# ----------------------------
+_NOTICE_ACK_ALLOWED = {"admin-review", "member-store"}
+
+
+@app.post("/store/{handle}/notice-ack")
+async def store_notice_ack(handle: str, request: Request):
+    """Record that a customer has seen a one-time notice for a store.
+
+    Auth: X-Admin-Secret (relay-injected) + X-SS-Customer-Id (relay-verified).
+    The customer_id is NEVER accepted from the request body — only from the
+    trusted relay header so a browser cannot forge another customer's ack.
+
+    Adds exactly one tag of the form:
+        ss-ack-admin-review--<handle>
+        ss-ack-member-store--<handle>
+    All other existing customer tags are preserved.
+    """
+    denied = _require_admin_secret(request)
+    if denied:
+        return denied
+
+    raw_cid = request.headers.get("X-SS-Customer-Id", "").strip()
+    if not raw_cid:
+        return JSONResponse({"error": "X-SS-Customer-Id header required"}, status_code=403)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    notice = (body.get("notice") or "").strip()
+    if notice not in _NOTICE_ACK_ALLOWED:
+        return JSONResponse(
+            {"error": f"notice must be one of: {', '.join(sorted(_NOTICE_ACK_ALLOWED))}"},
+            status_code=400,
+        )
+
+    # Sanitize handle — only lowercase alphanumeric and dashes allowed in ack tags
+    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c == "-")
+    if not clean_handle:
+        return JSONResponse({"error": "invalid handle"}, status_code=400)
+
+    ack_tag = f"ss-ack-{notice}--{clean_handle}"
+    customer_gid = _ensure_gid_customer(raw_cid)
+
+    try:
+        current_tags = _get_customer_tags(customer_gid)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+
+    if current_tags is None:
+        return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+    if ack_tag in current_tags:
+        return JSONResponse({
+            "ok": True,
+            "handle": clean_handle,
+            "notice": notice,
+            "acknowledged": True,
+            "tag_added": False,
+        })
+
+    new_tags = current_tags + [ack_tag]
+    _ack_mutation = """
+    mutation customerUpdate($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id tags }
+        userErrors { field message }
+      }
+    }
+    """
+    try:
+        res = _shopify_graphql(_ack_mutation, {"input": {"id": customer_gid, "tags": new_tags}})
+        errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+        if errs:
+            return JSONResponse({"error": f"Tag update failed: {json.dumps(errs)}"}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to update customer tags: {e}"}, status_code=502)
+
+    return JSONResponse({
+        "ok": True,
+        "handle": clean_handle,
+        "notice": notice,
+        "acknowledged": True,
+        "tag_added": True,
+    })
+
+
+@app.get("/store/{handle}/notice-ack/status")
+async def store_notice_ack_status(
+    handle: str,
+    request: Request,
+    notice: str = Query(""),
+):
+    """Check whether a customer has already acked a notice for a store.
+
+    Auth: same trusted path as POST (X-Admin-Secret + X-SS-Customer-Id).
+    """
+    denied = _require_admin_secret(request)
+    if denied:
+        return denied
+
+    raw_cid = request.headers.get("X-SS-Customer-Id", "").strip()
+    if not raw_cid:
+        return JSONResponse({"error": "X-SS-Customer-Id header required"}, status_code=403)
+
+    notice = notice.strip()
+    if notice not in _NOTICE_ACK_ALLOWED:
+        return JSONResponse(
+            {"error": f"notice must be one of: {', '.join(sorted(_NOTICE_ACK_ALLOWED))}"},
+            status_code=400,
+        )
+
+    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c == "-")
+    if not clean_handle:
+        return JSONResponse({"error": "invalid handle"}, status_code=400)
+
+    ack_tag = f"ss-ack-{notice}--{clean_handle}"
+    customer_gid = _ensure_gid_customer(raw_cid)
+
+    try:
+        current_tags = _get_customer_tags(customer_gid)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+
+    if current_tags is None:
+        return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+    return JSONResponse({
+        "ok": True,
+        "handle": clean_handle,
+        "notice": notice,
+        "acknowledged": ack_tag in current_tags,
+    })
+
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui(
     request: Request,
