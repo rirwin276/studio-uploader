@@ -1,7 +1,9 @@
 # Fundraising Backend — Stella & Sage
 
 > **Branch:** `claude/dazzling-turing-76cjur`  
-> **Payout cron:** OFF — no transfers are triggered automatically. No payout or transfer logic was changed in this document's scope.
+> **Payout cron:** A runner script (`cron_payout_run.py`) and a manual single-store
+> path now exist. The payout endpoint stays idempotent and must be wired to Railway
+> Cron with `CRON_SECRET`. Operational steps: [`fundraising-test-runbook.md`](./fundraising-test-runbook.md).
 
 ---
 

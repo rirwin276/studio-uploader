@@ -206,11 +206,26 @@ def test_summary_200_superadmin_via_header(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _iso(days_ago: float, friday_date: datetime.date) -> str:
-    """ISO timestamp N days before the given Friday (UTC)."""
+    """ISO timestamp N days before the given Friday (UTC).
+
+    Use for SUMMARY-endpoint tests: summary eligibility is measured relative to
+    the upcoming Friday.
+    """
     dt = datetime.datetime(
         friday_date.year, friday_date.month, friday_date.day,
         tzinfo=datetime.timezone.utc,
     ) - datetime.timedelta(days=days_ago)
+    return dt.isoformat()
+
+
+def _iso_now(days_ago: float) -> str:
+    """ISO timestamp N days before NOW (UTC).
+
+    Use for RUN-endpoint tests: the payout run measures the 7-day hold against
+    *now* (not Friday), so eligibility fixtures must be dated relative to now or
+    the test becomes day-of-week dependent.
+    """
+    dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_ago)
     return dt.isoformat()
 
 
@@ -392,7 +407,7 @@ def test_payout_run_sends_idempotency_key(monkeypatch):
         "stripe_account_id": "acct_run1",
         "ledger": [
             {"order_id": "ORD-1", "amount": 10.0, "paid": False,
-             "created_at": _iso(10.0, friday)},
+             "created_at": _iso_now(10.0)},   # 10 days ago → past the 7-day hold
         ],
     }
 
@@ -564,7 +579,7 @@ def test_payout_run_pending_batch_no_double_transfer(monkeypatch):
         "stripe_account_id": "acct_run3",
         "ledger": [
             {"order_id": "ORD-3", "amount": 30.0, "paid": False,
-             "created_at": _iso(10.0, friday)},
+             "created_at": _iso_now(10.0)},   # 10 days ago → past the 7-day hold
         ],
         "payout_batches": [
             {
@@ -668,3 +683,58 @@ def test_next_friday_on_friday_is_same_day():
     friday = dt.date(2026, 6, 19)  # Known Friday
     assert friday.weekday() == 4
     assert studio_app._fr_next_friday(friday) == friday
+
+
+# ---------------------------------------------------------------------------
+# Health / env-readiness endpoint — GET /healthz/fundraising
+# ---------------------------------------------------------------------------
+
+def test_health_401_without_secret(monkeypatch):
+    """No cron/admin secret → 401, fails closed."""
+    client = TestClient(studio_app.app)
+    res = client.get("/healthz/fundraising")
+    assert res.status_code == 401
+
+
+def test_health_200_with_cron_secret_reports_missing(monkeypatch):
+    """
+    With a valid cron secret, returns present/missing per env var and never
+    leaks a value. The fixture does not set SHOPIFY_WEBHOOK_SECRET or
+    STRIPE_SECRET_KEY, so those must report missing and gate ready_for_test.
+    """
+    monkeypatch.delenv("SHOPIFY_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("STRIPE_SECRET_KEY", raising=False)
+    client = TestClient(studio_app.app)
+    res = client.get("/healthz/fundraising", headers={"X-Cron-Secret": CRON_SECRET})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["env"]["ADMIN_SECRET"] == "present"
+    assert body["env"]["CRON_SECRET"] == "present"
+    assert body["env"]["SHOP"] == "present"
+    assert body["env"]["SHOPIFY_WEBHOOK_SECRET"] == "missing"
+    assert body["env"]["STRIPE_SECRET_KEY"] == "missing"
+    assert body["ready_for_test"] is False
+    assert "SHOPIFY_WEBHOOK_SECRET" in body["missing"]
+    # No secret VALUES leaked — only present/missing strings.
+    assert ADMIN_SECRET not in res.text
+    assert CRON_SECRET not in res.text
+
+
+def test_health_200_with_admin_secret(monkeypatch):
+    """Admin secret is also accepted (operator may have either handy)."""
+    client = TestClient(studio_app.app)
+    res = client.get("/healthz/fundraising", headers={"X-Admin-Secret": ADMIN_SECRET})
+    assert res.status_code == 200, res.text
+
+
+def test_health_ready_when_all_present(monkeypatch):
+    """When every required var is set, ready_for_test is True with no missing."""
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET", "whsec_test")
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_123")
+    client = TestClient(studio_app.app)
+    res = client.get("/healthz/fundraising", headers={"X-Cron-Secret": CRON_SECRET})
+    body = res.json()
+    assert body["ready_for_test"] is True, body
+    assert body["missing"] == []
+    assert body["stripe_mode"] == "test"

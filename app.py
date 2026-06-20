@@ -2469,6 +2469,68 @@ async def fundraising_payouts_summary(request: Request):
     })
 
 
+@app.get("/healthz/fundraising")
+async def fundraising_health(request: Request):
+    """
+    Readiness probe for the fundraiser money path on THIS service.
+
+    Path is under /healthz (not /api/fundraising) so the /api/fundraising/{handle}
+    route never shadows it.
+
+    Reports whether each required environment variable is configured WITHOUT
+    ever revealing a value. Run this before a live test to confirm wiring.
+
+    Auth: X-Cron-Secret OR X-Admin-Secret (either accepted). Fails closed —
+    if neither secret is configured/valid, returns 401. No values are leaked.
+    """
+    # Accept either secret so the operator can probe with whichever is handy.
+    cron_hdr = request.headers.get("X-Cron-Secret", "").strip()
+    admin_hdr = request.headers.get("X-Admin-Secret", "").strip()
+    cron_ok = bool(_CRON_SECRET) and bool(cron_hdr) and secrets.compare_digest(cron_hdr, _CRON_SECRET)
+    admin_ok = bool(admin_hdr) and secrets.compare_digest(admin_hdr, _ADMIN_SECRET)
+    if not (cron_ok or admin_ok):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    # Required env vars for the fundraiser money path on studio-uploader.
+    # CLIENT_SECRET = Shopify Admin API access token; SHOP = *.myshopify.com domain.
+    required = [
+        "ADMIN_SECRET",
+        "CRON_SECRET",
+        "SHOPIFY_WEBHOOK_SECRET",
+        "STRIPE_SECRET_KEY",
+        "SHOP",
+        "CLIENT_SECRET",
+        "FUNDRAISING_SUPERADMIN_CUSTOMER_IDS",
+    ]
+    env_status: Dict[str, str] = {}
+    missing: list = []
+    for name in required:
+        present = bool((os.getenv(name) or "").strip())
+        env_status[name] = "present" if present else "missing"
+        if not present:
+            missing.append(name)
+
+    stripe_mode = None
+    _sk = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
+    if _sk.startswith("sk_live_"):
+        stripe_mode = "live"
+    elif _sk.startswith("sk_test_"):
+        stripe_mode = "test"
+    elif _sk:
+        stripe_mode = "unknown"
+
+    return JSONResponse({
+        "ok": True,
+        "service": "studio-uploader",
+        "ready_for_test": len(missing) == 0,
+        "env": env_status,
+        "missing": missing,
+        "stripe_mode": stripe_mode,
+        "payout_hold_days": _FR_HOLD_DAYS,
+        "next_payday": _fr_next_friday().isoformat(),
+    })
+
+
 def _fr_all_handles() -> list:
     """Return all store handles that have a store_fundraising metaobject."""
     q = """
