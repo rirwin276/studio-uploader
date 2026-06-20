@@ -4659,8 +4659,12 @@ async def store_notice_ack(handle: str, request: Request):
             status_code=400,
         )
 
-    # Sanitize handle — only lowercase alphanumeric and dashes allowed in ack tags
-    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c == "-")
+    # Sanitize handle — only lowercase alphanumeric, dashes, and underscores
+    # allowed in ack tags. Underscores must be preserved: the storefront theme
+    # decodes %5F -> "_" in store handles, so stripping them here would make the
+    # backend write a tag that never matches the Liquid tag check (popup would
+    # show forever for any store whose handle contains an underscore).
+    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c in "-_")
     if not clean_handle:
         return JSONResponse({"error": "invalid handle"}, status_code=400)
 
@@ -4735,7 +4739,9 @@ async def store_notice_ack_status(
             status_code=400,
         )
 
-    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c == "-")
+    # Same sanitize rule as the POST route — preserve underscores so the tag
+    # matches the storefront theme's Liquid tag check (handles may contain "_").
+    clean_handle = "".join(c for c in handle.lower().strip() if c.isalnum() or c in "-_")
     if not clean_handle:
         return JSONResponse({"error": "invalid handle"}, status_code=400)
 
