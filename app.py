@@ -1733,6 +1733,117 @@ def _fr_applied_markup(state: Dict[str, Any]) -> int:
     return int(state.get("markup_add") or 0)
 
 
+# ----------------------------
+# Fundraising — edit (merge-update) helpers
+# ----------------------------
+# The edit flow changes ONLY goal / end_date / show_bar on an already-active
+# fundraiser. It never touches enabled, amount, cause, owner, Stripe, or raised
+# totals, and it never reprices products. Field-name aliases are normalized here
+# so the backend has one canonical data model regardless of frontend version.
+_FR_EDIT_ALLOWED_FIELDS = ("goal", "end_date", "show_bar")
+
+
+def _fr_is_edit_request(body: Dict[str, Any]) -> bool:
+    """True when the POST body explicitly asks to edit an existing fundraiser
+    (as opposed to launching a new one or stopping one)."""
+    if str(body.get("action") or "").strip().lower() == "update":
+        return True
+    if str(body.get("mode") or "").strip().lower() == "edit":
+        return True
+    for flag in ("edit_existing", "edit_only", "update_existing"):
+        if bool(body.get(flag)):
+            return True
+    return False
+
+
+def _fr_normalize_edit_fields(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the editable fields from a request body, accepting legacy aliases.
+
+    Only keys actually present in the body are returned, so a partial edit never
+    clobbers a field the caller did not send.
+    """
+    out: Dict[str, Any] = {}
+
+    for k in ("goal", "fundraising_goal", "fundraiser_goal", "goal_amount"):
+        if k in body and body[k] is not None:
+            try:
+                out["goal"] = int(float(body[k]))
+            except (TypeError, ValueError):
+                out["goal"] = 0
+            break
+
+    for k in ("end_date", "fundraiser_end_date", "fundraising_end_date", "endDate"):
+        if k in body and body[k] is not None:
+            out["end_date"] = str(body[k]).strip()
+            break
+
+    if "visibility" in body and body["visibility"] is not None:
+        out["show_bar"] = str(body["visibility"]).strip().lower() == "public"
+    else:
+        for k in ("show_bar", "show_progress_bar", "public_progress", "display_progress"):
+            if k in body and body[k] is not None:
+                out["show_bar"] = bool(body[k])
+                break
+
+    return out
+
+
+def _fr_days_left(end_date: str) -> Optional[int]:
+    """Whole days remaining until end_date (YYYY-MM-DD or ISO), or None if unset."""
+    end_date = (end_date or "").strip()
+    if not end_date:
+        return None
+    d = None
+    try:
+        d = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            d = datetime.strptime(end_date[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    delta = d - datetime.now(timezone.utc)
+    days = delta.days
+    if delta.total_seconds() > 0 and days == 0:
+        days = 1  # less than a day left still counts as 1 day
+    return max(0, days)
+
+
+def _fr_log(action: str, handle: str, **fields: Any) -> None:
+    """Structured one-line log for fundraiser actions (visible in Railway logs)."""
+    try:
+        parts = [f"action={action}", f"handle={handle}"]
+        for k, v in fields.items():
+            val = json.dumps(v) if isinstance(v, (dict, list)) else v
+            parts.append(f"{k}={val}")
+        print("[fundraising] " + " ".join(str(p) for p in parts))
+    except Exception:
+        pass
+
+
+def _fr_public_view(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the normalized, client-facing fundraiser object from stored state.
+
+    Guarantees a consistent shape: ok, enabled, active (mirror of enabled),
+    cause_name, amount, goal, end_date, show_bar, total_raised, days_left, plus
+    any other whitelisted public fields (Stripe status, pricing status, etc.).
+    """
+    out = {k: v for k, v in state.items() if k in _FR_PUBLIC_FIELDS}
+    enabled = bool(state.get("enabled"))
+    out["ok"] = True
+    out["enabled"] = enabled
+    out["active"] = enabled
+    out["cause_name"] = state.get("cause_name") or ""
+    out["amount"] = int(state.get("amount") or 0)
+    out["goal"] = float(state.get("goal") or 0)
+    out["end_date"] = state.get("end_date") or ""
+    out["show_bar"] = bool(state.get("show_bar"))
+    out["total_raised"] = float(state.get("total_raised") or 0)
+    out["days_left"] = _fr_days_left(out["end_date"])
+    return out
+
+
 def _ensure_fundraising_definition() -> None:
     """Idempotently create the store_fundraising metaobject definition."""
     check = """
@@ -1835,10 +1946,14 @@ async def fundraising_get(handle: str, request: Request):
         return JSONResponse({"ok": False, "error": f"Failed to load fundraising state: {e}"})
 
     if not state:
-        return JSONResponse({"ok": True, "enabled": False})
+        _fr_log("get", handle, found=False)
+        return JSONResponse({"ok": True, "enabled": False, "active": False})
 
-    out = {k: v for k, v in state.items() if k in _FR_PUBLIC_FIELDS}
-    out["ok"] = True
+    out = _fr_public_view(state)
+    _fr_log(
+        "get", handle, found=True, enabled=out["enabled"], amount=out["amount"],
+        goal=out["goal"], end_date=out["end_date"], show_bar=out["show_bar"],
+    )
     return JSONResponse(out)
 
 
@@ -1884,10 +1999,80 @@ async def fundraising_post(handle: str, request: Request):
         _ensure_fundraising_definition()
         current = _fr_get_state(handle)
     except Exception as e:
+        _fr_log("read:error", handle, error=str(e))
         return JSONResponse({"error": f"Failed to read current state: {e}"}, status_code=502)
+
+    # ── Edit an existing active fundraiser (merge-update) ─────────────────────
+    # An explicit edit/update request changes ONLY goal / end_date / show_bar.
+    # It never disables the fundraiser, never changes amount / cause / owner /
+    # Stripe / raised totals, and never reprices products. This is a true merge,
+    # not a replace — fields the caller omits are preserved from current state.
+    if _fr_is_edit_request(body):
+        edits = _fr_normalize_edit_fields(body)
+        _fr_log("edit:request", handle, payload=edits,
+                currently_enabled=bool(current.get("enabled")))
+
+        # Must have an active fundraiser to edit. If the GET-confirmed record is
+        # missing or already stopped, refuse rather than silently re-creating or
+        # re-enabling — the caller should use the start flow instead.
+        if not current or not bool(current.get("enabled")):
+            _fr_log("edit:reject", handle, reason="no_active_fundraiser")
+            return JSONResponse(
+                {"ok": False, "code": "no_active_fundraiser",
+                 "error": "No active fundraiser to edit. Start one first."},
+                status_code=409,
+            )
+
+        # Owner / super-admin gate (relay already verified the App Proxy sig).
+        denied = _fr_require_owner(handle, request, current)
+        if denied is not None:
+            _fr_log("edit:reject", handle, reason="not_owner")
+            return denied
+
+        before = {
+            "enabled": current.get("enabled"), "amount": current.get("amount"),
+            "goal": current.get("goal"), "end_date": current.get("end_date"),
+            "show_bar": current.get("show_bar"), "cause_name": current.get("cause_name"),
+            "total_raised": current.get("total_raised"),
+        }
+
+        state = dict(current)                  # preserve EVERYTHING by default
+        for k in _FR_EDIT_ALLOWED_FIELDS:      # overlay only the editable keys
+            if k in edits:
+                state[k] = edits[k]
+
+        # Hard invariants for an edit: stays enabled, never reprices.
+        state["enabled"] = True
+        state["total_raised"] = current.get("total_raised", 0)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["pricing_status"] = "skipped"
+        state["pricing_error"] = ""
+        state["pricing_updated_at"] = state["updated_at"]
+
+        try:
+            _fr_set_state(handle, state)
+        except Exception as e:
+            _fr_log("edit:error", handle, error=str(e))
+            return JSONResponse(
+                {"ok": False, "error": f"Failed to save fundraiser edit: {e}"},
+                status_code=502,
+            )
+
+        after = {
+            "enabled": state.get("enabled"), "amount": state.get("amount"),
+            "goal": state.get("goal"), "end_date": state.get("end_date"),
+            "show_bar": state.get("show_bar"), "cause_name": state.get("cause_name"),
+            "total_raised": state.get("total_raised"),
+        }
+        _fr_log("edit:saved", handle, before=before, after=after)
+        return JSONResponse(_fr_public_view(state))
 
     incoming_enabled = bool(body.get("enabled"))
     currently_enabled = bool(current.get("enabled"))
+    _fr_log("post", handle, incoming_enabled=incoming_enabled,
+            currently_enabled=currently_enabled,
+            mode=("stop" if (currently_enabled and not incoming_enabled) else
+                  "launch" if incoming_enabled else "save"))
 
     # ── One-at-a-time check ──────────────────────────────────────────────────
     # Reject a NEW launch if a fundraiser is already running.  Editing an
@@ -1974,9 +2159,11 @@ async def fundraising_post(handle: str, request: Request):
     if pricing_will_run:
         threading.Thread(target=_fr_sync_pricing, args=(handle,), daemon=True).start()
 
-    out = {k: v for k, v in state.items() if k in _FR_PUBLIC_FIELDS}
-    out["ok"] = True
-    return JSONResponse(out)
+    _fr_log("post:saved", handle, enabled=state.get("enabled"),
+            amount=state.get("amount"), goal=state.get("goal"),
+            end_date=state.get("end_date"), show_bar=state.get("show_bar"),
+            pricing_status=state.get("pricing_status"))
+    return JSONResponse(_fr_public_view(state))
 
 
 # ----------------------------
@@ -2411,9 +2598,16 @@ async def fundraising_payouts_summary(request: Request):
     for h in handles:
         try:
             state = _fr_get_state(h)
-        except Exception:
+        except Exception as e:
+            _fr_log("summary:state_error", h, error=str(e))
             state = {}
-        summary = _fr_summarize_rows(state, friday)
+        try:
+            summary = _fr_summarize_rows(state, friday)
+        except Exception as e:
+            # One malformed store must never break the whole Hub. Skip its rows.
+            _fr_log("summary:rows_error", h, error=str(e))
+            summary = {"eligible_by_friday": 0.0, "on_hold": 0.0,
+                       "total_unpaid": 0.0, "eligible_row_count": 0}
         stores.append({
             "handle": h,
             "cause_name": state.get("cause_name") or "",
