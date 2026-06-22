@@ -2327,8 +2327,12 @@ async def fundraising_stripe_connect(handle: str, request: Request):
         if not acct_id:
             acct = stripe.Account.create(
                 type="express",
+                business_type="individual",
                 capabilities={"transfers": {"requested": True}},
-                business_profile={"name": state.get("cause_name") or handle},
+                business_profile={
+                    "name": state.get("cause_name") or handle,
+                    "url": "https://stellasageco.com",
+                },
                 metadata={"store_handle": handle},
             )
             acct_id = acct.id
