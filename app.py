@@ -1489,6 +1489,7 @@ async def storefront_join(handle: str, request: Request):
     """
     denied = _require_admin_secret(request)
     if denied is not None:
+        print(f"[join] DENIED (bad/missing X-Admin-Secret) handle={handle!r}")
         return denied
 
     body = {}
@@ -1505,6 +1506,8 @@ async def storefront_join(handle: str, request: Request):
     if not handle:
         return JSONResponse({"error": "handle is required"}, status_code=400)
 
+    print(f"[join] handle={handle!r} customer_id={customer_id!r}")
+
     customer_gid = _ensure_gid_customer(customer_id)
     member_tag = f"storefront-member--{handle}"
     admin_tag = f"storefront-admin--{handle}"
@@ -1512,20 +1515,25 @@ async def storefront_join(handle: str, request: Request):
     try:
         tags = _get_customer_tags(customer_gid)
     except Exception as e:
+        print(f"[join] FAILED to fetch tags handle={handle!r} gid={customer_gid!r}: {e}")
         return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
 
     if tags is None:
+        print(f"[join] customer not found gid={customer_gid!r}")
         return JSONResponse({"error": "Customer not found"}, status_code=404)
 
     # Already has access — admins implicitly count as members, so don't re-tag.
     if member_tag in tags or admin_tag in tags:
+        print(f"[join] already has access handle={handle!r} gid={customer_gid!r}")
         return {"ok": True, "already_member": True}
 
     try:
         _customer_add_tag(customer_gid, member_tag)
     except Exception as e:
+        print(f"[join] FAILED to add tag {member_tag!r} gid={customer_gid!r}: {e}")
         return JSONResponse({"error": f"Failed to add member tag: {e}"}, status_code=502)
 
+    print(f"[join] SUCCESS added {member_tag!r} to gid={customer_gid!r}")
     return {"ok": True, "member_tag": member_tag}
 
 
