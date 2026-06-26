@@ -245,6 +245,28 @@ def _customer_remove_tag(customer_gid: str, tag: str) -> None:
         raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
 
 
+def _customer_add_tag(customer_gid: str, tag: str) -> None:
+    """Add a single tag to a customer (merge-safe)."""
+    existing = _get_customer_tags(customer_gid)
+    if existing is None:
+        raise RuntimeError(f"Customer not found: {customer_gid}")
+    if tag in existing:
+        return
+    new_tags = existing + [tag]
+    q = """
+    mutation customerUpdate($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id tags }
+        userErrors { field message }
+      }
+    }
+    """
+    res = _shopify_graphql(q, {"input": {"id": customer_gid, "tags": new_tags}})
+    errs = (res.get("customerUpdate") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+
 # ----------------------------
 # Helpers: file read
 # ----------------------------
@@ -1446,6 +1468,59 @@ async def storefront_leave(handle: str, request: Request):
         return JSONResponse({"error": f"Failed to remove member tag: {e}"}, status_code=502)
 
     return {"ok": True}
+
+
+@app.post("/api/storefront/{handle}/join")
+async def storefront_join(handle: str, request: Request):
+    """
+    Member self-join for a store.
+    Body JSON: {"customer_id": "<id>"}
+    Returns 200 {"ok": true} on success (idempotent if already a member or admin).
+
+    Auth: requires X-Admin-Secret. Reached only through the Printful_Automation
+    relay, which verifies the App Proxy signature and injects the VERIFIED
+    logged-in customer id — so the customer_id here is trusted.
+    Grants MEMBER access only, never admin.
+    """
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Request body must be JSON"}, status_code=400)
+
+    customer_id = (body.get("customer_id") or "").strip()
+    if not customer_id:
+        return JSONResponse({"error": "customer_id is required"}, status_code=400)
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    customer_gid = _ensure_gid_customer(customer_id)
+    member_tag = f"storefront-member--{handle}"
+    admin_tag = f"storefront-admin--{handle}"
+
+    try:
+        tags = _get_customer_tags(customer_gid)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to fetch customer tags: {e}"}, status_code=502)
+
+    if tags is None:
+        return JSONResponse({"error": "Customer not found"}, status_code=404)
+
+    if member_tag in tags or admin_tag in tags:
+        return {"ok": True, "already_member": True}
+
+    try:
+        _customer_add_tag(customer_gid, member_tag)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to add member tag: {e}"}, status_code=502)
+
+    return {"ok": True, "member_tag": member_tag}
 
 
 @app.post("/api/storefront/{handle}/nuke")
