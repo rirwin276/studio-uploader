@@ -4458,6 +4458,89 @@ async def admin_store_list_members(handle: str, request: Request):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+
+
+@app.get("/admin/setup-blog")
+async def admin_setup_blog(request: Request):
+    """One-time blog seeder for SEO/AI discoverability.
+
+    Creates the "News" blog (if missing) and publishes the prefilled articles
+    from blog_seed.py. Idempotent: articles whose handle already exists are
+    skipped, so re-running is always safe.
+
+    Auth: X-Admin-Secret header OR ?secret= query param (same ADMIN_SECRET).
+    """
+    supplied = (request.headers.get("X-Admin-Secret") or request.query_params.get("secret") or "").strip()
+    if not secrets.compare_digest(supplied, _ADMIN_SECRET):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    shop = os.getenv("SHOP", "").strip()
+    api_version = os.getenv("API_VERSION", "2026-01").strip()
+    access_token = os.getenv("CLIENT_SECRET", "").strip()
+    if not shop or not access_token:
+        return JSONResponse({"error": "Shopify not configured"}, status_code=503)
+
+    from blog_seed import BLOG_TITLE, BLOG_HANDLE, AUTHOR, SEED_ARTICLES
+
+    base = f"https://{shop}/admin/api/{api_version}"
+    hdrs = {"Content-Type": "application/json", "X-Shopify-Access-Token": access_token}
+
+    created, skipped, errors = [], [], []
+    try:
+        # 1) Find or create the blog
+        r = requests.get(f"{base}/blogs.json", headers=hdrs, timeout=30)
+        r.raise_for_status()
+        blogs = (r.json() or {}).get("blogs") or []
+        blog = next((b for b in blogs if (b.get("handle") or "") == BLOG_HANDLE), None)
+        if blog is None and blogs:
+            blog = blogs[0]  # any existing blog beats creating a duplicate
+        if blog is None:
+            r = requests.post(f"{base}/blogs.json", headers=hdrs,
+                              json={"blog": {"title": BLOG_TITLE, "handle": BLOG_HANDLE}}, timeout=30)
+            if r.status_code not in (200, 201):
+                return JSONResponse({"error": f"Could not create blog: HTTP {r.status_code} {r.text[:300]}"}, status_code=502)
+            blog = (r.json() or {}).get("blog") or {}
+        blog_id = blog.get("id")
+        if not blog_id:
+            return JSONResponse({"error": "No blog id resolved"}, status_code=502)
+
+        # 2) Existing article handles (for idempotency)
+        r = requests.get(f"{base}/blogs/{blog_id}/articles.json?limit=250&fields=id,handle", headers=hdrs, timeout=30)
+        r.raise_for_status()
+        existing = {(a.get("handle") or "") for a in (r.json() or {}).get("articles") or []}
+
+        # 3) Publish the seed articles
+        for art in SEED_ARTICLES:
+            if art["handle"] in existing:
+                skipped.append(art["handle"])
+                continue
+            payload = {"article": {
+                "title": art["title"],
+                "handle": art["handle"],
+                "author": AUTHOR,
+                "tags": art["tags"],
+                "body_html": art["body_html"],
+                "summary_html": art.get("summary_html", ""),
+                "published": True,
+            }}
+            r = requests.post(f"{base}/blogs/{blog_id}/articles.json", headers=hdrs, json=payload, timeout=30)
+            if r.status_code in (200, 201):
+                created.append(art["handle"])
+            else:
+                errors.append({"handle": art["handle"], "status": r.status_code, "body": r.text[:300]})
+    except Exception as e:
+        return JSONResponse({"error": str(e), "created": created, "skipped": skipped, "errors": errors}, status_code=502)
+
+    return {
+        "ok": True,
+        "blog": {"id": blog_id, "handle": blog.get("handle"), "title": blog.get("title")},
+        "created": created,
+        "skipped": skipped,
+        "errors": errors,
+        "blog_url": f"/blogs/{blog.get('handle')}",
+    }
+
+
 @app.get("/admin/store/{handle}/products")
 async def admin_store_list_products(handle: str, request: Request):
     """
