@@ -4485,7 +4485,7 @@ async def admin_setup_blog(request: Request):
     base = f"https://{shop}/admin/api/{api_version}"
     hdrs = {"Content-Type": "application/json", "X-Shopify-Access-Token": access_token}
 
-    created, skipped, errors = [], [], []
+    created, skipped, errors, updated = [], [], [], []
     try:
         # 1) Find or create the blog
         r = requests.get(f"{base}/blogs.json", headers=hdrs, timeout=30)
@@ -4504,25 +4504,38 @@ async def admin_setup_blog(request: Request):
         if not blog_id:
             return JSONResponse({"error": "No blog id resolved"}, status_code=502)
 
-        # 2) Existing article handles (for idempotency)
+        # 2) Existing articles (handle -> id) for idempotency / updates
         r = requests.get(f"{base}/blogs/{blog_id}/articles.json?limit=250&fields=id,handle", headers=hdrs, timeout=30)
         r.raise_for_status()
-        existing = {(a.get("handle") or "") for a in (r.json() or {}).get("articles") or []}
+        existing = {(a.get("handle") or ""): a.get("id") for a in (r.json() or {}).get("articles") or []}
 
-        # 3) Publish the seed articles
+        do_update = str(request.query_params.get("update") or "").strip() in ("1", "true", "yes")
+        blog_url = f"/blogs/{blog.get('handle') or BLOG_HANDLE}"
+
+        # 3) Publish (and optionally refresh) the seed articles
         for art in SEED_ARTICLES:
-            if art["handle"] in existing:
-                skipped.append(art["handle"])
-                continue
-            payload = {"article": {
+            body_html = art["body_html"].replace("{{BLOG_URL}}", blog_url)
+            article_fields = {
                 "title": art["title"],
-                "handle": art["handle"],
                 "author": AUTHOR,
                 "tags": art["tags"],
-                "body_html": art["body_html"],
+                "body_html": body_html,
                 "summary_html": art.get("summary_html", ""),
                 "published": True,
-            }}
+            }
+            if art["handle"] in existing:
+                if not do_update:
+                    skipped.append(art["handle"])
+                    continue
+                aid = existing[art["handle"]]
+                r = requests.put(f"{base}/blogs/{blog_id}/articles/{aid}.json", headers=hdrs,
+                                 json={"article": dict(article_fields, id=aid)}, timeout=30)
+                if r.status_code == 200:
+                    updated.append(art["handle"])
+                else:
+                    errors.append({"handle": art["handle"], "status": r.status_code, "body": r.text[:300]})
+                continue
+            payload = {"article": dict(article_fields, handle=art["handle"])}
             r = requests.post(f"{base}/blogs/{blog_id}/articles.json", headers=hdrs, json=payload, timeout=30)
             if r.status_code in (200, 201):
                 created.append(art["handle"])
@@ -4535,6 +4548,7 @@ async def admin_setup_blog(request: Request):
         "ok": True,
         "blog": {"id": blog_id, "handle": blog.get("handle"), "title": blog.get("title")},
         "created": created,
+        "updated": updated,
         "skipped": skipped,
         "errors": errors,
         "blog_url": f"/blogs/{blog.get('handle')}",
