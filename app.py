@@ -141,6 +141,36 @@ def _send_new_store_email(handle: str, store_name: str) -> None:
         print(f"[email] Failed to send notification for {handle}: {exc}")
 
 
+def _queue_social_engine_post(handle: str, store_name: str) -> None:
+    """Ask Social Engine to draft a "store is live" Facebook post. Never raises.
+
+    Social Engine looks the store up by handle to fill in its category and pull
+    a real product photo, and queues the result for manual approval — nothing
+    is published automatically. Configured via SOCIAL_ENGINE_URL and
+    SOCIAL_ENGINE_SECRET (the Social Engine app's ADMIN_SECRET/CRON_SECRET);
+    when either is unset this is a no-op so store-ready is unaffected.
+    """
+    base = os.getenv("SOCIAL_ENGINE_URL", "").strip().rstrip("/")
+    secret = os.getenv("SOCIAL_ENGINE_SECRET", "").strip()
+
+    if not base or not secret:
+        print(f"[social] Social Engine not configured — skipping post for {handle}")
+        return
+
+    try:
+        r = requests.post(
+            f"{base}/tasks/new-store",
+            params={"key": secret, "store_handle": handle, "store_name": store_name},
+            timeout=90,
+        )
+        if r.status_code >= 400:
+            print(f"[social] Social Engine HTTP {r.status_code} for {handle}: {r.text[:300]}")
+            return
+        print(f"[social] Queued new-store draft for {handle}: {r.text[:200]}")
+    except Exception as exc:
+        print(f"[social] Failed to queue post for {handle}: {exc}")
+
+
 # ----------------------------
 # Job + session status tracking
 # ----------------------------
@@ -4991,6 +5021,14 @@ async def store_mark_ready(handle: str, request: Request):
 
     threading.Thread(
         target=_send_new_store_email,
+        args=(handle, store_name),
+        daemon=True,
+    ).start()
+
+    # Draft the "store is live" social post. Separate thread so a Social Engine
+    # outage can never delay or fail the store-ready response.
+    threading.Thread(
+        target=_queue_social_engine_post,
         args=(handle, store_name),
         daemon=True,
     ).start()
