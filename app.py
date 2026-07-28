@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import uuid
 import time
 import secrets
@@ -1106,6 +1107,42 @@ def final_file(session_id: str):
 # ----------------------------
 # Provisioning runner
 # ----------------------------
+def _summarize_provision_error(stderr: str) -> str:
+    """The one line worth reading out of a provision traceback.
+
+    Shopify reports schema problems as a JSON blob nested inside a RuntimeError,
+    so the exception line alone says "Shopify GraphQL errors:" and nothing
+    useful. Pulling the first message out of that blob is the difference between
+    a log you can act on and one you have to decode.
+    """
+    text = stderr or ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    headline = ""
+    for line in reversed(lines):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception)\b", line):
+            headline = line
+            break
+    if not headline:
+        headline = lines[-1]
+
+    # Where it broke. The deepest frame is usually a generic helper, so name its
+    # caller too — "collection_update_smart" says what was being attempted in a
+    # way "shopify_graphql" never does.
+    app_frames = []
+    for line in lines:
+        m = re.match(r'^File "([^"]+)", line (\d+), in (\S+)', line)
+        if m and "/app/" in m.group(1):
+            app_frames.append(f"{m.group(3)}:{m.group(2)}")
+    frame = " -> ".join(app_frames[-2:])
+
+    detail = " | ".join(dict.fromkeys(re.findall(r'"message":\s*"([^"]+)"', text)))
+    parts = [p for p in (headline, detail, frame) if p]
+    return " — ".join(parts)[:600]
+
+
 def _run_shopify_provision_job(
     job_id: str,
     storefront_name: str,
@@ -1164,11 +1201,17 @@ def _run_shopify_provision_job(
             print("🧯 Provision stderr:\n", stderr[-12000:])
 
         if proc.returncode != 0:
+            # Lead with the one line worth reading. Two multi-thousand-character
+            # blocks land interleaved in the platform log, so a raw traceback is
+            # effectively unreadable and it is not obvious the run even failed.
+            summary = _summarize_provision_error(stderr) or f"exit {proc.returncode}"
+            print(f"❌ PROVISION FAILED — {summary}", flush=True)
+            print(f"❌ No build was triggered. Store was NOT created or updated.", flush=True)
             _job_set(
                 job_id,
                 status="failed",
                 finished_at=time.time(),
-                error=f"Provision failed (exit {proc.returncode})",
+                error=f"Provision failed (exit {proc.returncode}): {summary}",
                 stdout=stdout[-12000:],
                 stderr=stderr[-12000:],
             )

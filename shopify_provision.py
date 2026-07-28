@@ -447,17 +447,23 @@ def collection_create_smart(title: str, handle: str, tag_value: str, sport_tag: 
 
 
 def collection_update_smart(collection_id: str, title: str, handle: str, tag_value: str, sport_tag: str = "") -> None:
+    # collectionUpdate takes the id inside the input, unlike publishablePublish
+    # and metaobjectUpdate which take it as a separate argument. Passing it
+    # separately here failed every re-provision of an existing handle with
+    # "Field 'collectionUpdate' doesn't accept argument 'id'", killing the whole
+    # provision before it could trigger a build — and because a first-time
+    # provision creates rather than updates, only rebuilds ever hit it.
     q = """
-    mutation collectionUpdate($id: ID!, $input: CollectionInput!) {
-      collectionUpdate(id: $id, input: $input) {
+    mutation collectionUpdate($input: CollectionInput!) {
+      collectionUpdate(input: $input) {
         collection { id handle title templateSuffix }
         userErrors { field message }
       }
     }
     """
     variables = {
-        "id": collection_id,
         "input": {
+            "id": collection_id,
             "title": title,
             "handle": handle,
             "templateSuffix": COLLECTION_TEMPLATE_SUFFIX,
