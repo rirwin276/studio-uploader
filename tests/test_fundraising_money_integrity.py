@@ -227,3 +227,97 @@ def test_test_mode_is_decided_by_the_key_that_moves_the_money():
         assert app._fr_stripe_livemode() is False
     finally:
         app._STRIPE_KEY = original
+
+
+# --- a campaign that says it ends must end ----------------------------------
+
+def _dated(days_from_now, enabled=True):
+    from datetime import datetime, timedelta, timezone
+    when = datetime.now(timezone.utc) + timedelta(days=days_from_now)
+    return _state(enabled=enabled, end_date=when.date().isoformat())
+
+
+def test_a_campaign_past_its_end_date_is_finished():
+    assert A._fr_campaign_ended(_dated(-2)) is True
+
+
+def test_a_running_campaign_is_not_finished():
+    assert A._fr_campaign_ended(_dated(5)) is False
+
+
+def test_the_final_day_is_still_a_selling_day():
+    """The storefront bar counts down to 23:59:59 on the end date and shows
+    "Final day". Closing at midnight that morning would stop the campaign a day
+    before the shoppers looking at it were told."""
+    assert A._fr_campaign_ended(_dated(0)) is False
+
+
+def test_the_check_does_not_depend_on_the_clamped_day_count():
+    """_fr_days_left clamps to max(0, days) so an ended campaign reads "0 days
+    left" rather than negative — correct for display, useless for deciding."""
+    ended = _dated(-2)
+    assert A._fr_days_left(ended["end_date"]) == 0
+    assert A._fr_campaign_ended(ended) is True
+
+
+def test_a_campaign_with_no_end_date_runs_until_stopped():
+    assert A._fr_campaign_ended(_state(end_date="")) is False
+
+
+def test_an_already_stopped_campaign_is_not_re_closed():
+    assert A._fr_campaign_ended(_dated(-2, enabled=False)) is False
+
+
+# --- the ledger must not outgrow the field it lives in ----------------------
+
+def _row(order_id, days_ago, paid, amount=5.0):
+    from datetime import datetime, timedelta, timezone
+    when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return {"order_id": order_id, "amount": amount, "qty": 1,
+            "created_at": when.isoformat(), "paid": paid}
+
+
+def test_settled_aged_rows_are_folded_into_a_total():
+    state = _state(ledger=[_row("A", 400, True), _row("B", 500, True)])
+    assert A._fr_compact_ledger(state) == 2
+    assert state["ledger"] == []
+    assert state["ledger_archive"]["rows"] == 2
+    assert state["ledger_archive"]["amount"] == 10.0
+
+
+def test_money_still_owed_is_never_folded_away():
+    """An unpaid row is a debt to a cause. Age is irrelevant."""
+    state = _state(ledger=[_row("A", 900, False)])
+    assert A._fr_compact_ledger(state) == 0
+    assert len(state["ledger"]) == 1
+
+
+def test_recent_payouts_stay_line_by_line_for_reconciliation():
+    state = _state(ledger=[_row("A", 3, True)])
+    assert A._fr_compact_ledger(state) == 0
+    assert len(state["ledger"]) == 1
+
+
+def test_a_row_with_an_unreadable_date_is_kept_not_dropped():
+    state = _state(ledger=[{"order_id": "A", "amount": 5.0, "qty": 1,
+                            "created_at": "whenever", "paid": True}])
+    assert A._fr_compact_ledger(state) == 0
+    assert len(state["ledger"]) == 1
+
+
+def test_archiving_twice_accumulates_rather_than_resets():
+    state = _state(ledger=[_row("A", 400, True)])
+    A._fr_compact_ledger(state)
+    state["ledger"] = [_row("B", 400, True)]
+    A._fr_compact_ledger(state)
+    assert state["ledger_archive"]["rows"] == 2
+
+
+# --- one writer per store ---------------------------------------------------
+
+def test_the_same_store_always_gets_the_same_lock():
+    assert A._fr_lock("northview") is A._fr_lock("northview")
+
+
+def test_different_stores_do_not_block_each_other():
+    assert A._fr_lock("northview") is not A._fr_lock("westfield")

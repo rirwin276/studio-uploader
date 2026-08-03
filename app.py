@@ -2220,6 +2220,53 @@ def _fr_days_left(end_date: str) -> Optional[int]:
     return max(0, days)
 
 
+# One writer per store at a time.
+#
+# Every fundraiser write is read-modify-write against a single JSON blob, and
+# Shopify's metaobject upsert has no version to check, so two orders paid
+# seconds apart both read the same state, both append their own row, and the
+# second write erases the first. The contribution is gone with nothing logged.
+#
+# A process-local lock closes that for the case that actually happens — several
+# webhooks landing on one instance at once. It is not a distributed lock; if
+# this service is ever run multi-instance, the ledger needs to move out of the
+# blob rather than gain a bigger lock here.
+_FR_STATE_LOCKS: Dict[str, threading.Lock] = {}
+_FR_LOCKS_GUARD = threading.Lock()
+
+
+def _fr_lock(handle: str) -> threading.Lock:
+    with _FR_LOCKS_GUARD:
+        lock = _FR_STATE_LOCKS.get(handle)
+        if lock is None:
+            lock = threading.Lock()
+            _FR_STATE_LOCKS[handle] = lock
+        return lock
+
+
+def _fr_campaign_ended(state: Dict[str, Any]) -> bool:
+    """True when an active fundraiser is past the end date it advertised.
+
+    Not built on _fr_days_left: that clamps to max(0, days) so a campaign can
+    read "0 days left" forever and never look finished. It is right to clamp
+    for display and wrong to reuse for a decision.
+
+    The end date is inclusive, through 23:59:59 UTC. That is what the
+    storefront progress bar counts down to, and a campaign must never close
+    earlier than the day shoppers were shown.
+    """
+    if not state.get("enabled"):
+        return False
+    raw = (state.get("end_date") or "").strip()
+    if not raw:
+        return False
+    try:
+        end = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) > end + timedelta(days=1)
+
+
 def _fr_validate_end_date(end_date: str) -> str:
     """Return an error message for an unusable end date, or "" if it's fine."""
     raw = (end_date or "").strip()
@@ -2592,7 +2639,21 @@ async def fundraising_post(handle: str, request: Request):
     state["enabled"] = incoming_enabled
     # total_raised is owned by the order webhook; never clobber it here.
     state["total_raised"] = current.get("total_raised", 0)
-    if incoming_enabled and not current.get("created_at"):
+
+    # A new campaign starts from zero.
+    #
+    # Stopping preserved the running total and nothing reset it, so a school's
+    # second fundraiser opened already showing last season's number on the
+    # storefront bar — and goal_met_notified was still set, so the new goal
+    # never triggered its email. The ledger is untouched: unpaid rows from the
+    # previous campaign are still owed and still have to reach the cause.
+    if incoming_enabled and not currently_enabled:
+        state["total_raised"] = 0
+        state["goal_met_notified"] = False
+        state["created_at"] = now_iso
+        _fr_log("launch:new_campaign", handle,
+                previous_total=current.get("total_raised", 0))
+    elif incoming_enabled and not current.get("created_at"):
         state["created_at"] = now_iso
     state["updated_at"] = now_iso
 
@@ -2895,6 +2956,153 @@ async def fundraising_stripe_status(handle: str, request: Request):
         "details_submitted": bool(getattr(acct, "details_submitted", False)),
         "payouts_enabled": bool(getattr(acct, "payouts_enabled", False)),
     })
+
+
+# Paid rows are kept in full for this long, then collapsed into a running total.
+#
+# The whole fundraiser lives in one metaobject JSON field with a hard size
+# limit, and the ledger only ever grew. A store with a few hundred variants
+# already spends a chunk of that budget on base_prices, so a campaign that goes
+# well is the one that hits the ceiling — and the write failure surfaces inside
+# the order webhook's except block, where it prints a line and drops the
+# contribution. Successful fundraising must not be the thing that breaks it.
+_FR_LEDGER_KEEP_DAYS = int(os.getenv("FUNDRAISING_LEDGER_KEEP_DAYS", "120"))
+
+
+def _fr_compact_ledger(state: Dict[str, Any]) -> int:
+    """Fold settled, aged-out rows into a summary. Returns how many were folded.
+
+    Only rows that are paid AND older than the retention window are touched, so
+    nothing owed is ever summarised away and a recent payout can still be
+    reconciled line by line against its Stripe transfer. payout_batches keeps
+    the full transfer history regardless — that is the audit trail.
+    """
+    ledger = state.get("ledger") or []
+    if not ledger:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_FR_LEDGER_KEEP_DAYS)
+    keep, folded_amount, folded_qty, folded_rows = [], 0.0, 0, 0
+
+    for row in ledger:
+        if not row.get("paid"):
+            keep.append(row)
+            continue
+        try:
+            when = datetime.fromisoformat(row.get("created_at") or "")
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+        except Exception:
+            keep.append(row)  # undatable: never fold what we cannot age
+            continue
+        if when > cutoff:
+            keep.append(row)
+            continue
+        folded_amount += float(row.get("amount") or 0)
+        folded_qty += int(row.get("qty") or 0)
+        folded_rows += 1
+
+    if not folded_rows:
+        return 0
+
+    archive = state.get("ledger_archive") or {"rows": 0, "amount": 0.0, "qty": 0}
+    archive["rows"] = int(archive.get("rows") or 0) + folded_rows
+    archive["amount"] = round(float(archive.get("amount") or 0) + folded_amount, 2)
+    archive["qty"] = int(archive.get("qty") or 0) + folded_qty
+    archive["through"] = cutoff.isoformat()
+    state["ledger_archive"] = archive
+    state["ledger"] = keep
+    return folded_rows
+
+
+def _fr_send_campaign_ended_email(handle: str, state: Dict[str, Any]) -> None:
+    """Tell the organizer their campaign closed on schedule. Never raises."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        return
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        cause = state.get("cause_name") or handle
+        raised = float(state.get("total_raised", 0))
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIFY_EMAIL
+        msg["Subject"] = f"Fundraiser ended: {cause} raised ${raised:.0f}"
+        msg.attach(MIMEText(
+            f"The fundraiser for {cause} ({handle}) reached its end date and has been closed.\n\n"
+            f"Raised: ${raised:.2f}\n\n"
+            f"Product prices have been restored to normal. Any contributions still inside\n"
+            f"their 7-day hold will go out on the next weekly payout.\n",
+            "plain"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, [NOTIFY_EMAIL], msg.as_string())
+    except Exception as e:
+        print(f"[email] campaign-ended email failed for {handle}: {e}")
+
+
+def _fr_close_if_ended(handle: str) -> Dict[str, Any]:
+    """Stop a fundraiser that has passed its end date, and restore its prices.
+
+    The end date was shown to shoppers on the progress bar and used for "days
+    left", but nothing acted on it: past the advertised close, prices stayed
+    raised and every sale kept adding to what the cause was owed. A campaign
+    that says it ends has to end.
+
+    Contributions already in the ledger are untouched — they were collected and
+    are still owed, and the payout run settles them on the normal schedule.
+    """
+    with _fr_lock(handle):
+        state = _fr_get_state(handle)
+        if not _fr_campaign_ended(state):
+            return {"handle": handle, "closed": False}
+        state["enabled"] = False
+        state["ended_at"] = datetime.now(timezone.utc).isoformat()
+        state["updated_at"] = state["ended_at"]
+        state["pricing_status"] = "pending"
+        _fr_set_state(handle, state)
+
+    _fr_log("campaign:auto_closed", handle, end_date=state.get("end_date"),
+            total_raised=state.get("total_raised"))
+    # Restores prices from the base_prices snapshot; idempotent.
+    _fr_sync_pricing(handle)
+    _fr_send_campaign_ended_email(handle, state)
+    return {"handle": handle, "closed": True, "total_raised": state.get("total_raised")}
+
+
+@app.post("/api/fundraising/maintenance")
+async def fundraising_maintenance(request: Request):
+    """Daily housekeeping: close ended campaigns, keep the ledger bounded.
+
+    Separate from the payout run so it can run every day while payouts stay
+    weekly — a campaign that ended on Saturday should not stay live, and its
+    prices should not stay raised, until Friday.
+    """
+    denied = _require_cron_secret(request)
+    if denied is not None:
+        return denied
+
+    results = []
+    for h in _fr_all_handles():
+        entry: Dict[str, Any] = {"handle": h}
+        try:
+            entry.update(_fr_close_if_ended(h))
+        except Exception as e:
+            entry["close_error"] = str(e)
+        try:
+            with _fr_lock(h):
+                state = _fr_get_state(h)
+                folded = _fr_compact_ledger(state)
+                if folded:
+                    _fr_set_state(h, state)
+            entry["ledger_rows_archived"] = folded
+        except Exception as e:
+            entry["compact_error"] = str(e)
+        results.append(entry)
+
+    return JSONResponse({"ok": True, "results": results})
 
 
 def _fr_send_underfunded_email(underfunded: list, total_shortfall: float, friday_iso: str) -> None:
@@ -3783,29 +3991,37 @@ async def fundraising_order_paid(request: Request):
     updated = []
     for handle, qty in handle_qty.items():
         try:
-            state = _fr_get_state(handle)
-            if not state.get("enabled"):
-                continue
-            ledger = state.get("ledger") or []
-            if any(r.get("order_id") == order_id for r in ledger):
-                continue  # already counted this order
-            amount = int(state.get("amount") or 0)
-            contribution = amount * qty
-            if contribution <= 0:
-                continue
-            ledger.append({
-                "order_id": order_id, "amount": contribution, "qty": qty,
-                "created_at": now_iso, "paid": False,
-            })
-            state["ledger"] = ledger
-            state["total_raised"] = float(state.get("total_raised", 0)) + contribution
+            hit_goal = False
+            # Re-read inside the lock. The state fetched above to decide which
+            # stores this order touches is already stale by the time we write,
+            # and the window between them is exactly where a concurrent order's
+            # contribution used to disappear.
+            with _fr_lock(handle):
+                state = _fr_get_state(handle)
+                if not state.get("enabled"):
+                    continue
+                ledger = state.get("ledger") or []
+                if any(r.get("order_id") == order_id for r in ledger):
+                    continue  # already counted this order
+                amount = int(state.get("amount") or 0)
+                contribution = amount * qty
+                if contribution <= 0:
+                    continue
+                ledger.append({
+                    "order_id": order_id, "amount": contribution, "qty": qty,
+                    "created_at": now_iso, "paid": False,
+                })
+                state["ledger"] = ledger
+                state["total_raised"] = float(state.get("total_raised", 0)) + contribution
 
-            goal = float(state.get("goal") or 0)
-            hit_goal = goal > 0 and state["total_raised"] >= goal and not state.get("goal_met_notified")
-            if hit_goal:
-                state["goal_met_notified"] = True
+                goal = float(state.get("goal") or 0)
+                hit_goal = goal > 0 and state["total_raised"] >= goal and not state.get("goal_met_notified")
+                if hit_goal:
+                    state["goal_met_notified"] = True
 
-            _fr_set_state(handle, state)
+                _fr_set_state(handle, state)
+
+            # Outside the lock: SMTP is slow and must not hold up the next order.
             if hit_goal:
                 _fr_send_goal_email(handle, state)
             updated.append(handle)
@@ -3889,18 +4105,19 @@ def _fr_apply_reversals(reversal_id: str, order_id: str, prod_qty: Dict[str, int
     reversed_handles = []
     for handle, qty in handle_qty.items():
         try:
-            state = _fr_get_state(handle)
-            row = _fr_reverse_order(handle, state, original_order_id=order_id,
-                                    reversal_id=reversal_id, refunded_qty=qty)
-            if row is None:
-                continue
-            ledger = state.get("ledger") or []
-            ledger.append(row)
-            state["ledger"] = ledger
-            state["total_raised"] = round(
-                max(0.0, float(state.get("total_raised", 0)) + float(row["amount"])), 2
-            )
-            _fr_set_state(handle, state)
+            with _fr_lock(handle):
+                state = _fr_get_state(handle)
+                row = _fr_reverse_order(handle, state, original_order_id=order_id,
+                                        reversal_id=reversal_id, refunded_qty=qty)
+                if row is None:
+                    continue
+                ledger = state.get("ledger") or []
+                ledger.append(row)
+                state["ledger"] = ledger
+                state["total_raised"] = round(
+                    max(0.0, float(state.get("total_raised", 0)) + float(row["amount"])), 2
+                )
+                _fr_set_state(handle, state)
             _fr_log("ledger:reversed", handle, order_id=order_id,
                     reversal_id=reversal_id, amount=row["amount"])
             reversed_handles.append(handle)
