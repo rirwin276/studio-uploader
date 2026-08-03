@@ -1978,6 +1978,12 @@ _FR_METAOBJECT_TYPE = "store_fundraising"
 # Defined once here so both the POST handler and _fr_sync_pricing stay in sync.
 _FR_PLATFORM_FEE = 1
 
+# The bounds the wizard advertises ("$1–$8 range", "Max 1 year from today").
+# Enforced server-side too — see the validation in fundraising_post.
+_FR_MIN_AMOUNT = 1
+_FR_MAX_AMOUNT = 8
+_FR_MAX_END_DATE_DAYS = 366
+
 # Fields the client is allowed to set. Anything else in the body is ignored so a
 # caller can't write arbitrary keys into the metaobject.
 _FR_ALLOWED_FIELDS = (
@@ -2214,6 +2220,26 @@ def _fr_days_left(end_date: str) -> Optional[int]:
     return max(0, days)
 
 
+def _fr_validate_end_date(end_date: str) -> str:
+    """Return an error message for an unusable end date, or "" if it's fine."""
+    raw = (end_date or "").strip()
+    if not raw:
+        return ""
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            d = datetime.strptime(raw[:10], "%Y-%m-%d")
+        except Exception:
+            return "End date must be a date (YYYY-MM-DD)."
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    days = (d - datetime.now(timezone.utc)).days
+    if days > _FR_MAX_END_DATE_DAYS:
+        return "End date cannot be more than a year from today."
+    return ""
+
+
 def _fr_log(action: str, handle: str, **fields: Any) -> None:
     """Structured one-line log for fundraiser actions (visible in Railway logs)."""
     try:
@@ -2351,9 +2377,11 @@ async def fundraising_get(handle: str, request: Request):
 
     if not state:
         _fr_log("get", handle, found=False)
-        return JSONResponse({"ok": True, "enabled": False, "active": False})
+        return JSONResponse({"ok": True, "enabled": False, "active": False,
+                             "stripe_livemode": _fr_stripe_livemode()})
 
     out = _fr_public_view(state)
+    out["stripe_livemode"] = _fr_stripe_livemode()
     _fr_log(
         "get", handle, found=True, enabled=out["enabled"], amount=out["amount"],
         goal=out["goal"], end_date=out["end_date"], show_bar=out["show_bar"],
@@ -2501,6 +2529,50 @@ async def fundraising_post(handle: str, request: Request):
                 status_code=409,
             )
 
+    # ── The limits the wizard promises must hold on the server ───────────────
+    #
+    # "$1–$8 range" and "Max 1 year from today" are enforced only by the browser
+    # form. `amount` drives the price markup on every product in the store and
+    # the per-unit debt recorded against the cause, so a request that skips the
+    # form could raise an entire catalogue by an arbitrary amount.
+    if "amount" in body:
+        try:
+            amount_val = int(body["amount"])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"ok": False, "error": "Fundraising amount must be a whole dollar amount."},
+                status_code=400)
+        if amount_val and not (_FR_MIN_AMOUNT <= amount_val <= _FR_MAX_AMOUNT):
+            return JSONResponse(
+                {"ok": False, "error": f"Fundraising amount must be between "
+                                       f"${_FR_MIN_AMOUNT} and ${_FR_MAX_AMOUNT} per item."},
+                status_code=400)
+        body["amount"] = amount_val
+
+    if body.get("end_date"):
+        bad_end = _fr_validate_end_date(str(body["end_date"]))
+        if bad_end:
+            return JSONResponse({"ok": False, "error": bad_end}, status_code=400)
+
+    # ── No launch without somewhere to send the money ────────────────────────
+    #
+    # The admin wizard already blocks this and says exactly why: "prevents money
+    # from being collected without a payout account." That check lives in the
+    # browser, so any request that does not come from the wizard skips it — and
+    # the result is the worst possible state. Prices go up, the ledger fills,
+    # and the payout run skips the store forever with "no connected stripe
+    # account", so money is collected from shoppers on a cause's behalf with no
+    # route to the cause.
+    if incoming_enabled and not currently_enabled:
+        if not (current.get("stripe_connected") and current.get("stripe_account_id")):
+            _fr_log("launch:reject", handle, reason="stripe_not_connected")
+            return JSONResponse(
+                {"ok": False, "code": "stripe_not_connected",
+                 "error": "Connect Stripe before launching this fundraiser. "
+                          "Without a payout account the money cannot reach the cause."},
+                status_code=409,
+            )
+
     # ── Owner / super-admin enforcement ──────────────────────────────────────
     # For a stop or an edit of an owned fundraiser the caller must be
     # owner or super-admin.  The very first launch where no owner exists yet is
@@ -2582,6 +2654,17 @@ async def fundraising_post(handle: str, request: Request):
 _STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 # Days a contribution is held before it's eligible for payout.
 _FR_HOLD_DAYS = int(os.getenv("FUNDRAISING_HOLD_DAYS", "7"))
+
+
+def _fr_stripe_livemode() -> bool:
+    """Whether Stripe is configured with a live key.
+
+    The wizard shows "Test mode active — no real money moves" next to the
+    Connect button. That warning was hardcoded, so it kept reassuring
+    organizers that nothing was real long after the key went live. It has to be
+    driven by the key that will actually process the money.
+    """
+    return _STRIPE_KEY.startswith("sk_live_")
 
 
 def _stripe():
@@ -2814,6 +2897,76 @@ async def fundraising_stripe_status(handle: str, request: Request):
     })
 
 
+def _fr_send_underfunded_email(underfunded: list, total_shortfall: float, friday_iso: str) -> None:
+    """Tell someone the payouts did not go out. Never raises.
+
+    Without this the run returns ok:true with a skip buried in the results
+    array, which is indistinguishable from a quiet week. The causes are waiting
+    on money that is sitting in Shopify, and nobody finds out until one of them
+    asks.
+    """
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print(f"[email] SMTP not configured — cannot send underfunded payout alert "
+              f"(${total_shortfall:.2f} short for {len(underfunded)} store(s))")
+        return
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        lines = [
+            f"{len(underfunded)} fundraiser payout(s) did NOT go out on {friday_iso} "
+            f"because the platform Stripe balance was too low.",
+            "",
+            f"Load at least ${total_shortfall:.2f} into Stripe, then re-run the payout job.",
+            "(Re-running is safe — the same eligible set on the same Friday cannot pay twice.)",
+            "",
+            "Stores waiting:",
+        ]
+        for u in underfunded:
+            label = u["cause_name"] or u["handle"]
+            lines.append(f"  - {label} ({u['handle']}): ${u['due']:.2f} due, ${u['shortfall']:.2f} short")
+        lines += [
+            "",
+            "Storefront sales settle through Shopify Payments, so the Stripe balance",
+            "these transfers draw on is not funded automatically.",
+        ]
+
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIFY_EMAIL
+        msg["Subject"] = f"⚠️ Fundraiser payouts blocked — load ${total_shortfall:.0f} into Stripe"
+        msg.attach(MIMEText("\n".join(lines), "plain"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, [NOTIFY_EMAIL], msg.as_string())
+    except Exception as e:
+        print(f"[email] underfunded payout alert failed: {e}")
+
+
+@app.post("/api/fundraising/markup/reconcile")
+async def fundraising_markup_reconcile(request: Request):
+    """Re-apply the fundraiser markup to anything that is missing it.
+
+    Products published after a fundraiser launches never had it, and a price
+    write that failed mid-apply leaves the store half-marked-up with no way to
+    notice. Safe to run on any schedule; it only touches variants whose live
+    price disagrees with base + markup.
+    """
+    denied = _require_cron_secret(request)
+    if denied is not None:
+        return denied
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    one = (body.get("handle") or "").strip()
+    handles = [one] if one else _fr_all_handles()
+    return JSONResponse({"ok": True, "results": [_fr_reconcile_markup(h) for h in handles]})
+
+
 @app.post("/api/fundraising/payouts/run")
 async def fundraising_payouts_run(request: Request):
     """
@@ -2856,6 +3009,19 @@ async def fundraising_payouts_run(request: Request):
     cutoff = now - timedelta(days=_FR_HOLD_DAYS)
 
     results = []
+    underfunded: list = []
+
+    # Bring prices back in line before deciding what is owed. A product added
+    # mid-campaign is not charging the markup yet, and every week it stays that
+    # way is a week of sales the cause is owed for but nobody collected.
+    for h in handles:
+        try:
+            rec = _fr_reconcile_markup(h)
+            if rec.get("added") or rec.get("repaired"):
+                print(f"[payouts/run] markup reconciled for {h}: {rec}")
+        except Exception as e:
+            print(f"[payouts/run] markup reconcile failed for {h} (non-fatal): {e}")
+
     for h in handles:
         try:
             state = _fr_get_state(h)
@@ -2897,11 +3063,24 @@ async def fundraising_payouts_run(request: Request):
                 0,
             )
             if available_usd < due_cents:
+                # Storefront sales settle through Shopify Payments, which funds
+                # Shopify — not this platform's Stripe balance. So this branch is
+                # not an edge case, it is the normal state until the balance is
+                # topped up, and a silent skip means money accrues week after
+                # week while the cron reports success.
+                shortfall_cents = due_cents - available_usd
+                underfunded.append({
+                    "handle": h,
+                    "cause_name": state.get("cause_name") or "",
+                    "due": round(due_cents / 100.0, 2),
+                    "shortfall": round(shortfall_cents / 100.0, 2),
+                })
                 results.append({
                     "handle": h,
                     "skipped": "insufficient_stripe_balance",
                     "due_cents": due_cents,
                     "available_cents": available_usd,
+                    "shortfall_cents": shortfall_cents,
                 })
                 # Do NOT write a pending marker for a skipped handle.
                 continue
@@ -2969,7 +3148,16 @@ async def fundraising_payouts_run(request: Request):
         except Exception as e:
             results.append({"handle": h, "error": str(e)})
 
-    return JSONResponse({"ok": True, "results": results})
+    total_shortfall = round(sum(u["shortfall"] for u in underfunded), 2)
+    if underfunded:
+        _fr_send_underfunded_email(underfunded, total_shortfall, friday_iso)
+
+    return JSONResponse({
+        "ok": True,
+        "results": results,
+        "underfunded": underfunded,
+        "load_needed": total_shortfall,
+    })
 
 
 @app.get("/api/fundraising/payouts/summary")
@@ -3273,6 +3461,107 @@ def _fr_apply_markup(handle: str, add: int, state: Dict[str, Any]) -> None:
         raise RuntimeError("; ".join(errors[:10]))
 
 
+def _fr_variant_gid(variant_id: Any) -> str:
+    """Shopify variant GID from either a numeric id or an existing GID."""
+    raw = str(variant_id or "").strip()
+    if not raw:
+        return ""
+    return raw if raw.startswith("gid://") else f"gid://shopify/ProductVariant/{raw}"
+
+
+def _fr_reconcile_markup(handle: str) -> Dict[str, Any]:
+    """Restore the invariant: while a fundraiser runs, every live variant price
+    equals its snapshotted base plus the markup.
+
+    Two ways that invariant breaks, both of which cost real money:
+
+    1. A product published after launch. _fr_apply_markup snapshots the
+       variants that existed at launch and nothing revisits the list, so a
+       garment added mid-campaign sells at base price — while the order webhook
+       used to credit the cause for it anyway. Money owed that was never
+       collected.
+
+    2. A price write that failed partway through apply. `markup_add` is
+       persisted before the writes, so _fr_sync_pricing then sees
+       desired == applied and reports "skipped" forever. Some products carry
+       the markup and some do not, and nothing repairs it short of a full stop
+       and relaunch.
+
+    Both are handled the same way: compare every live variant against
+    base + markup and fix whatever disagrees. Idempotent, so it is safe to run
+    on a schedule, and it is the mechanism that lets the order webhook trust
+    base_prices as the record of what was actually charged.
+    """
+    state = _fr_get_state(handle)
+    if not state.get("enabled"):
+        return {"handle": handle, "skipped": "not_enabled"}
+
+    add = _fr_applied_markup(state)
+    if add <= 0:
+        # Launched but the background reprice has not run (or failed) yet.
+        # Adding a snapshot here would race it.
+        return {"handle": handle, "skipped": "markup_not_applied_yet"}
+
+    base = dict(state.get("base_prices") or {})
+    try:
+        variants = _fr_list_variants(handle)
+    except Exception as e:
+        return {"handle": handle, "error": f"could not list variants: {e}"}
+
+    added: list = []
+    repaired: list = []
+    for v in variants:
+        gid = v["gid"]
+        try:
+            live_cents = int(round(float(v["price"]) * 100))
+        except Exception:
+            continue
+
+        snap = base.get(gid)
+        if snap is None:
+            # New since launch: today's price is its true base.
+            base[gid] = f"{live_cents / 100.0:.2f}"
+            added.append((gid, live_cents))
+            continue
+
+        try:
+            want_cents = int(round(float(snap) * 100)) + add * 100
+        except Exception:
+            continue
+        if live_cents != want_cents:
+            repaired.append((gid, want_cents))
+
+    if not added and not repaired:
+        return {"handle": handle, "added": 0, "repaired": 0}
+
+    # Persist the widened snapshot BEFORE touching live prices, so a crash
+    # mid-loop still leaves a Stop able to restore every variant it raised.
+    if added:
+        state["base_prices"] = base
+        _fr_set_state(handle, state)
+
+    errors = []
+    for gid, base_cents in added:
+        try:
+            _variant_set_price(gid, f"{(base_cents + add * 100) / 100.0:.2f}")
+        except Exception as e:
+            errors.append(f"{gid}: {e}")
+        time.sleep(0.3)
+    for gid, want_cents in repaired:
+        try:
+            _variant_set_price(gid, f"{want_cents / 100.0:.2f}")
+        except Exception as e:
+            errors.append(f"{gid}: {e}")
+        time.sleep(0.3)
+
+    out = {"handle": handle, "added": len(added), "repaired": len(repaired)}
+    if errors:
+        out["errors"] = errors[:10]
+    _fr_log("markup:reconcile", handle, added=len(added), repaired=len(repaired),
+            errors=len(errors))
+    return out
+
+
 def _fr_sync_pricing(handle: str) -> None:
     """
     Bring a store's product prices in line with current fundraiser state.
@@ -3375,6 +3664,42 @@ def _fr_send_goal_email(handle: str, state: Dict[str, Any]) -> None:
         print(f"[email] goal-met email failed for {handle}: {e}")
 
 
+def _fr_collected_qty(state: Dict[str, Any], lines: list) -> int:
+    """How many units on these lines were actually sold at the fundraiser price.
+
+    A contribution is only owed on a sale that collected it. base_prices is the
+    record of what each variant cost before the markup, so a line qualifies when
+    the price paid is at least base + markup. Anything else — a product created
+    after launch and never reconciled, a variant whose price write failed, an
+    order placed in the seconds between "enabled" and the background reprice
+    finishing — is not credited, because the money was never taken.
+
+    Compared in whole cents. Shopify sends prices as strings and float
+    arithmetic on money invents a fraction of a cent, which at exact equality
+    is the difference between crediting a sale and silently dropping it.
+    """
+    base = state.get("base_prices") or {}
+    add = int(state.get("markup_add") or 0)
+    if add <= 0 or not base:
+        return 0
+
+    total = 0
+    for variant_gid, price, qty in lines:
+        if qty <= 0 or not variant_gid:
+            continue
+        snapshot = base.get(variant_gid)
+        if snapshot is None:
+            continue
+        try:
+            paid_cents = int(round(float(price) * 100))
+            owed_cents = int(round(float(snapshot) * 100)) + add * 100
+        except (TypeError, ValueError):
+            continue
+        if paid_cents >= owed_cents:
+            total += qty
+    return total
+
+
 @app.post("/webhooks/fundraising/order-paid")
 async def fundraising_order_paid(request: Request):
     """
@@ -3413,22 +3738,43 @@ async def fundraising_order_paid(request: Request):
         return JSONResponse({"ok": True, "skipped": "no_order_id"})
     order_id = _raw_order_id
 
-    prod_qty: Dict[str, int] = {}
+    # Group by product, keeping each line's variant and the price actually paid.
+    #
+    # Quantity alone is not enough to credit a cause. This used to add
+    # amount × qty for anything carrying a fundraiser-active store tag, whether
+    # or not that product's price had ever been raised — so a garment published
+    # after launch sold at base price and still accrued a payout obligation.
+    prod_lines: Dict[str, list] = {}
     for li in (order.get("line_items") or []):
         pid = li.get("product_id")
         if pid is None:
             continue
-        prod_qty[str(pid)] = prod_qty.get(str(pid), 0) + int(li.get("quantity") or 0)
-    if not prod_qty:
+        prod_lines.setdefault(str(pid), []).append((
+            _fr_variant_gid(li.get("variant_id")),
+            li.get("price"),
+            int(li.get("quantity") or 0),
+        ))
+    if not prod_lines:
         return JSONResponse({"ok": True, "skipped": "no products"})
 
-    # Which fundraiser-active store(s) do this order's products belong to?
+    # Which fundraiser-active store(s) do this order's products belong to, and
+    # how many units of each actually carried the markup?
+    #
+    # States are cached per tag: this used to refetch the metaobject for every
+    # tag on every product, which on a multi-line order is dozens of GraphQL
+    # round trips inside Shopify's webhook timeout.
+    state_cache: Dict[str, Dict[str, Any]] = {}
     handle_qty: Dict[str, int] = {}
-    for pid, qty in prod_qty.items():
+    for pid, lines in prod_lines.items():
         for tag in _product_tags(pid):
-            st = _fr_get_state(tag)
-            if st.get("enabled"):
-                handle_qty[tag] = handle_qty.get(tag, 0) + qty
+            if tag not in state_cache:
+                state_cache[tag] = _fr_get_state(tag)
+            st = state_cache[tag]
+            if not st.get("enabled"):
+                continue
+            paid_qty = _fr_collected_qty(st, lines)
+            if paid_qty > 0:
+                handle_qty[tag] = handle_qty.get(tag, 0) + paid_qty
 
     if not handle_qty:
         return JSONResponse({"ok": True, "updated": []})
@@ -3467,6 +3813,165 @@ async def fundraising_order_paid(request: Request):
             print(f"[fundraising] order-paid update failed for {handle}: {e}")
 
     return JSONResponse({"ok": True, "updated": updated})
+
+
+# ----------------------------
+# Fundraising — refunds and cancellations (reverse what was never earned)
+# ----------------------------
+# Only orders/paid was ever handled, so a refunded or cancelled order kept its
+# ledger row and was transferred to the cause on Friday: the shopper got their
+# money back and the cause got paid anyway, out of the platform's pocket.
+#
+# Reversals are appended as negative ledger rows rather than edited into the
+# originals. That keeps the ledger an append-only record of what happened, makes
+# the webhook idempotent on Shopify's retries (the reversal carries its own
+# order_id), and works identically whether or not the original row has already
+# been paid out — an unpaid row is cancelled out inside the same batch, and a
+# paid one nets against the next.
+
+def _fr_reverse_order(handle: str, state: Dict[str, Any], *, original_order_id: str,
+                      reversal_id: str, refunded_qty: int) -> Optional[Dict[str, Any]]:
+    """Build the negative ledger row for a refund, or None if nothing to do."""
+    ledger = state.get("ledger") or []
+    if any(r.get("order_id") == reversal_id for r in ledger):
+        return None  # already reversed (webhook retry)
+
+    original = next(
+        (r for r in ledger if r.get("order_id") == original_order_id and float(r.get("amount", 0)) > 0),
+        None,
+    )
+    if original is None:
+        return None  # never credited — nothing to give back
+
+    credited_qty = int(original.get("qty") or 0)
+    credited_amount = float(original.get("amount") or 0)
+    if credited_qty <= 0 or credited_amount <= 0:
+        return None
+
+    # Never reverse more than was credited. A shopper can be refunded for units
+    # bought before the fundraiser started, or for a product that never carried
+    # the markup, and neither put anything in the ledger.
+    qty = min(int(refunded_qty), credited_qty)
+    if qty <= 0:
+        return None
+    amount = round(credited_amount * (qty / credited_qty), 2)
+
+    return {
+        "order_id": reversal_id,
+        "reverses": original_order_id,
+        "amount": -amount,
+        "qty": -qty,
+        # Dated to the original contribution, not to now: a reversal must be
+        # eligible to offset at least as soon as the row it cancels, otherwise
+        # the refunded money is paid out on Friday and clawed back a week later.
+        "created_at": original.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "paid": False,
+        "kind": "reversal",
+    }
+
+
+def _fr_apply_reversals(reversal_id: str, order_id: str, prod_qty: Dict[str, int]) -> list:
+    """Reverse a refund/cancellation across every fundraiser it touched."""
+    state_cache: Dict[str, Dict[str, Any]] = {}
+    handle_qty: Dict[str, int] = {}
+    for pid, qty in prod_qty.items():
+        if qty <= 0:
+            continue
+        for tag in _product_tags(pid):
+            if tag not in state_cache:
+                state_cache[tag] = _fr_get_state(tag)
+            # Deliberately not gated on enabled: a fundraiser that has since
+            # been stopped can still hold unpaid rows for this order.
+            if not state_cache[tag]:
+                continue
+            handle_qty[tag] = handle_qty.get(tag, 0) + qty
+
+    reversed_handles = []
+    for handle, qty in handle_qty.items():
+        try:
+            state = _fr_get_state(handle)
+            row = _fr_reverse_order(handle, state, original_order_id=order_id,
+                                    reversal_id=reversal_id, refunded_qty=qty)
+            if row is None:
+                continue
+            ledger = state.get("ledger") or []
+            ledger.append(row)
+            state["ledger"] = ledger
+            state["total_raised"] = round(
+                max(0.0, float(state.get("total_raised", 0)) + float(row["amount"])), 2
+            )
+            _fr_set_state(handle, state)
+            _fr_log("ledger:reversed", handle, order_id=order_id,
+                    reversal_id=reversal_id, amount=row["amount"])
+            reversed_handles.append(handle)
+        except Exception as e:
+            print(f"[fundraising] reversal failed for {handle} ({reversal_id}): {e}")
+    return reversed_handles
+
+
+@app.post("/webhooks/fundraising/refund")
+async def fundraising_refund(request: Request):
+    """Shopify refunds/create webhook — reverse the refunded units."""
+    raw = await request.body()
+    if not _verify_shopify_webhook(raw, request.headers.get("X-Shopify-Hmac-Sha256", "")):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        refund = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+
+    refund_id = str(refund.get("id") or "").strip()
+    order_id = str(refund.get("order_id") or "").strip()
+    if not refund_id or not order_id:
+        return JSONResponse({"ok": True, "skipped": "no_refund_or_order_id"})
+
+    prod_qty: Dict[str, int] = {}
+    for rli in (refund.get("refund_line_items") or []):
+        li = (rli or {}).get("line_item") or {}
+        pid = li.get("product_id")
+        if pid is None:
+            continue
+        prod_qty[str(pid)] = prod_qty.get(str(pid), 0) + int((rli or {}).get("quantity") or 0)
+    if not prod_qty:
+        return JSONResponse({"ok": True, "skipped": "no_refunded_line_items"})
+
+    handles = _fr_apply_reversals(f"refund:{refund_id}", order_id, prod_qty)
+    return JSONResponse({"ok": True, "reversed": handles})
+
+
+@app.post("/webhooks/fundraising/order-cancelled")
+async def fundraising_order_cancelled(request: Request):
+    """Shopify orders/cancelled webhook — reverse the whole order.
+
+    A cancellation is not always accompanied by a refunds/create event (an
+    unfulfilled order can be cancelled without one), so this is handled
+    separately. Its reversal id is distinct from any refund's, and
+    _fr_reverse_order caps the total at what was credited, so an order that is
+    both cancelled and refunded cannot be reversed twice over.
+    """
+    raw = await request.body()
+    if not _verify_shopify_webhook(raw, request.headers.get("X-Shopify-Hmac-Sha256", "")):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        order = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return JSONResponse({"error": "bad json"}, status_code=400)
+
+    order_id = str(order.get("id") or "").strip() or str(order.get("order_number") or "").strip()
+    if not order_id:
+        return JSONResponse({"ok": True, "skipped": "no_order_id"})
+
+    prod_qty: Dict[str, int] = {}
+    for li in (order.get("line_items") or []):
+        pid = li.get("product_id")
+        if pid is None:
+            continue
+        prod_qty[str(pid)] = prod_qty.get(str(pid), 0) + int(li.get("quantity") or 0)
+    if not prod_qty:
+        return JSONResponse({"ok": True, "skipped": "no products"})
+
+    handles = _fr_apply_reversals(f"cancel:{order_id}", order_id, prod_qty)
+    return JSONResponse({"ok": True, "reversed": handles})
 
 
 # ----------------------------
