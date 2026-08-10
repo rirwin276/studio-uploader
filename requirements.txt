@@ -2,6 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 pillow==11.1.0
+cairosvg==2.7.1
 requests==2.32.3
 opencv-python-headless==4.11.0.86
 numpy==2.1.3
