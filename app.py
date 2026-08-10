@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 import cv2
+import cairosvg
 import numpy as np
 import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -359,6 +360,27 @@ def _pil_open_safe(data: bytes) -> Image.Image:
         raise ValueError("bad_image")
     except OSError:
         raise ValueError("bad_image")
+
+
+def _is_svg_data(data: bytes) -> bool:
+    head = data[:4096].lstrip().lower()
+    return head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head)
+
+
+def _svg_open_safe(data: bytes) -> Image.Image:
+    """Render an SVG to a transparent PNG for the existing image pipeline."""
+    lowered = data.lower()
+    if any(token in lowered for token in (b"<script", b"<foreignobject", b"<!entity")):
+        raise ValueError("bad_svg")
+    if re.search(rb"(?:href|xlink:href)\s*=\s*['\"]\s*(?:https?:)?//", lowered):
+        raise ValueError("bad_svg")
+    try:
+        png = cairosvg.svg2png(bytestring=data, output_width=TARGET_PX)
+        return _pil_open_safe(png)
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("bad_svg")
 
 
 def _pil_to_png_bytes(img: Image.Image) -> bytes:
@@ -836,6 +858,7 @@ def session_info(session_id: str):
         "status_url": f"/status/{session_id}",
         "finalized": bool(s.get("finalized")),
         "processed_available": processed_available,
+        "is_svg": bool(s.get("is_svg", False)),
         "active_version": active_version,
         "selected": selected,
         "processing": bool(s.get("processing", False)),
@@ -852,14 +875,16 @@ async def upload_image(file: UploadFile = File(...)):
             return JSONResponse({"error": f"File too large (max {MAX_UPLOAD_MB}MB)"}, status_code=413)
         return JSONResponse({"error": "Upload read failed"}, status_code=400)
 
+    is_svg = _is_svg_data(data) or (file.content_type or "").lower() == "image/svg+xml"
+
     try:
-        img = _pil_open_safe(data)
+        img = _svg_open_safe(data) if is_svg else _pil_open_safe(data)
     except ValueError as e:
         if str(e) == "too_many_pixels":
             return JSONResponse({"error": "Image resolution too large. Please upload a smaller image."}, status_code=413)
-        return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
+        return JSONResponse({"error": "Unsupported image. Please upload an SVG, PNG, JPG, or WebP."}, status_code=400)
     except Exception:
-        return JSONResponse({"error": "Unsupported image. Please upload a PNG/JPG/WebP."}, status_code=400)
+        return JSONResponse({"error": "Unsupported image. Please upload an SVG, PNG, JPG, or WebP."}, status_code=400)
 
     session_id = str(uuid.uuid4())
     p = _paths(session_id)
@@ -876,6 +901,7 @@ async def upload_image(file: UploadFile = File(...)):
         finalized=False,
         processing=False,
         processed_available=False,
+        is_svg=is_svg,
         active_version="",
         selected=False,
         error="",
@@ -891,6 +917,7 @@ async def upload_image(file: UploadFile = File(...)):
         "final_image_url": f"/final-file/{session_id}",
         "status_url": f"/status/{session_id}",
         "processed_available": False,
+        "is_svg": is_svg,
         "active_version": "",
         "selected": False,
     }
@@ -902,6 +929,8 @@ def process_session(session_id: str):
         return JSONResponse({"error": "Not found"}, status_code=404)
 
     s = _sess_get(session_id)
+    if s.get("is_svg"):
+        return JSONResponse({"error": "SVG artwork already has transparency; AI cleanup is disabled."}, status_code=409)
     if s.get("processing"):
         return {"status": "ok", "session_id": session_id, "processing": True, "cached": False}
 
