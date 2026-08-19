@@ -255,6 +255,11 @@ def _ensure_gid_customer(customer_id: str) -> str:
     return f"gid://shopify/Customer/{cid_num}"
 
 
+def _normalize_customer_id(customer_id: str) -> str:
+    """Return the bare customer id from a Shopify GID or plain value."""
+    return (customer_id or "").strip().split("/")[-1]
+
+
 def _customer_remove_tag(customer_gid: str, tag: str) -> None:
     """Remove a single tag from a customer (merge-safe)."""
     existing = _get_customer_tags(customer_gid)
@@ -297,6 +302,128 @@ def _customer_add_tag(customer_gid: str, tag: str) -> None:
     errs = (res.get("customerUpdate") or {}).get("userErrors") or []
     if errs:
         raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
+
+
+_STORE_CLAIM_NAMESPACE = "stella_sage"
+_STORE_CLAIM_KEY = "claim_owner_customer_id"
+_STORE_CLAIM_LOCKS: Dict[str, threading.Lock] = {}
+_STORE_CLAIM_LOCKS_GUARD = threading.Lock()
+
+
+def _store_claim_lock(handle: str) -> threading.Lock:
+    """Return a process-local lock that keeps claim retries orderly per store."""
+    with _STORE_CLAIM_LOCKS_GUARD:
+        lock = _STORE_CLAIM_LOCKS.get(handle)
+        if lock is None:
+            lock = threading.Lock()
+            _STORE_CLAIM_LOCKS[handle] = lock
+        return lock
+
+
+def _get_custom_shop(handle: str) -> Optional[Dict[str, Any]]:
+    """Return a custom_shop metaobject and its fields, or None when absent."""
+    metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
+    q = """
+    query GetCustomShopForClaim($handle: MetaobjectHandleInput!) {
+      metaobjectByHandle(handle: $handle) {
+        id
+        fields { key value }
+      }
+    }
+    """
+    data = _shopify_graphql(
+        q,
+        {"handle": {"type": metaobject_type, "handle": handle}},
+    )
+    node = data.get("metaobjectByHandle")
+    if not node:
+        return None
+    return {
+        "id": node["id"],
+        "fields": {f["key"]: f.get("value", "") for f in (node.get("fields") or [])},
+    }
+
+
+def _set_custom_shop_owner(metaobject_id: str, customer_id: str) -> None:
+    """Persist the winning claimant on the existing custom_shop metaobject."""
+    q = """
+    mutation SetCustomShopOwner($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+      metaobjectUpdate(id: $id, metaobject: $metaobject) {
+        metaobject { id }
+        userErrors { field message }
+      }
+    }
+    """
+    data = _shopify_graphql(
+        q,
+        {
+            "id": metaobject_id,
+            "metaobject": {
+                "fields": [
+                    {"key": "owner_customer_id", "value": _normalize_customer_id(customer_id)}
+                ]
+            },
+        },
+    )
+    errs = (data.get("metaobjectUpdate") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"metaobjectUpdate userErrors: {json.dumps(errs)}")
+
+
+def _get_collection_claim_owner(collection_gid: str) -> str:
+    """Return the atomic claim marker stored on a collection, or an empty string."""
+    q = """
+    query GetStoreClaimOwner($id: ID!) {
+      node(id: $id) {
+        ... on Collection {
+          metafield(namespace: "stella_sage", key: "claim_owner_customer_id") {
+            value
+          }
+        }
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"id": collection_gid})
+    raw = (((data.get("node") or {}).get("metafield") or {}).get("value") or "").strip()
+    return _normalize_customer_id(raw)
+
+
+def _try_create_collection_claim(collection_gid: str, customer_id: str) -> bool:
+    """Atomically create the claim marker; return True only for the first writer."""
+    q = """
+    mutation ClaimStore($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id value compareDigest }
+        userErrors { field message code }
+      }
+    }
+    """
+    data = _shopify_graphql(
+        q,
+        {
+            "metafields": [
+                {
+                    "namespace": _STORE_CLAIM_NAMESPACE,
+                    "key": _STORE_CLAIM_KEY,
+                    "ownerId": collection_gid,
+                    "type": "single_line_text_field",
+                    "value": _normalize_customer_id(customer_id),
+                    "compareDigest": None,
+                }
+            ]
+        },
+    )
+    result = data.get("metafieldsSet") or {}
+    errs = result.get("userErrors") or []
+    if errs:
+        # A compare-and-set mismatch means another verified customer won the
+        # race. Everything else is an operational error and must fail closed.
+        codes = {str(e.get("code") or "").upper() for e in errs}
+        messages = " | ".join(str(e.get("message") or "") for e in errs)
+        if "STALE_OBJECT" in codes or "compare" in messages.lower():
+            return False
+        raise RuntimeError(f"metafieldsSet userErrors: {json.dumps(errs)}")
+    return bool(result.get("metafields"))
 
 
 # ----------------------------
@@ -1265,7 +1392,8 @@ def _run_shopify_provision_job(
 # ----------------------------
 @app.post("/api/storefront-request")
 async def storefront_request(
-    customer_id: str = Form(...),
+    request: Request,
+    customer_id: str = Form(""),
     customer_email: str = Form(...),
     storefront_name: str = Form(...),
     storefront_handle: str = Form(...),
@@ -1278,15 +1406,22 @@ async def storefront_request(
     secondary_session_id: Optional[str] = Form(None),
     storefront_logo_file: Optional[UploadFile] = File(None),
     storefront_logo_secondary: Optional[UploadFile] = File(None),
+    claimable: bool = Form(False),
 ):
     if not storefront_name.strip():
         return JSONResponse({"error": "storefront_name is required"}, status_code=400)
     if not storefront_handle.strip():
         return JSONResponse({"error": "storefront_handle is required"}, status_code=400)
-    if not customer_id.strip():
-        return JSONResponse({"error": "customer_id is required"}, status_code=400)
-
-    owner_customer_id = customer_id.split("/")[-1].strip()
+    customer_id = (customer_id or "").strip()
+    if claimable:
+        denied = _require_admin_secret(request)
+        if denied is not None:
+            return denied
+        owner_customer_id = ""
+    else:
+        if not customer_id:
+            return JSONResponse({"error": "customer_id is required"}, status_code=400)
+        owner_customer_id = customer_id.split("/")[-1].strip()
     # type_of_store_direct is the pre-computed slug from the hidden field added by the Shopify form.
     # Use it when present; otherwise derive the slug from org_type + sub-field.
     if type_of_store_direct and type_of_store_direct.strip():
@@ -1386,6 +1521,7 @@ async def storefront_request(
         main_session_id=main_session_id,
         secondary_session_id=secondary_session_id,
         customer_email=customer_email,
+        claimable=claimable,
         primary_color=primary_color_norm,
         created_at=time.time(),
     )
@@ -1575,14 +1711,17 @@ async def storefront_leave(handle: str, request: Request):
 @app.post("/api/storefront/{handle}/join")
 async def storefront_join(handle: str, request: Request):
     """
-    Member self-join for a store.
+    Verified self-join for a store.
     Body JSON: {"customer_id": "<id>"}
-    Returns 200 {"ok": true} on success (idempotent if already a member or admin).
+    Returns 200 {"ok": true} on success.
 
     Auth: requires X-Admin-Secret. Reached only through the Printful_Automation
     relay, which verifies the App Proxy signature and injects the VERIFIED
     logged-in customer id — so the customer_id here is trusted.
-    Grants MEMBER access only, never admin.
+    Normal owner-backed stores grant MEMBER access exactly as before. An
+    explicitly ownerless outreach store is claimable: Shopify's compare-and-set
+    metafield operation selects exactly one first claimant, who receives ADMIN
+    and MEMBER access. Later joiners receive MEMBER access only.
     """
     denied = _require_admin_secret(request)
     if denied is not None:
@@ -1603,6 +1742,7 @@ async def storefront_join(handle: str, request: Request):
     if not handle:
         return JSONResponse({"error": "handle is required"}, status_code=400)
 
+    customer_id = _normalize_customer_id(customer_id)
     print(f"[join] handle={handle!r} customer_id={customer_id!r}")
 
     customer_gid = _ensure_gid_customer(customer_id)
@@ -1619,18 +1759,79 @@ async def storefront_join(handle: str, request: Request):
         print(f"[join] customer not found gid={customer_gid!r}")
         return JSONResponse({"error": "Customer not found"}, status_code=404)
 
-    if member_tag in tags or admin_tag in tags:
-        print(f"[join] already has access handle={handle!r} gid={customer_gid!r}")
-        return {"ok": True, "already_member": True}
+    with _store_claim_lock(handle):
+        try:
+            custom_shop = _get_custom_shop(handle)
+        except Exception as e:
+            print(f"[join] FAILED to load store handle={handle!r}: {e}")
+            return JSONResponse({"error": f"Failed to load store: {e}"}, status_code=502)
 
-    try:
-        _customer_add_tag(customer_gid, member_tag)
-    except Exception as e:
-        print(f"[join] FAILED to add tag {member_tag!r} gid={customer_gid!r}: {e}")
-        return JSONResponse({"error": f"Failed to add member tag: {e}"}, status_code=502)
+        if custom_shop is None:
+            return JSONResponse({"error": "Store not found"}, status_code=404)
 
-    print(f"[join] SUCCESS added {member_tag!r} to gid={customer_gid!r}")
-    return {"ok": True, "member_tag": member_tag}
+        fields = custom_shop["fields"]
+        owner_id = _normalize_customer_id(fields.get("owner_customer_id") or "")
+        collection_gid = (fields.get("collection_gid") or "").strip()
+        claimed_admin = False
+
+        if owner_id:
+            # Preserve the existing member-only join behavior for normal stores.
+            # A claim marker exists only on outreach stores, and lets a retry
+            # repair missing admin tags after a partial first-claim failure.
+            claimed_admin = admin_tag in tags
+            if owner_id == customer_id and collection_gid:
+                try:
+                    claimed_admin = (
+                        _get_collection_claim_owner(collection_gid) == customer_id
+                        or claimed_admin
+                    )
+                except Exception as e:
+                    print(f"[join] claim-marker lookup warning handle={handle!r}: {e}")
+        else:
+            if not collection_gid:
+                return JSONResponse(
+                    {"error": "Store is not ready to be claimed"},
+                    status_code=409,
+                )
+            try:
+                claim_owner_id = _get_collection_claim_owner(collection_gid)
+                if not claim_owner_id:
+                    won_claim = _try_create_collection_claim(collection_gid, customer_id)
+                    claim_owner_id = customer_id if won_claim else _get_collection_claim_owner(collection_gid)
+                if not claim_owner_id:
+                    raise RuntimeError("Claim marker was not available after claim attempt")
+
+                claimed_admin = claim_owner_id == customer_id
+                # Keep the public custom_shop owner field in sync with the
+                # atomic collection marker. Retried requests safely repair a
+                # partial failure from an earlier attempt.
+                _set_custom_shop_owner(custom_shop["id"], claim_owner_id)
+            except Exception as e:
+                print(f"[join] FAILED claim handle={handle!r} gid={customer_gid!r}: {e}")
+                return JSONResponse({"error": f"Failed to claim store: {e}"}, status_code=502)
+
+        try:
+            if claimed_admin:
+                _customer_add_tag(customer_gid, admin_tag)
+            _customer_add_tag(customer_gid, member_tag)
+        except Exception as e:
+            role = "admin/member" if claimed_admin else "member"
+            print(f"[join] FAILED to add {role} tags handle={handle!r} gid={customer_gid!r}: {e}")
+            return JSONResponse({"error": f"Failed to grant store access: {e}"}, status_code=502)
+
+    already_member = member_tag in tags
+    already_admin = admin_tag in tags
+    role = "admin" if claimed_admin else "member"
+    print(f"[join] SUCCESS role={role} handle={handle!r} gid={customer_gid!r}")
+    return {
+        "ok": True,
+        "role": role,
+        "claimed_admin": claimed_admin,
+        "already_member": already_member,
+        "already_admin": already_admin,
+        "member_tag": member_tag,
+        "admin_tag": admin_tag if claimed_admin else None,
+    }
 
 
 @app.post("/api/storefront/{handle}/nuke")
@@ -1791,10 +1992,7 @@ _FR_SUPERADMIN_IDS: frozenset = frozenset(
 
 def _fr_normalize_customer_id(raw: str) -> str:
     """Return the bare numeric id from a gid:// or plain numeric string."""
-    raw = (raw or "").strip()
-    if raw.startswith("gid://"):
-        return raw.split("/")[-1]
-    return raw.split("/")[-1]
+    return _normalize_customer_id(raw)
 
 
 def _fr_caller_is_superadmin(request: Request) -> bool:
