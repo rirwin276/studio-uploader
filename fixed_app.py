@@ -173,3 +173,14 @@ try:
     install_command_center_routes(app, core)
 except Exception:
     log.exception("Could not install Command Center routes")
+
+
+# Repository-controlled outreach manifests run inside Railway, where the
+# existing Shopify and Printful credentials already live.  There is no public
+# trigger route and no admin secret is copied into GitHub or the browser.
+try:
+    from outreach_manifest import install_outreach_manifest_runner
+
+    install_outreach_manifest_runner(core)
+except Exception:
+    log.exception("Could not install outreach manifest runner")
