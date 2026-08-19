@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "action": "delete_store",
-  "run_id": "grrc-rejected-poc-20260819",
-  "storefront_handle": "grand-rapids-rowing-club",
-  "confirm_handle": "grand-rapids-rowing-club",
-  "reason": "User rejected the proof-of-concept logo transparency, edge quality, and dark-garment contrast. No outreach email was sent."
-}
