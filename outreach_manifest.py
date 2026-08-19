@@ -249,8 +249,14 @@ def _process_manifest(core: Any, request: Dict[str, Any]) -> None:
     )
 
 
-def process_pending_manifests(core: Any, outreach_root: Path) -> int:
+def process_pending_manifests(
+    core: Any,
+    outreach_root: Path,
+    *,
+    blocked_handles: set[str] | None = None,
+) -> int:
     """Process enabled request files sequentially; return the number discovered."""
+    blocked = blocked_handles or set()
     pending_dir = outreach_root / "pending"
     paths = sorted(pending_dir.glob("*.json")) if pending_dir.is_dir() else []
     for path in paths:
@@ -266,16 +272,106 @@ def process_pending_manifests(core: Any, outreach_root: Path) -> int:
                 error=f"{path.name}: {exc}",
             )
             continue
+        if request["storefront_handle"] in blocked:
+            core._job_set(
+                request["job_id"],
+                status="skipped_retired",
+                source="repository_outreach_manifest",
+                storefront_handle=request["storefront_handle"],
+                finished_at=time.time(),
+                reason="The same deployment explicitly retires this handle; no rebuild was started.",
+            )
+            continue
         _process_manifest(core, request)
     return len(paths)
 
 
+def _load_retire_manifest(path: Path) -> Dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OutreachManifestError(f"invalid JSON: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise OutreachManifestError("retire manifest root must be an object")
+    if payload.get("enabled") is not True:
+        raise OutreachManifestError("retire manifest is not enabled")
+    if payload.get("action") != "delete_store":
+        raise OutreachManifestError("retire manifest action must be delete_store")
+
+    run_id = _required_text(payload, "run_id").lower()
+    handle = _required_text(payload, "storefront_handle").lower()
+    confirm_handle = _required_text(payload, "confirm_handle").lower()
+    if not _SAFE_RUN_ID.fullmatch(run_id):
+        raise OutreachManifestError("run_id contains unsupported characters")
+    if not _SAFE_HANDLE.fullmatch(handle):
+        raise OutreachManifestError("storefront_handle contains unsupported characters")
+    if confirm_handle != handle:
+        raise OutreachManifestError("confirm_handle must exactly match storefront_handle")
+
+    normalized = dict(payload)
+    normalized.update(
+        run_id=run_id,
+        storefront_handle=handle,
+        job_id=f"outreach-retire-{run_id}",
+        manifest_path=path,
+    )
+    return normalized
+
+
+def process_retire_manifests(core: Any, outreach_root: Path) -> int:
+    """Run explicitly confirmed store deletions before any pending builds."""
+    retire_dir = outreach_root / "retire"
+    paths = sorted(retire_dir.glob("*.json")) if retire_dir.is_dir() else []
+    for path in paths:
+        fallback_job_id = f"outreach-retire-invalid-{path.stem[:40]}"
+        try:
+            request = _load_retire_manifest(path)
+        except OutreachManifestError as exc:
+            core._job_set(
+                fallback_job_id,
+                status="failed",
+                source="repository_outreach_retire_manifest",
+                finished_at=time.time(),
+                error=f"{path.name}: {exc}",
+            )
+            continue
+
+        core._job_set(
+            request["job_id"],
+            status="queued",
+            source="repository_outreach_retire_manifest",
+            handle=request["storefront_handle"],
+            reason=str(request.get("reason") or "").strip(),
+            created_at=time.time(),
+            log=[],
+        )
+        core._run_shopify_deprovision_job(request["job_id"], request["storefront_handle"])
+    return len(paths)
+
+
+def _retired_handles(outreach_root: Path) -> set[str]:
+    """Return valid, explicitly confirmed handles retired by this deployment."""
+    retire_dir = outreach_root / "retire"
+    paths = sorted(retire_dir.glob("*.json")) if retire_dir.is_dir() else []
+    handles: set[str] = set()
+    for path in paths:
+        try:
+            handles.add(_load_retire_manifest(path)["storefront_handle"])
+        except OutreachManifestError:
+            continue
+    return handles
+
+
 def install_outreach_manifest_runner(core: Any, outreach_root: Path | None = None, delay_seconds: float = 3.0) -> bool:
-    """Start one daemon worker when this deployment contains pending requests."""
+    """Start one daemon worker when this deployment contains build/retire requests."""
     global _INSTALLED
     root = Path(outreach_root or (Path(__file__).resolve().parent / "outreach"))
     pending_dir = root / "pending"
-    if not pending_dir.is_dir() or not any(pending_dir.glob("*.json")):
+    retire_dir = root / "retire"
+    has_pending = pending_dir.is_dir() and any(pending_dir.glob("*.json"))
+    has_retire = retire_dir.is_dir() and any(retire_dir.glob("*.json"))
+    if not has_pending and not has_retire:
         return False
 
     with _INSTALL_LOCK:
@@ -286,7 +382,9 @@ def install_outreach_manifest_runner(core: Any, outreach_root: Path | None = Non
     def worker() -> None:
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-        process_pending_manifests(core, root)
+        blocked_handles = _retired_handles(root)
+        process_retire_manifests(core, root)
+        process_pending_manifests(core, root, blocked_handles=blocked_handles)
 
     threading.Thread(target=worker, name="outreach-manifest-runner", daemon=True).start()
     return True
