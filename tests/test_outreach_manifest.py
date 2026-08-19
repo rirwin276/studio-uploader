@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from io import BytesIO
 from pathlib import Path
@@ -16,12 +17,15 @@ def _write_request(root: Path, *, handle: str = "sample-rowing-club") -> Path:
     (root / "logos").mkdir(parents=True)
 
     buf = BytesIO()
-    Image.new("RGBA", (20, 10), (35, 35, 35, 255)).save(buf, format="PNG")
+    source = Image.new("RGBA", (20, 10), (35, 35, 35, 255))
+    source.putpixel((0, 0), (0, 0, 0, 0))
+    source.save(buf, format="PNG")
     (root / "logos" / "sample.png.b64").write_text(
         base64.b64encode(buf.getvalue()).decode("ascii"),
         encoding="ascii",
     )
 
+    prepared = source.resize((40, 20), Image.Resampling.LANCZOS)
     payload = {
         "enabled": True,
         "claimable": True,
@@ -33,6 +37,18 @@ def _write_request(root: Path, *, handle: str = "sample-rowing-club") -> Path:
         "primary_color": "Charcoal",
         "logo_base64_file": "logos/sample.png.b64",
         "logo_preparation": {"target_width": 40},
+        "qa": {
+            "approved": True,
+            "source_reviewed": True,
+            "transparency_reviewed": True,
+            "edge_quality_reviewed": True,
+            "light_background_reviewed": True,
+            "dark_background_reviewed": True,
+            "garment_contrast_reviewed": True,
+            "approved_primary_color": "Charcoal",
+            "minimum_width": 40,
+            "prepared_rgba_sha256": hashlib.sha256(prepared.tobytes()).hexdigest(),
+        },
     }
     path = root / "pending" / "sample.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -129,6 +145,35 @@ def test_logo_path_cannot_escape_outreach_root(tmp_path):
         assert "escapes" in str(exc)
     else:
         raise AssertionError("path traversal should be rejected")
+
+
+def test_manifest_requires_complete_logo_qa(tmp_path):
+    root = tmp_path / "outreach"
+    path = _write_request(root)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["qa"]["edge_quality_reviewed"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    core = FakeCore(tmp_path / "uploads")
+
+    outreach_manifest.process_pending_manifests(core, root)
+
+    assert core.provision_calls == []
+    invalid_jobs = [job for key, job in core.jobs.items() if key.startswith("outreach-invalid-")]
+    assert "edge_quality_reviewed" in invalid_jobs[0]["error"]
+
+
+def test_prepared_logo_must_match_approved_digest(tmp_path):
+    root = tmp_path / "outreach"
+    path = _write_request(root)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["qa"]["prepared_rgba_sha256"] = "0" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    core = FakeCore(tmp_path / "uploads")
+
+    outreach_manifest.process_pending_manifests(core, root)
+
+    assert core.provision_calls == []
+    assert "QA-approved digest" in core.jobs["outreach-sample-20260819"]["error"]
 
 
 def test_connected_background_cleanup_preserves_enclosed_white(tmp_path):
