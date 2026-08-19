@@ -528,7 +528,7 @@ def metaobject_upsert_custom_shop(
     handle: str,
     name: str,
     logo_file_gid: str,
-    owner_customer_id_text: str,
+    owner_customer_id_text: Optional[str],
     collection_gid: str,
     collection_handle: str,
     secondary_logo_file_gid: Optional[str],
@@ -552,13 +552,15 @@ def metaobject_upsert_custom_shop(
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
-        {"key": "owner_customer_id", "value": owner_customer_id_text},
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
         {"key": "status", "value": status_value},
         {"key": "primary_color", "value": primary_color_value},
     ]
+
+    if owner_customer_id_text:
+        fields.append({"key": "owner_customer_id", "value": owner_customer_id_text})
 
     if secondary_logo_file_gid:
         fields.append({"key": "secondary_logo", "value": secondary_logo_file_gid})
@@ -762,14 +764,20 @@ def provision(
     publish_to_all_publications(collection_gid)
     print("✅ Collection published to all publications")
 
-    # 5) Customer tags
-    owner_customer_gid = ensure_gid_customer(owner_customer_id)
+    # 5) Customer tags. Claimable outreach stores intentionally have no owner;
+    # their first verified claimant receives these tags through the join relay.
     admin_tag = f"storefront-admin--{handle}"
     member_tag = f"storefront-member--{handle}"
-    customer_add_tags(owner_customer_gid, [admin_tag, member_tag])
+    customer_tags_added: List[str] = []
+    if owner_customer_id.strip():
+        owner_customer_gid = ensure_gid_customer(owner_customer_id)
+        customer_add_tags(owner_customer_gid, [admin_tag, member_tag])
+        customer_tags_added = [admin_tag, member_tag]
+    else:
+        print("🔐 Claimable store: owner and customer tags deferred until first verified claim")
 
     # 6) Upsert metaobject
-    owner_customer_id_text = normalize_customer_id_value(owner_customer_id)
+    owner_customer_id_text = normalize_customer_id_value(owner_customer_id) or None
     metaobject_id = metaobject_upsert_custom_shop(
         handle=handle,
         name=storefront_name,
@@ -802,7 +810,7 @@ def provision(
         "secondary_logo_url": secondary_file_url,
         "type_of_store": type_of_store,
         "primary_color": primary_color_value,
-        "customer_tags_added": [admin_tag, member_tag],
+        "customer_tags_added": customer_tags_added,
         "printful_automation_url": used_printful_url,
     }
 
@@ -811,7 +819,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True, help="Storefront display name")
     ap.add_argument("--handle", required=True, help="Storefront handle (REQUIRED, passed from app.py)")
-    ap.add_argument("--owner_customer_id", required=True, help="Customer gid or numeric id")
+    ap.add_argument(
+        "--owner_customer_id",
+        default="",
+        help="Customer gid or numeric id; omit for a claimable outreach store",
+    )
     ap.add_argument("--main_session_id", required=True, help="Session id for main logo (uploads/<id>_curr.png)")
     ap.add_argument("--uploads_dir", required=True, help="Uploads directory path")
     ap.add_argument("--secondary_session_id", default="", help="Optional session id for secondary logo")
