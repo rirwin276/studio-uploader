@@ -9,6 +9,11 @@ Logo bytes live as base64 text under `logos/` so the repository deployment can
 carry the exact reviewed artwork without exposing a new upload endpoint or an
 admin secret.
 
+Every build manifest must include a completed `qa` block. The runner verifies
+the approved primary color, transparency, tight crop, minimum output width,
+and the SHA-256 digest of the exact prepared RGBA pixels before provisioning.
+This makes a reviewed logo immutable between approval and the product build.
+
 After a request reaches `succeeded`, remove its JSON and logo payload in a
 cleanup commit. The store itself remains live in Shopify.
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import re
 import threading
@@ -27,6 +28,7 @@ from PIL import Image, UnidentifiedImageError
 
 _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
@@ -72,6 +74,30 @@ def _load_manifest(path: Path, outreach_root: Path) -> Dict[str, Any]:
     if not logo_path.is_file():
         raise OutreachManifestError(f"logo file not found: {logo_rel.as_posix()}")
 
+    qa = payload.get("qa")
+    if not isinstance(qa, dict) or qa.get("approved") is not True:
+        raise OutreachManifestError("qa.approved=true is required")
+    for flag in (
+        "source_reviewed",
+        "transparency_reviewed",
+        "edge_quality_reviewed",
+        "light_background_reviewed",
+        "dark_background_reviewed",
+        "garment_contrast_reviewed",
+    ):
+        if qa.get(flag) is not True:
+            raise OutreachManifestError(f"qa.{flag}=true is required")
+    approved_color = _required_text(qa, "approved_primary_color")
+    primary_color = _required_text(payload, "primary_color")
+    if approved_color.casefold() != primary_color.casefold():
+        raise OutreachManifestError("qa.approved_primary_color must match primary_color")
+    prepared_digest = _required_text(qa, "prepared_rgba_sha256").lower()
+    if not _SHA256.fullmatch(prepared_digest):
+        raise OutreachManifestError("qa.prepared_rgba_sha256 must be a lowercase SHA-256")
+    minimum_width = int(qa.get("minimum_width") or 0)
+    if minimum_width < 1 or minimum_width > 8192:
+        raise OutreachManifestError("qa.minimum_width must be between 1 and 8192")
+
     normalized = dict(payload)
     normalized.update(
         run_id=run_id,
@@ -79,8 +105,9 @@ def _load_manifest(path: Path, outreach_root: Path) -> Dict[str, Any]:
         storefront_name=_required_text(payload, "storefront_name"),
         contact_email=_required_text(payload, "contact_email"),
         type_of_store=_required_text(payload, "type_of_store"),
-        primary_color=_required_text(payload, "primary_color"),
+        primary_color=primary_color,
         logo_path=logo_path,
+        qa=dict(qa),
         manifest_path=path,
         job_id=f"outreach-{run_id}",
     )
@@ -163,6 +190,13 @@ def _prepare_logo(image: Image.Image, request: Dict[str, Any], max_pixels: int) 
         if target_width * target_height > max_pixels:
             raise OutreachManifestError("prepared logo dimensions exceed the image limit")
         prepared = prepared.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    # Canonicalize invisible RGB bytes. Different lossless containers may keep
+    # arbitrary color values under alpha=0; zeroing them makes the reviewed
+    # digest format-independent and prevents matte colors from leaking during
+    # downstream resizing.
+    rgba = np.asarray(prepared.convert("RGBA")).copy()
+    rgba[rgba[:, :, 3] == 0, :3] = 0
+    prepared = Image.fromarray(rgba, "RGBA")
     return prepared
 
 
@@ -191,7 +225,30 @@ def _write_session_logo(core: Any, request: Dict[str, Any]) -> str:
     except (UnidentifiedImageError, OSError) as exc:
         raise OutreachManifestError("decoded logo is not a valid image") from exc
 
-    digest = hashlib.sha256(image.tobytes()).hexdigest()[:12]
+    qa = request["qa"]
+    if image.width < int(qa["minimum_width"]):
+        raise OutreachManifestError("prepared logo is narrower than qa.minimum_width")
+    alpha = image.getchannel("A")
+    alpha_min, alpha_max = alpha.getextrema()
+    if alpha_min != 0 or alpha_max != 255:
+        raise OutreachManifestError("prepared logo must contain both transparent and opaque pixels")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        raise OutreachManifestError("prepared logo has no visible artwork")
+    tolerance_x = max(1, round(image.width * 0.01))
+    tolerance_y = max(1, round(image.height * 0.01))
+    if (
+        bbox[0] > tolerance_x
+        or bbox[1] > tolerance_y
+        or image.width - bbox[2] > tolerance_x
+        or image.height - bbox[3] > tolerance_y
+    ):
+        raise OutreachManifestError("prepared logo still has excess transparent padding")
+    prepared_digest = hashlib.sha256(image.tobytes()).hexdigest()
+    if not hmac.compare_digest(prepared_digest, qa["prepared_rgba_sha256"]):
+        raise OutreachManifestError("prepared logo does not match the QA-approved digest")
+
+    digest = prepared_digest[:12]
     session_id = f"outreach-{request['run_id']}-{digest}"
     session_path = Path(core.UPLOAD_DIR) / f"{session_id}_curr.png"
     session_path.parent.mkdir(parents=True, exist_ok=True)
