@@ -118,7 +118,10 @@ class StoreClaimTests(unittest.TestCase):
     def test_first_claimant_gets_admin_and_member(self):
         store = {
             "id": "gid://shopify/Metaobject/1",
-            "fields": {"collection_gid": "gid://shopify/Collection/1"},
+            "fields": {
+                "owner_customer_id": "unclaimed",
+                "collection_gid": "gid://shopify/Collection/1",
+            },
         }
         with (
             patch.object(app_module, "_get_customer_tags", return_value=[]),
@@ -150,7 +153,10 @@ class StoreClaimTests(unittest.TestCase):
     def test_later_claimant_gets_member_only(self):
         store = {
             "id": "gid://shopify/Metaobject/1",
-            "fields": {"collection_gid": "gid://shopify/Collection/1"},
+            "fields": {
+                "owner_customer_id": "unclaimed",
+                "collection_gid": "gid://shopify/Collection/1",
+            },
         }
         with (
             patch.object(app_module, "_get_customer_tags", return_value=[]),
@@ -253,7 +259,10 @@ class ClaimableProvisionTests(unittest.TestCase):
             )
 
         add_tags.assert_not_called()
-        self.assertIsNone(upsert.call_args.kwargs["owner_customer_id_text"])
+        self.assertEqual(
+            upsert.call_args.kwargs["owner_customer_id_text"],
+            provision_module.UNCLAIMED_OWNER_VALUE,
+        )
         self.assertEqual(result["customer_tags_added"], [])
 
 
