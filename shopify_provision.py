@@ -45,6 +45,7 @@ PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
 COLLECTION_TEMPLATE_SUFFIX = os.getenv("COLLECTION_TEMPLATE_SUFFIX", "private-store").strip()
+UNCLAIMED_OWNER_VALUE = "unclaimed"
 
 # Smart collection rule config (Shopify expects ENUMS)
 COLLECTION_RULE_FIELD = os.getenv("COLLECTION_RULE_FIELD", "TAG").strip()           # TAG / TITLE / ...
@@ -528,7 +529,7 @@ def metaobject_upsert_custom_shop(
     handle: str,
     name: str,
     logo_file_gid: str,
-    owner_customer_id_text: Optional[str],
+    owner_customer_id_text: str,
     collection_gid: str,
     collection_handle: str,
     secondary_logo_file_gid: Optional[str],
@@ -552,15 +553,13 @@ def metaobject_upsert_custom_shop(
     fields = [
         {"key": "name", "value": name},
         {"key": "logo", "value": logo_file_gid},
+        {"key": "owner_customer_id", "value": owner_customer_id_text},
         {"key": "collection_gid", "value": collection_gid},
         {"key": "collection_handle", "value": collection_handle},
         {"key": "is_fully_ready", "value": "true" if is_fully_ready else "false"},
         {"key": "status", "value": status_value},
         {"key": "primary_color", "value": primary_color_value},
     ]
-
-    if owner_customer_id_text:
-        fields.append({"key": "owner_customer_id", "value": owner_customer_id_text})
 
     if secondary_logo_file_gid:
         fields.append({"key": "secondary_logo", "value": secondary_logo_file_gid})
@@ -777,7 +776,7 @@ def provision(
         print("🔐 Claimable store: owner and customer tags deferred until first verified claim")
 
     # 6) Upsert metaobject
-    owner_customer_id_text = normalize_customer_id_value(owner_customer_id) or None
+    owner_customer_id_text = normalize_customer_id_value(owner_customer_id) or UNCLAIMED_OWNER_VALUE
     metaobject_id = metaobject_upsert_custom_shop(
         handle=handle,
         name=storefront_name,
