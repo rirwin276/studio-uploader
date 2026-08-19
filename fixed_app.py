@@ -163,3 +163,13 @@ def admin_store_list_products_fixed(handle: str, request: Request):
             "error": "Unable to load store products from Shopify",
             "detail": str(exc)[:300],
         }, status_code=502)
+
+
+# Command Center metrics and storefront activity are isolated from the upload
+# pipeline so they can be tested and rolled back without touching image flows.
+try:
+    from command_center import install_command_center_routes
+
+    install_command_center_routes(app, core)
+except Exception:
+    log.exception("Could not install Command Center routes")
