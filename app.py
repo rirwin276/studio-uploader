@@ -306,6 +306,7 @@ def _customer_add_tag(customer_gid: str, tag: str) -> None:
 
 _STORE_CLAIM_NAMESPACE = "stella_sage"
 _STORE_CLAIM_KEY = "claim_owner_customer_id"
+_STORE_UNCLAIMED_OWNER = "unclaimed"
 _STORE_CLAIM_LOCKS: Dict[str, threading.Lock] = {}
 _STORE_CLAIM_LOCKS_GUARD = threading.Lock()
 
@@ -318,6 +319,14 @@ def _store_claim_lock(handle: str) -> threading.Lock:
             lock = threading.Lock()
             _STORE_CLAIM_LOCKS[handle] = lock
         return lock
+
+
+def _normalize_store_owner(customer_id: str) -> str:
+    """Return an actual owner id, treating the provisioning sentinel as empty."""
+    owner_id = _normalize_customer_id(customer_id)
+    if owner_id.lower() == _STORE_UNCLAIMED_OWNER:
+        return ""
+    return owner_id
 
 
 def _get_custom_shop(handle: str) -> Optional[Dict[str, Any]]:
@@ -1770,7 +1779,7 @@ async def storefront_join(handle: str, request: Request):
             return JSONResponse({"error": "Store not found"}, status_code=404)
 
         fields = custom_shop["fields"]
-        owner_id = _normalize_customer_id(fields.get("owner_customer_id") or "")
+        owner_id = _normalize_store_owner(fields.get("owner_customer_id") or "")
         collection_gid = (fields.get("collection_gid") or "").strip()
         claimed_admin = False
 
@@ -2078,7 +2087,7 @@ def _fr_get_owner_from_custom_shop(handle: str) -> str:
             return ""
         fields = {f["key"]: f["value"] for f in (node.get("fields") or [])}
         raw = (fields.get("owner_customer_id") or "").strip()
-        return _fr_normalize_customer_id(raw)
+        return _normalize_store_owner(raw)
     except Exception as e:
         print(f"[fundraising] could not read custom_shop owner for {handle}: {e}")
         return ""
