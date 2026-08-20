@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "action": "delete_store",
-  "run_id": "rny-stale-override-reject-20260820",
-  "storefront_handle": "row-new-york",
-  "confirm_handle": "row-new-york",
-  "reason": "Cancel and delete exactly this queued POC so it can rebuild cleanly after saved color overrides were brought under the immutable contrast gate."
-}
