@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "action": "delete_store",
+  "run_id": "rny-contrast-reject-20260820",
+  "storefront_handle": "row-new-york",
+  "confirm_handle": "row-new-york",
+  "reason": "Rejected during garment mockup QA: the thin keyline did not preserve the black mark on dark products. Delete exactly this proof-of-concept before rebuilding under the stricter contrast gate."
+}
