@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "action": "delete_store",
+  "run_id": "grrc-stale-override-reject-20260820",
+  "storefront_handle": "grand-rapids-rowing-club",
+  "confirm_handle": "grand-rapids-rowing-club",
+  "reason": "Second QA rejection: persisted per-product color selections resurrected charcoal/dark-gray variants. Delete exactly this partial POC after the renderer was updated to validate saved overrides."
+}
