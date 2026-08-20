@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "station-l-rowing-poc-20260820",
+  "storefront_name": "Station L Rowing Club Team Store",
+  "storefront_handle": "station-l-rowing-club",
+  "contact_email": "info@stationlrowingclub.com",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/station-l-rowing-club.webp.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "687b9e2ef9318ef038a024d139994e0cf716e956e9fd3290f0e7dc0a554e8676",
+    "notes": "Official blue header artwork was de-matted from white by recovering its antialias coverage, then rebuilt as a single exact #107DC1 layer with transparent background and a tight crop. Light-gray and white-neutral garments are the approved heroes."
+  },
+  "organization_url": "https://stationlrowingclub.com/",
+  "contact_source_url": "https://stationlrowingclub.com/contact-us/",
+  "logo_source_url": "https://stationlrowingclub.com/wp-content/uploads/2014/12/cropped-StationLlogo.png",
+  "qualification_note": "Active Portland 501(c)(3) masters rowing club with a current 2026 calendar, a public role-based contact address, no prior Stella & Sage outreach, and no merchandise storefront found on its official site or sitemap."
+}
