@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "claimable": true,
-  "run_id": "rny-contrast-safe-20260820",
+  "run_id": "rny-final-qa-20260820",
   "storefront_name": "Row New York Team Store",
   "storefront_handle": "row-new-york",
   "contact_email": "info@rownewyork.org",
@@ -22,7 +22,7 @@
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
     "prepared_rgba_sha256": "1a79d5eeca97b5d57d545fcdf5e0990ecf823fcec63bb6513cdca4bb0c0b4731",
-    "notes": "Official black SVG rendered directly at 4K with tight transparent bounds and a thin print-safe white keyline. Dark mockups were explicitly rejected; the immutable garment contrast gate now permits only light neutral products where the complete black mark remains fully visible."
+    "notes": "Official black SVG rendered directly at 4K with tight transparent bounds and a thin print-safe white keyline. Dark mockups were explicitly rejected; the immutable garment contrast gate now permits only light neutral products where the complete black mark remains fully visible. Persisted product color selections are also revalidated and unsafe stale choices are discarded before rendering."
   },
   "organization_url": "https://rownewyork.org/",
   "contact_source_url": "https://rownewyork.org/contact-us/",
