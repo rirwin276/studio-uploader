@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "action": "delete_store",
-  "run_id": "grrc-contrast-reject-20260820",
-  "storefront_handle": "grand-rapids-rowing-club",
-  "confirm_handle": "grand-rapids-rowing-club",
-  "reason": "Rejected during garment mockup QA: black oar handles disappeared on charcoal, black, and navy products. Delete exactly this proof-of-concept before rebuilding under the stricter contrast gate."
-}
