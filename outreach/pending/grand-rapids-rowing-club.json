@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "claimable": true,
-  "run_id": "grrc-rebuild-20260819",
+  "run_id": "grrc-contrast-safe-20260820",
   "storefront_name": "Grand Rapids Rowing Club Team Store",
   "storefront_handle": "grand-rapids-rowing-club",
   "contact_email": "info@grandrapidsrowing.com",
@@ -22,7 +22,7 @@
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
     "prepared_rgba_sha256": "c37aa76311ac1f2621ebf9fbcc71d966370a9ec3019388e840aac4e25b2b330f",
-    "notes": "Rebuilt as exact flat black/red/white layers. Outer background plus the G opening and R counter are transparent; only the oar blade inlays remain white. Gray/light-neutral garments are required so the black handles remain visible."
+    "notes": "Rebuilt as exact flat black/red/white layers. Outer background plus the G opening and R counter are transparent; only the oar blade inlays remain white. The immutable garment contrast gate requires light neutral products so every black handle and outline remains visible."
   },
   "organization_url": "https://grandrapidsrowing.com/",
   "contact_source_url": "https://grandrapidsrowing.com/contact/",
