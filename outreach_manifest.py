@@ -405,7 +405,8 @@ def process_due_followups(core: Any) -> int:
     for handle, state in outreach_tracking.list_all(core).items():
         due = outreach_tracking.parse_iso(state.get("followup_due_at"))
         recipient = str(state.get("contact_email") or "").strip()
-        if state.get("email_authorized", True) is not True or not due or due.timestamp() > now or state.get("followup_sent_at") or not recipient:
+        claimed = str(state.get("claim_status") or "unclaimed").strip().lower() in {"claimed", "active"}
+        if claimed or state.get("email_authorized", True) is not True or not due or due.timestamp() > now or state.get("followup_sent_at") or not recipient:
             continue
         message = _followup_message(state)
         try:

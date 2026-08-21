@@ -175,9 +175,29 @@ except Exception:
     log.exception("Could not install Command Center routes")
 
 
-# Repository-controlled outreach manifests run inside Railway, where the
-# existing Shopify and Printful credentials already live.  There is no public
-# trigger route and no admin secret is copied into GitHub or the browser.
+# Direct outreach submissions reuse the normal Railway/Shopify provisioning
+# pipeline. Prospect metadata and artwork arrive as an authenticated multipart
+# request and are never committed to the deployment repository.
+try:
+    from outreach_direct import install_outreach_direct_routes
+
+    install_outreach_direct_routes(app, core)
+except Exception:
+    log.exception("Could not install direct outreach routes")
+
+
+# The prospect-demo ledger and one-product reservation API are private
+# server-to-server routes used by Printful_Automation's signed App Proxy relay.
+try:
+    from prospect_demo import install_prospect_demo_routes
+
+    install_prospect_demo_routes(app, core)
+except Exception:
+    log.exception("Could not install prospect demo routes")
+
+
+# Keep the legacy maintenance worker for due follow-ups and explicit retire
+# requests. Per-store build manifests are no longer kept in the repository.
 try:
     from outreach_manifest import install_outreach_manifest_runner
 

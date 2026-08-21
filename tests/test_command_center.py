@@ -282,6 +282,11 @@ def test_delete_review_requires_seven_real_tracking_days_and_never_acts_automati
     assert observed["delete_candidate"] is True
     assert observed["automatic_action"] is False
 
+    base["source"] = "direct_outreach_api"
+    direct = _store_decision(base, now=now)
+    assert direct["delete_candidate"] is True
+    assert direct["automatic_action"] is False
+
 
 def test_unknown_source_is_review_only_even_after_no_traction_window():
     store = {

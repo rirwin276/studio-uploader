@@ -1,23 +1,32 @@
-# Outreach store deployment queue
+# Direct outreach automation
 
-Each enabled JSON file in `pending/` is an explicitly claimable store request.
-Railway processes the files sequentially on deployment. The store handle is
-checked against Shopify before provisioning; an existing handle is never
-rebuilt by this runner.
+Prospect records and artwork do not belong in this repository. Automated
+outreach stores are submitted directly to Railway through the authenticated
+multipart route:
 
-Logo bytes live as base64 text under `logos/` so the repository deployment can
-carry the exact reviewed artwork without exposing a new upload endpoint or an
-admin secret.
+`POST /api/outreach/storefront-request`
 
-Every build manifest must include a completed `qa` block. The runner verifies
-the approved primary color, transparency, tight crop, minimum output width,
-and the SHA-256 digest of the exact prepared RGBA pixels before provisioning.
-This makes a reviewed logo immutable between approval and the product build.
+The request uses the existing `X-Admin-Secret` authentication and uploads the
+reviewed logo as `storefront_logo_file`. The response includes the build job
+id, preview URL, and first-claimant administration URL. Status is available at
+`GET /api/outreach/job/{job_id}` using the same header.
 
-After a request reaches `succeeded`, remove its JSON and logo payload in a
-cleanup commit. The store itself remains live in Shopify.
+`submit_outreach_store.py` is the reusable low-cost worker client. It defaults
+to the production studio-uploader Railway URL and reads the secret from
+`OUTREACH_API_SECRET` or `ADMIN_SECRET`; secrets are never stored in source
+control. The client handles status polling internally so an AI model receives
+only the final job result instead of spending reasoning calls watching
+Printful.
 
-An explicitly confirmed JSON file under `retire/` deletes exactly one store.
-It must use `action: delete_store` and repeat the exact handle in
-`confirm_handle`. Retirement runs before new builds and retains the backend's
-fundraiser-safety checks.
+The direct route defaults email authorization off, raises the tri-blend and
+kids hoodie artwork by approximately one inch, prevents duplicate builds by
+store handle, and records build state in the Shopify outreach-tracking
+metaobject used by the Command Center.
+
+After the initial email is actually sent, call:
+
+`POST /api/outreach/store/{handle}/mark-sent`
+
+That starts the three-day follow-up and seven-day deletion-review clocks. Store
+deletion continues to use the authenticated `/api/storefront/{handle}/nuke`
+route so fundraiser safeguards remain in force.
