@@ -1,0 +1,35 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "lake-merritt-rowing-club-20260821",
+  "storefront_name": "Lake Merritt Rowing Club Team Store",
+  "storefront_handle": "lake-merritt-rowing-club",
+  "contact_email": "membership@lakemerrittrowingclub.org",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/lake-merritt-rowing-club.webp.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "placement_profile": {
+    "bc3413_front_vertical_offset_px": -300,
+    "cc1467y_front_vertical_offset_px": -300
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "15e7ac9c2f9e8a0644591c32db7e7886153c4970f34156694bd0309a5bdffa25",
+    "notes": "Official Lake Merritt Rowing Club shield was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments keep the navy, red, and white shield visible."
+  },
+  "organization_url": "https://www.lakemerrittrowingclub.org/",
+  "contact_source_url": "https://www.lakemerrittrowingclub.org/contact-us",
+  "logo_source_url": "https://images.squarespace-cdn.com/content/v1/591890838419c282a86b84c7/1526998242288-CFHFT7UKU4V8P56H3F41/lmrc-logo-master.png?format=1500w",
+  "qualification_note": "Active rowing club with a public organizational contact and no dedicated merchandise storefront found on the official site during this qualification pass."
+}

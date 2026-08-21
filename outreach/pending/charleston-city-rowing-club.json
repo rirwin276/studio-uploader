@@ -1,0 +1,35 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "charleston-city-rowing-club-20260821",
+  "storefront_name": "Charleston City Rowing Club Team Store",
+  "storefront_handle": "charleston-city-rowing-club",
+  "contact_email": "charlestonrows@gmail.com",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/charleston-city-rowing-club.webp.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "placement_profile": {
+    "bc3413_front_vertical_offset_px": -300,
+    "cc1467y_front_vertical_offset_px": -300
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "cc0d5bb4662baa49d50b74530ee0076a380f5b145ed6be099591655fbe135494",
+    "notes": "Official Charleston City Rowing Club artwork was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments are required because the deep blue artwork needs contrast."
+  },
+  "organization_url": "https://www.charlestonrows.org/",
+  "contact_source_url": "https://www.charlestonrows.org/contact",
+  "logo_source_url": "https://images.squarespace-cdn.com/content/v1/5e35d34859e605777fc17d56/1583113781364-XP2VC04Q61LVWX7ULG7A/ccrc-logo62.png?format=1500w",
+  "qualification_note": "Active rowing club with a public organizational contact and no dedicated merchandise storefront found on the official site during this qualification pass."
+}
