@@ -1,0 +1,35 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "buffalo-river-rowing-club-20260821",
+  "storefront_name": "Buffalo River Rowing Club Team Store",
+  "storefront_handle": "buffalo-river-rowing-club",
+  "contact_email": "info@buffaloriverrowing.org",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/buffalo-river-rowing-club.png.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "placement_profile": {
+    "bc3413_front_vertical_offset_px": -300,
+    "cc1467y_front_vertical_offset_px": -300
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "48a1dd936c4faa30195bb2b7b5b027a2b3b816878d2c8c68bd5dd4768d5ae670",
+    "notes": "Official Buffalo River Rowing Club shield was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments preserve the navy, green, and white artwork."
+  },
+  "organization_url": "https://www.buffaloriverrowing.org/",
+  "contact_source_url": "https://www.buffaloriverrowing.org/contact",
+  "logo_source_url": "https://images.squarespace-cdn.com/content/v1/66253f8d37b7bc3b18a1fa21/a6a2f578-defe-40f4-a869-a01471abc063/brrc-nobg.png?format=1500w",
+  "qualification_note": "Active rowing club with a public organizational contact and no dedicated merchandise storefront found on the official site during this qualification pass."
+}
