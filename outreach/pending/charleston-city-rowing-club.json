@@ -25,7 +25,7 @@
     "garment_contrast_reviewed": true,
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
-    "prepared_rgba_sha256": "cc0d5bb4662baa49d50b74530ee0076a380f5b145ed6be099591655fbe135494",
+    "prepared_rgba_sha256": "87c1666e1e5bde833e32e385be521de3e3b8a6b91a9568c9e292841114cd352f",
     "notes": "Official Charleston City Rowing Club artwork was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments are required because the deep blue artwork needs contrast."
   },
   "organization_url": "https://www.charlestonrows.org/",
