@@ -14,10 +14,13 @@ import binascii
 import hashlib
 import hmac
 import json
+import os
 import re
+import smtplib
 import threading
 import time
 from collections import deque
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict
@@ -25,12 +28,20 @@ from typing import Any, Dict
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
+import outreach_tracking
+
 
 _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
+DEFAULT_PLACEMENT_PROFILE = {
+    # Print files are 300 dpi; -300 moves the artwork up by approximately one
+    # inch on the two garments used for cold-outreach previews.
+    "bc3413_front_vertical_offset_px": -300,
+    "cc1467y_front_vertical_offset_px": -300,
+}
 
 
 class OutreachManifestError(ValueError):
@@ -98,6 +109,20 @@ def _load_manifest(path: Path, outreach_root: Path) -> Dict[str, Any]:
     if minimum_width < 1 or minimum_width > 8192:
         raise OutreachManifestError("qa.minimum_width must be between 1 and 8192")
 
+    placement_profile = payload.get("placement_profile") or dict(DEFAULT_PLACEMENT_PROFILE)
+    if not isinstance(placement_profile, dict):
+        raise OutreachManifestError("placement_profile must be an object")
+    normalized_placement: Dict[str, float] = {}
+    for key, default in DEFAULT_PLACEMENT_PROFILE.items():
+        raw = placement_profile.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise OutreachManifestError(f"placement_profile.{key} must be numeric") from exc
+        if value < -2000 or value > 2000:
+            raise OutreachManifestError(f"placement_profile.{key} must be between -2000 and 2000")
+        normalized_placement[key] = int(value) if value.is_integer() else value
+
     normalized = dict(payload)
     normalized.update(
         run_id=run_id,
@@ -110,6 +135,7 @@ def _load_manifest(path: Path, outreach_root: Path) -> Dict[str, Any]:
         qa=dict(qa),
         manifest_path=path,
         job_id=f"outreach-{run_id}",
+        placement_profile=normalized_placement,
     )
     return normalized
 
@@ -261,6 +287,26 @@ def _write_session_logo(core: Any, request: Dict[str, Any]) -> str:
 def _process_manifest(core: Any, request: Dict[str, Any]) -> None:
     job_id = request["job_id"]
     handle = request["storefront_handle"]
+    created_at = time.time()
+    created_at_utc = str(request.get("sent_at_utc") or outreach_tracking.utc_iso(created_at))
+    tracking_state = {
+        "handle": handle,
+        "storefront_name": request["storefront_name"],
+        "contact_email": request["contact_email"],
+        "source": "cold_outreach",
+        "created_at": created_at_utc,
+        "sent_at": created_at_utc,
+        "followup_due_at": outreach_tracking.add_days_iso(created_at_utc, 3),
+        "delete_due_at": outreach_tracking.add_days_iso(created_at_utc, 7),
+        "followup_sent_at": None,
+        "status": "building",
+        "claim_status": "unclaimed",
+        "placement_profile": request["placement_profile"],
+    }
+    try:
+        outreach_tracking.upsert(core, handle, tracking_state)
+    except Exception as exc:
+        print(f"⚠️ outreach tracking unavailable for {handle}: {exc}")
     core._job_set(
         job_id,
         status="queued",
@@ -269,7 +315,7 @@ def _process_manifest(core: Any, request: Dict[str, Any]) -> None:
         storefront_handle=handle,
         contact_email=request["contact_email"],
         claimable=True,
-        created_at=time.time(),
+        created_at=created_at,
     )
 
     try:
@@ -279,6 +325,10 @@ def _process_manifest(core: Any, request: Dict[str, Any]) -> None:
         return
 
     if existing is not None:
+        try:
+            outreach_tracking.update(core, handle, {"status": "existing_store"})
+        except Exception as exc:
+            print(f"⚠️ outreach tracking update unavailable for {handle}: {exc}")
         core._job_set(
             job_id,
             status="skipped_existing",
@@ -303,7 +353,73 @@ def _process_manifest(core: Any, request: Dict[str, Any]) -> None:
         request["primary_color"],
         session_id,
         None,
+        request["placement_profile"],
     )
+    try:
+        outreach_tracking.update(core, handle, {
+            "built_at": outreach_tracking.utc_iso(),
+            "status": "provisioned",
+        })
+    except Exception as exc:
+        print(f"⚠️ outreach tracking completion unavailable for {handle}: {exc}")
+
+
+def _followup_message(state: Dict[str, Any]) -> EmailMessage:
+    handle = str(state.get("handle") or "").strip()
+    name = str(state.get("storefront_name") or handle).strip()
+    preview = f"https://stellasageco.com/collections/{handle}?preview=1"
+    claim = f"https://stellasageco.com/pages/join-store?shop={handle}"
+    message = EmailMessage()
+    message["Subject"] = f"Quick follow-up: {name} private store"
+    message["To"] = str(state.get("contact_email") or "").strip()
+    message["From"] = os.getenv("SMTP_USER", "").strip()
+    message.set_content(
+        f"""Hello {name} team,
+
+Just a quick follow-up on the private, unofficial {name} spirit-wear concept:
+{preview}
+
+If an authorized person claims the store, you can easily edit shirt and hoodie colors, move or resize the logo, add artwork, and add products from the admin dashboard. The first verified account to use the private claim link becomes the store administrator:
+{claim}
+
+If it is not useful, reply “no” and I will remove the private concept and artwork.
+
+Ryan Irwin
+Founder, Stella & Sage Co.
+Veteran Owned and Operated
+"""
+    )
+    return message
+
+
+def process_due_followups(core: Any) -> int:
+    """Send due follow-ups using SMTP; leave them pending when SMTP is unset."""
+    host = os.getenv("SMTP_HOST", "").strip()
+    user = os.getenv("SMTP_USER", "").strip()
+    password = os.getenv("SMTP_PASS", "").strip()
+    if not host or not user or not password:
+        return 0
+    now = time.time()
+    sent = 0
+    for handle, state in outreach_tracking.list_all(core).items():
+        due = outreach_tracking.parse_iso(state.get("followup_due_at"))
+        recipient = str(state.get("contact_email") or "").strip()
+        if not due or due.timestamp() > now or state.get("followup_sent_at") or not recipient:
+            continue
+        message = _followup_message(state)
+        try:
+            with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=20) as server:
+                server.starttls()
+                server.login(user, password)
+                server.send_message(message)
+            outreach_tracking.update(core, handle, {
+                "followup_sent_at": outreach_tracking.utc_iso(),
+                "status": "followup_sent",
+            })
+            sent += 1
+        except Exception as exc:
+            print(f"⚠️ follow-up failed for {handle}: {exc}")
+    return sent
 
 
 def process_pending_manifests(
@@ -421,14 +537,15 @@ def _retired_handles(outreach_root: Path) -> set[str]:
 
 
 def install_outreach_manifest_runner(core: Any, outreach_root: Path | None = None, delay_seconds: float = 3.0) -> bool:
-    """Start one daemon worker when this deployment contains build/retire requests."""
+    """Start the low-cost build/retire/follow-up worker for this deployment."""
     global _INSTALLED
     root = Path(outreach_root or (Path(__file__).resolve().parent / "outreach"))
     pending_dir = root / "pending"
     retire_dir = root / "retire"
     has_pending = pending_dir.is_dir() and any(pending_dir.glob("*.json"))
     has_retire = retire_dir.is_dir() and any(retire_dir.glob("*.json"))
-    if not has_pending and not has_retire:
+    scheduler_enabled = os.getenv("OUTREACH_FOLLOWUP_SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y"}
+    if not has_pending and not has_retire and not scheduler_enabled:
         return False
 
     with _INSTALL_LOCK:
@@ -442,6 +559,15 @@ def install_outreach_manifest_runner(core: Any, outreach_root: Path | None = Non
         blocked_handles = _retired_handles(root)
         process_retire_manifests(core, root)
         process_pending_manifests(core, root, blocked_handles=blocked_handles)
+        if not scheduler_enabled:
+            return
+        interval = max(300, int(os.getenv("OUTREACH_FOLLOWUP_INTERVAL_S", "900")))
+        while True:
+            try:
+                process_due_followups(core)
+            except Exception as exc:
+                print(f"⚠️ outreach follow-up scan failed: {exc}")
+            time.sleep(interval)
 
     threading.Thread(target=worker, name="outreach-manifest-runner", daemon=True).start()
     return True

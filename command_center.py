@@ -28,6 +28,8 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+import outreach_tracking
+
 
 _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9._:-]{8,160}$")
@@ -639,6 +641,13 @@ def _aggregate_orders(
 def _store_decision(store: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """Classify traction without ever taking an automatic store action."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    outreach = store.get("outreach") or {}
+    delete_due = _parse_datetime(outreach.get("delete_due_at"))
+    outreach_delete_eligible = bool(
+        delete_due
+        and delete_due <= current
+        and str(outreach.get("claim_status") or "unclaimed").strip().lower() not in {"claimed", "active"}
+    )
     age_days = _age_days(store.get("created_at"), now=current)
     activity = store.get("activity") or {}
     customers = store.get("customers") or {}
@@ -707,6 +716,8 @@ def _store_decision(store: Dict[str, Any], *, now: Optional[datetime] = None) ->
 
     if review_candidate and not is_cold_outreach:
         reasons.append("Confirm this is a cold-outreach store before deleting")
+    if outreach_delete_eligible:
+        reasons.append("Outreach retention window reached; review the deletion queue")
 
     return {
         "traction": traction,
@@ -716,6 +727,8 @@ def _store_decision(store: Dict[str, Any], *, now: Optional[datetime] = None) ->
         "reasons": reasons,
         "review_candidate": review_candidate,
         "delete_candidate": delete_candidate,
+        "outreach_delete_eligible": outreach_delete_eligible,
+        "delete_after_at": outreach.get("delete_due_at"),
         "automatic_action": False,
     }
 
@@ -738,6 +751,11 @@ def _cache_set(payload: Dict[str, Any]) -> None:
 
 def _build_summary(core) -> Dict[str, Any]:
     store_nodes = _store_nodes(core)
+    outreach_states: Dict[str, Dict[str, Any]] = {}
+    try:
+        outreach_states = outreach_tracking.list_all(core)
+    except Exception as exc:
+        outreach_states = {}
     stores: list[Dict[str, Any]] = []
     for node in store_nodes:
         handle = _normalized_handle(str(node.get("handle") or ""))
@@ -762,6 +780,22 @@ def _build_summary(core) -> Dict[str, Any]:
             "created_at": fields.get("created_at") or fields.get("createdAt") or None,
             "updated_at": fields.get("updated_at") or fields.get("updatedAt") or None,
         })
+        outreach = outreach_states.get(handle)
+        if outreach:
+            store = stores[-1]
+            store["outreach"] = dict(outreach)
+            # Repository outreach timestamps are the canonical order for new
+            # stores; legacy stores continue to use their collection timestamp.
+            store["created_at"] = outreach.get("built_at") or outreach.get("created_at") or store.get("created_at")
+            store["build_timestamp"] = outreach.get("built_at") or outreach.get("created_at")
+            now = datetime.now(timezone.utc)
+            delete_due = _parse_datetime(outreach.get("delete_due_at"))
+            followup_due = _parse_datetime(outreach.get("followup_due_at"))
+            claimed = str(outreach.get("claim_status") or "unclaimed").strip().lower() in {"claimed", "active"}
+            store["outreach"]["delete_eligible"] = bool(delete_due and delete_due <= now and not claimed)
+            store["outreach"]["followup_due"] = bool(
+                followup_due and followup_due <= now and not outreach.get("followup_sent_at")
+            )
     handles = {store["handle"] for store in stores}
 
     scopes: set[str] = set()
@@ -923,16 +957,32 @@ def _build_summary(core) -> Dict[str, Any]:
     stores.sort(key=lambda row: (row.get("name") or row["handle"]).lower())
     stores.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
     decisions = [store.get("decision") or {} for store in stores]
+    deletion_queue = [
+        {
+            "handle": store["handle"],
+            "name": store["name"],
+            "delete_due_at": (store.get("outreach") or {}).get("delete_due_at"),
+            "claim_status": (store.get("outreach") or {}).get("claim_status") or "unclaimed",
+            "status": (store.get("outreach") or {}).get("status") or store.get("status"),
+            "reason": "7-day cold-outreach retention window reached; review before explicit deletion",
+        }
+        for store in stores
+        if (store.get("outreach") or {}).get("delete_eligible")
+    ]
+    followups_due = sum(1 for store in stores if (store.get("outreach") or {}).get("followup_due"))
     highlights = {
         "newest_store": ({
             "handle": newest_store["handle"],
             "name": newest_store["name"],
             "created_at": newest_store.get("created_at"),
             "age_days": (newest_store.get("decision") or {}).get("age_days"),
+            "build_timestamp": newest_store.get("build_timestamp"),
         } if newest_store else None),
         "newest_product": newest_product,
         "latest_purchase": global_order_stats.get("latest_purchase"),
         "latest_non_super_admin_session": latest_non_super_session,
+        "deletion_queue": deletion_queue,
+        "followups_due": followups_due,
     }
 
     return {
@@ -959,6 +1009,9 @@ def _build_summary(core) -> Dict[str, Any]:
             "needs_attention": sum(1 for decision in decisions if decision.get("needs_attention")),
             "review_candidates": sum(1 for decision in decisions if decision.get("review_candidate")),
             "delete_candidates": sum(1 for decision in decisions if decision.get("delete_candidate")),
+            "outreach_stores": sum(1 for store in stores if store.get("outreach")),
+            "followups_due": followups_due,
+            "outreach_delete_queue": len(deletion_queue),
         },
         "highlights": highlights,
         "recent_activity": sorted(
