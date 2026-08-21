@@ -7,7 +7,7 @@
   "contact_email": "info@buffaloriverrowing.org",
   "type_of_store": "rowing",
   "primary_color": "Gray",
-  "logo_base64_file": "logos/buffalo-river-rowing-club.png.b64",
+  "logo_base64_file": "logos/buffalo-river-rowing-club.webp.b64",
   "logo_preparation": {
     "target_width": 4096
   },
@@ -25,7 +25,7 @@
     "garment_contrast_reviewed": true,
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
-    "prepared_rgba_sha256": "48a1dd936c4faa30195bb2b7b5b027a2b3b816878d2c8c68bd5dd4768d5ae670",
+    "prepared_rgba_sha256": "3e53f914c34c99531ec6e0bdf29e396e36dd7888217c08da30685e66fbfed500",
     "notes": "Official Buffalo River Rowing Club shield was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments preserve the navy, green, and white artwork."
   },
   "organization_url": "https://www.buffaloriverrowing.org/",
