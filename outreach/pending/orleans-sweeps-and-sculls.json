@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "orleans-sweeps-sculls-20260821",
+  "storefront_name": "Orleans Sweeps and Sculls Team Store",
+  "storefront_handle": "orleans-sweeps-and-sculls",
+  "contact_email": "ossrowing@hotmail.com",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/orleans-sweeps-and-sculls.webp.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "3bb1be7c812541720b6ad1466c1df65f079d09f4c37135bca9ff4f3f59a611a0",
+    "notes": "Official artwork was deterministically unmatted and tightly cropped. White background and letter counters are transparent; the intentional white Cape Cod silhouette inside the official blue badge is preserved. Use gray/light-neutral garments for the black club-name line."
+  },
+  "organization_url": "https://www.ossrowing.com/",
+  "contact_source_url": "https://www.ossrowing.com/",
+  "logo_source_url": "https://images.squarespace-cdn.com/content/v1/658f35ede0a4d55a9d120568/ff7df140-4a21-4c60-b3cf-f2b0931c5e99/OSS_web_logo1.jpg?format=1500w",
+  "qualification_note": "Active nonprofit Cape Cod rowing club with current programs, a public club email, and no merchandise storefront found on its official site."
+}
