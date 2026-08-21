@@ -1317,6 +1317,7 @@ def _run_shopify_provision_job(
     primary_color: Optional[str],
     main_session_id: str,
     secondary_session_id: Optional[str],
+    placement_profile: Optional[Dict[str, Any]] = None,
 ):
     _job_set(job_id, status="running", started_at=time.time())
 
@@ -1345,6 +1346,8 @@ def _run_shopify_provision_job(
         cmd += ["--type_of_store", type_of_store]
     if primary_color:
         cmd += ["--primary_color", primary_color]
+    if placement_profile:
+        cmd += ["--placement_profile", json.dumps(placement_profile, separators=(",", ":"))]
 
     print("🚀 Provision cmd:", " ".join(cmd))
 

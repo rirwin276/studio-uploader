@@ -638,7 +638,12 @@ def _post_json(url: str, payload: Dict[str, Any], bearer_token: str = "") -> req
     raise RuntimeError(f"POST {url} failed after {_POST_MAX_ATTEMPTS} attempts")
 
 
-def trigger_printful_automation(store_handle: str, type_of_store: str, primary_color: str) -> str:
+def trigger_printful_automation(
+    store_handle: str,
+    type_of_store: str,
+    primary_color: str,
+    placement_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     Tries these endpoints in order:
       1) /run
@@ -650,6 +655,8 @@ def trigger_printful_automation(store_handle: str, type_of_store: str, primary_c
         "type_of_store": type_of_store or "",
         "primary_color": primary_color or "",
     }
+    if placement_profile:
+        payload["placement_profile"] = dict(placement_profile)
 
     candidates = [
         f"{PRINTFUL_AUTOMATION_BASE.rstrip('/')}/trigger_automation",
@@ -702,6 +709,7 @@ def provision(
     secondary_session_id: Optional[str] = None,
     type_of_store: Optional[str] = None,
     primary_color: Optional[str] = None,
+    placement_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     handle = (storefront_handle or "").strip()
     if not handle:
@@ -796,6 +804,7 @@ def provision(
         store_handle=handle,
         type_of_store=(type_of_store or ""),
         primary_color=primary_color_value,
+        placement_profile=placement_profile,
     )
     print("🧵 Printful Automation trigger complete")
 
@@ -828,6 +837,7 @@ def main():
     ap.add_argument("--secondary_session_id", default="", help="Optional session id for secondary logo")
     ap.add_argument("--type_of_store", default="", help="Optional type_of_store field")
     ap.add_argument("--primary_color", default="", help="Optional primary color (single-line text)")
+    ap.add_argument("--placement_profile", default="", help="Optional JSON object for future garment placement adjustments")
 
     args = ap.parse_args()
 
@@ -838,6 +848,15 @@ def main():
     secondary_session_id = args.secondary_session_id.strip() or None
     type_of_store = args.type_of_store.strip() or None
     primary_color = args.primary_color.strip() or "No preference"
+    placement_profile: Optional[Dict[str, Any]] = None
+    if args.placement_profile.strip():
+        try:
+            parsed_placement = json.loads(args.placement_profile)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"placement_profile must be valid JSON: {exc}") from exc
+        if not isinstance(parsed_placement, dict):
+            raise RuntimeError("placement_profile must be a JSON object")
+        placement_profile = parsed_placement
 
     result = provision(
         storefront_name=args.name.strip(),
@@ -848,6 +867,7 @@ def main():
         secondary_session_id=secondary_session_id,
         type_of_store=type_of_store,
         primary_color=primary_color,
+        placement_profile=placement_profile,
     )
 
     print("========== PROVISION RESULT ==========")
