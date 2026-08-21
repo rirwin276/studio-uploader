@@ -186,6 +186,16 @@ except Exception:
     log.exception("Could not install direct outreach routes")
 
 
+# The prospect-demo ledger and one-product reservation API are private
+# server-to-server routes used by Printful_Automation's signed App Proxy relay.
+try:
+    from prospect_demo import install_prospect_demo_routes
+
+    install_prospect_demo_routes(app, core)
+except Exception:
+    log.exception("Could not install prospect demo routes")
+
+
 # Keep the legacy maintenance worker for due follow-ups and explicit retire
 # requests. Per-store build manifests are no longer kept in the repository.
 try:

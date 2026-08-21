@@ -664,7 +664,13 @@ def _store_decision(store: Dict[str, Any], *, now: Optional[datetime] = None) ->
     non_founder_sessions = int(activity.get("non_super_admin_sessions") or 0)
     product_count = int(products.get("total") or 0)
     source = str(store.get("source") or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
-    is_cold_outreach = source in {"cold_outreach", "outreach", "cold_email", "prospecting"}
+    is_cold_outreach = source in {
+        "cold_outreach",
+        "direct_outreach_api",
+        "outreach",
+        "cold_email",
+        "prospecting",
+    }
 
     reasons: list[str] = []
     if not sales_known:
@@ -903,8 +909,30 @@ def _build_summary(core) -> Dict[str, Any]:
             "recent_sessions": activity.get("recent_activity") or [],
             "source": "first_party_storefront_tracker",
         }
+        outreach_state = store.get("outreach") or {}
+        demo = outreach_state.get("prospect_demo") or {}
+        if outreach_state.get("source") == "direct_outreach_api" and isinstance(demo, dict):
+            raw_counts = demo.get("event_counts") or {}
+            counts = raw_counts if isinstance(raw_counts, dict) else {}
+            store["prospect_demo"] = {
+                "enabled": bool(demo.get("enabled", True)),
+                "product_limit": 1,
+                "product_status": demo.get("product_status") or "available",
+                "product_model": demo.get("product_model"),
+                "product_id": demo.get("product_id"),
+                "product_handle": demo.get("product_handle"),
+                "completed_at": demo.get("completed_at"),
+                "event_counts": counts,
+                "events": list(demo.get("events") or [])[-25:],
+                "admin_demo_opened": bool(int((counts or {}).get("admin_demo_opened") or 0)),
+                "customizer_used": bool(int((counts or {}).get("store_appearance_changed") or 0)),
+                "product_builder_completed": bool(int((counts or {}).get("demo_product_successfully_created") or 0)),
+                "claim_attempted": bool(int((counts or {}).get("authentication_started") or 0)),
+            }
         store["recent_activity"] = sorted(
-            list(store["activity"]["recent_sessions"]) + list(sales.get("recent_purchases") or []),
+            list(store["activity"]["recent_sessions"])
+            + list(sales.get("recent_purchases") or [])
+            + list((store.get("prospect_demo") or {}).get("events") or []),
             key=lambda row: str(row.get("at") or row.get("created_at") or ""),
             reverse=True,
         )[:25]

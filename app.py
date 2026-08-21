@@ -1834,6 +1834,15 @@ async def storefront_join(handle: str, request: Request):
     already_member = member_tag in tags
     already_admin = admin_tag in tags
     role = "admin" if claimed_admin else "member"
+    if claimed_admin:
+        # Outreach/demo bookkeeping is additive and must never turn a
+        # successful atomic Shopify claim into a failed join response.
+        try:
+            from prospect_demo import mark_claimed
+
+            mark_claimed(__import__(__name__), handle, customer_id)
+        except Exception as e:
+            print(f"[join] prospect-demo claim tracking warning handle={handle!r}: {e}")
     print(f"[join] SUCCESS role={role} handle={handle!r} gid={customer_gid!r}")
     return {
         "ok": True,

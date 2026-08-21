@@ -163,6 +163,7 @@ def _run_direct_job(
             {
                 "built_at": outreach_tracking.utc_iso(),
                 "status": "provisioned",
+                "store_status": "prospect_unclaimed",
             },
         )
         return
@@ -284,6 +285,10 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
             "delete_due_at": None,
             "followup_sent_at": None,
             "status": "building",
+            # Canonical server-controlled state for the anonymous prospect
+            # admin demo.  The relay enables demo controls only while this
+            # value and claim_status both remain unclaimed.
+            "store_status": "prospect_unclaimed",
             "claim_status": "unclaimed",
             "placement_profile": dict(DEFAULT_PLACEMENT_PROFILE),
             "screening_confirmed": True,
