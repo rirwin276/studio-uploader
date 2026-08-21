@@ -6,14 +6,17 @@ multipart route:
 
 `POST /api/outreach/storefront-request`
 
-The request uses the existing `X-Admin-Secret` authentication and uploads the
-reviewed logo as `storefront_logo_file`. The response includes the build job
-id, preview URL, and first-claimant administration URL. Status is available at
-`GET /api/outreach/job/{job_id}` using the same header.
+The request prefers the outreach-only `X-Outreach-Secret` authentication backed
+by a production `OUTREACH_API_SECRET` of at least 32 characters and uploads the
+reviewed logo as `storefront_logo_file`. Existing `X-Admin-Secret`
+authentication remains available for backward compatibility. The response
+includes the build job id, preview URL, and first-claimant administration URL.
+Status is available at `GET /api/outreach/job/{job_id}` using the same header.
 
 `submit_outreach_store.py` is the reusable low-cost worker client. It defaults
-to the production studio-uploader Railway URL and reads the secret from
-`OUTREACH_API_SECRET` or `ADMIN_SECRET`; secrets are never stored in source
+to the production studio-uploader Railway URL. When `OUTREACH_API_SECRET` is
+configured it sends `X-Outreach-Secret`; otherwise it falls back to the legacy
+`ADMIN_SECRET` / `X-Admin-Secret` pair. Secrets are never stored in source
 control. The client handles status polling internally so an AI model receives
 only the final job result instead of spending reasoning calls watching
 Printful.
