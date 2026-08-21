@@ -7,7 +7,7 @@
   "contact_email": "membership@lakemerrittrowingclub.org",
   "type_of_store": "rowing",
   "primary_color": "Gray",
-  "logo_base64_file": "logos/lake-merritt-rowing-club.png.b64",
+  "logo_base64_file": "logos/lake-merritt-rowing-club.webp.b64",
   "logo_preparation": {
     "target_width": 4096
   },
@@ -25,7 +25,7 @@
     "garment_contrast_reviewed": true,
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
-    "prepared_rgba_sha256": "06e534adcb5007ce34f8ab3d64c4331a2340f20486823c535f4784b7ffa6711a",
+    "prepared_rgba_sha256": "15e7ac9c2f9e8a0644591c32db7e7886153c4970f34156694bd0309a5bdffa25",
     "notes": "Official Lake Merritt Rowing Club shield was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments keep the navy, red, and white shield visible."
   },
   "organization_url": "https://www.lakemerrittrowingclub.org/",
