@@ -8,7 +8,9 @@ check the job through the authenticated status route.
 
 from __future__ import annotations
 
+import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -34,6 +36,20 @@ DEFAULT_PLACEMENT_PROFILE = {
     "cc1467y_front_vertical_offset_px": -300,
 }
 MIN_REVIEWED_LOGO_WIDTH = 4096
+MIN_OUTREACH_SECRET_LENGTH = 32
+
+
+def _require_outreach_secret(core: Any, request: Request):
+    """Authorize an outreach-only key without weakening existing admin auth."""
+    configured = os.getenv("OUTREACH_API_SECRET", "").strip()
+    supplied = request.headers.get("X-Outreach-Secret", "").strip()
+    if (
+        len(configured) >= MIN_OUTREACH_SECRET_LENGTH
+        and supplied
+        and secrets.compare_digest(supplied, configured)
+    ):
+        return None
+    return core._require_admin_secret(request)
 
 
 def _required(value: Any, label: str, *, maximum: int = 300) -> str:
@@ -201,7 +217,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
         email_authorized: bool = Form(False),
         storefront_logo_file: UploadFile = File(...),
     ):
-        denied = core._require_admin_secret(request)
+        denied = _require_outreach_secret(core, request)
         if denied is not None:
             return denied
 
@@ -343,7 +359,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
 
     @app.get("/api/outreach/job/{job_id}")
     def direct_outreach_job_status(job_id: str, request: Request):
-        denied = core._require_admin_secret(request)
+        denied = _require_outreach_secret(core, request)
         if denied is not None:
             return denied
         job = core._job_get(job_id)
@@ -364,7 +380,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
 
     @app.post("/api/outreach/store/{handle}/mark-sent")
     def mark_direct_outreach_sent(handle: str, request: Request):
-        denied = core._require_admin_secret(request)
+        denied = _require_outreach_secret(core, request)
         if denied is not None:
             return denied
         normalized = str(handle or "").strip().lower()
