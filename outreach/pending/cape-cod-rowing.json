@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "claimable": true,
+  "run_id": "cape-cod-rowing-20260821",
+  "storefront_name": "Cape Cod Rowing Team Store",
+  "storefront_handle": "cape-cod-rowing",
+  "contact_email": "ccrowinginfo@gmail.com",
+  "type_of_store": "rowing",
+  "primary_color": "Gray",
+  "logo_base64_file": "logos/cape-cod-rowing.webp.b64",
+  "logo_preparation": {
+    "target_width": 4096
+  },
+  "qa": {
+    "approved": true,
+    "source_reviewed": true,
+    "transparency_reviewed": true,
+    "edge_quality_reviewed": true,
+    "light_background_reviewed": true,
+    "dark_background_reviewed": true,
+    "garment_contrast_reviewed": true,
+    "approved_primary_color": "Gray",
+    "minimum_width": 4096,
+    "prepared_rgba_sha256": "c863529e18ea28e95729cc2b1ab168208a95c4351303200135325dc0f3135cdd",
+    "notes": "Official red-and-navy artwork was deterministically unmatted from white, tightly cropped, and reviewed without changing its geometry. Gray/light-neutral garments are required because the navy lettering loses contrast on charcoal."
+  },
+  "organization_url": "https://www.capecodrowing.org/",
+  "contact_source_url": "https://www.capecodrowing.org/contact",
+  "logo_source_url": "https://static.wixstatic.com/media/14e5b0_af4d2243238e4b41abf10428b9a817f1~mv2.jpg",
+  "qualification_note": "Active volunteer-run rowing club with a 2025-26 board, current 2026 activity, a public club email, and no merchandise storefront found on its official site."
+}
