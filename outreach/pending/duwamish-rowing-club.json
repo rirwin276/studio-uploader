@@ -9,8 +9,7 @@
   "primary_color": "Gray",
   "logo_base64_file": "logos/duwamish-rowing-club.webp.b64",
   "logo_preparation": {
-    "target_width": 4096,
-    "remove_border_background": true
+    "target_width": 4096
   },
   "placement_profile": {
     "bc3413_front_vertical_offset_px": -300,
