@@ -7,7 +7,7 @@
   "contact_email": "charlestonrows@gmail.com",
   "type_of_store": "rowing",
   "primary_color": "Gray",
-  "logo_base64_file": "logos/charleston-city-rowing-club.png.b64",
+  "logo_base64_file": "logos/charleston-city-rowing-club.webp.b64",
   "logo_preparation": {
     "target_width": 4096
   },
@@ -25,7 +25,7 @@
     "garment_contrast_reviewed": true,
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
-    "prepared_rgba_sha256": "1324f7deb8017133c09fb5ff4005f1728fb1accf644f357ff98ee847769e341b",
+    "prepared_rgba_sha256": "cc0d5bb4662baa49d50b74530ee0076a380f5b145ed6be099591655fbe135494",
     "notes": "Official Charleston City Rowing Club artwork was resized deterministically to 4096px and checked for transparent edges. Gray/light-neutral garments are required because the deep blue artwork needs contrast."
   },
   "organization_url": "https://www.charlestonrows.org/",
