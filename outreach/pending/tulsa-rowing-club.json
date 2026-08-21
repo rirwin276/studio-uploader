@@ -25,7 +25,7 @@
     "garment_contrast_reviewed": true,
     "approved_primary_color": "Gray",
     "minimum_width": 4096,
-    "prepared_rgba_sha256": "28b855247ecc7c73e97188d2b763818712986061c35ef2c21f2104ea2ba23f5f",
+    "prepared_rgba_sha256": "8958c4ff8ec8deffc7ef762af4bdb14246f947d502fdc74a1a8bc5f15f5df6fe",
     "notes": "Official Tulsa Rowing Club logo was downloaded from the club website, resized deterministically to 4096px, and checked for transparent edges and garment contrast. Gray/light-neutral garments preserve the navy, yellow, black, and white artwork."
   },
   "organization_url": "https://www.tulsarowingclub.org/",
