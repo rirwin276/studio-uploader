@@ -534,6 +534,11 @@ def run_discovery(
             }
             if dry_run:
                 row["queued"] = False
+                # Kept so the candidates just read on screen can be built as
+                # they are. Searching again to build them would cost another
+                # search and could return a different set — the reviewed ones
+                # should be the ones that get made.
+                row["payload"] = payload
             else:
                 ok, status = _submit(core, payload)
                 row["queued"] = ok
@@ -552,6 +557,59 @@ def run_discovery(
         return run
     finally:
         _RUN_LOCK.release()
+
+
+def build_last_run(core: Any) -> Dict[str, Any]:
+    """Build the candidates from the most recent test run.
+
+    Duplicates are re-checked rather than trusted: the test run may have been
+    minutes or hours ago, and a store could have been created since.
+    """
+    history = recent_runs(core)
+    latest = history[0] if history else None
+    if not latest or not latest.get("dry_run"):
+        raise LookupError("The last run was not a test run")
+    rows = [row for row in (latest.get("candidates") or []) if row.get("payload")]
+    if not rows:
+        raise LookupError("That test run has no candidates left to build")
+
+    known = set(_known_handles(core))
+    known_domains = _known_domains(core)
+    built: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = row["payload"]
+        handle = str(payload.get("storefront_handle") or "")
+        host = _domain(payload.get("organization_url"))
+        if handle in known or (host and host in known_domains):
+            skipped.append({"handle": handle, "reason": "already known"})
+            continue
+        ok, status = _submit(core, payload)
+        known.add(handle)
+        if host:
+            known_domains.add(host)
+        built.append({
+            "handle": handle,
+            "storefront_name": payload.get("storefront_name"),
+            "queued": ok,
+            "status": status,
+        })
+
+    run = {
+        "started_at": outreach_tracking.utc_iso(),
+        "finished_at": outreach_tracking.utc_iso(),
+        "trigger": "build-reviewed",
+        "dry_run": False,
+        "model": latest.get("model"),
+        "requested": len(rows),
+        "returned": len(rows),
+        "accepted": len(built),
+        "queued": sum(1 for row in built if row.get("queued")),
+        "rejected": skipped,
+        "candidates": built,
+    }
+    _record_run(core, run)
+    return run
 
 
 def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
@@ -613,6 +671,19 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
                 model=model,
             )
         except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)[:400]}, status_code=502)
+        return {"ok": True, "run": run}
+
+    @app.post("/api/outreach/discovery/build-last")
+    async def discovery_build_last(request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        try:
+            run = await run_in_threadpool(build_last_run, core)
+        except LookupError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)[:400]}, status_code=502)

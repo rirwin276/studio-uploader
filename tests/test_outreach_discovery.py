@@ -387,3 +387,58 @@ def test_the_run_route_never_blocks_the_event_loop():
         and getattr(node.func, "id", "") == "run_in_threadpool"
     ]
     assert threadpooled, "the run must go through run_in_threadpool"
+
+
+def test_the_candidates_you_just_reviewed_are_the_ones_that_get_built(wired, monkeypatch):
+    """Searching again to build them would cost another search and could return
+    a different set. The reviewed ones should be the ones that get made."""
+    core, _ledger, submitted = wired
+    _answer(monkeypatch, [_candidate("first-club"), _candidate("second-club",
+                                                               organization_url="https://second.org/",
+                                                               contact_source_url="https://second.org/c",
+                                                               logo_source_url="https://second.org/l.png")])
+
+    test_run = outreach_discovery.run_discovery(core, limit=5, dry_run=True)
+    assert test_run["queued"] == 0
+    assert submitted == []
+
+    built = outreach_discovery.build_last_run(core)
+
+    assert built["queued"] == 2
+    assert {row["storefront_handle"] for row in submitted} == {"first-club", "second-club"}
+    assert built["trigger"] == "build-reviewed"
+
+
+def test_building_twice_does_not_create_the_store_twice(wired, monkeypatch):
+    core, ledger, submitted = wired
+    _answer(monkeypatch, [_candidate("first-club")])
+    outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+    outreach_discovery.build_last_run(core)
+    assert len(submitted) == 1
+
+    # The build itself is now the most recent run, so there is nothing pending.
+    with pytest.raises(LookupError):
+        outreach_discovery.build_last_run(core)
+    assert len(submitted) == 1
+
+
+def test_a_store_created_since_the_test_run_is_skipped(wired, monkeypatch):
+    """Minutes or hours can pass between reading the candidates and building
+    them, so the duplicate check is redone rather than trusted."""
+    core, ledger, submitted = wired
+    _answer(monkeypatch, [_candidate("first-club")])
+    outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+
+    ledger["first-club"] = {"handle": "first-club", "status": "provisioned"}
+    built = outreach_discovery.build_last_run(core)
+
+    assert submitted == []
+    assert built["rejected"][0]["reason"] == "already known"
+
+
+def test_building_refuses_when_the_last_run_already_built(wired, monkeypatch):
+    core, _ledger, _submitted = wired
+    _answer(monkeypatch, [_candidate("first-club")])
+    outreach_discovery.run_discovery(core, limit=2)  # a real run, not a test
+    with pytest.raises(LookupError, match="not a test run"):
+        outreach_discovery.build_last_run(core)
