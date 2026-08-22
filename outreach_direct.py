@@ -8,9 +8,7 @@ check the job through the authenticated status route.
 
 from __future__ import annotations
 
-import os
 import re
-import secrets
 import threading
 import time
 import uuid
@@ -19,8 +17,9 @@ from urllib.parse import urlparse
 
 from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
-from PIL import Image
 
+from outreach_assets import save_reviewed_logo_session
+from outreach_auth import require_outreach_secret
 import outreach_tracking
 
 
@@ -35,23 +34,6 @@ DEFAULT_PLACEMENT_PROFILE = {
     "bc3413_front_vertical_offset_px": -300,
     "cc1467y_front_vertical_offset_px": -300,
 }
-MIN_REVIEWED_LOGO_WIDTH = 4096
-MIN_OUTREACH_SECRET_LENGTH = 32
-
-
-def _require_outreach_secret(core: Any, request: Request):
-    """Authorize an outreach-only key without weakening existing admin auth."""
-    configured = os.getenv("OUTREACH_API_SECRET", "").strip()
-    supplied = request.headers.get("X-Outreach-Secret", "").strip()
-    if (
-        len(configured) >= MIN_OUTREACH_SECRET_LENGTH
-        and supplied
-        and secrets.compare_digest(supplied, configured)
-    ):
-        return None
-    return core._require_admin_secret(request)
-
-
 def _required(value: Any, label: str, *, maximum: int = 300) -> str:
     text = str(value or "").strip()
     if not text:
@@ -91,56 +73,7 @@ async def _save_reviewed_logo(core: Any, upload: UploadFile, handle: str) -> str
     except Exception as exc:
         raise ValueError("logo is not a valid image") from exc
 
-    if image.width < MIN_REVIEWED_LOGO_WIDTH:
-        raise ValueError(
-            f"reviewed logo must be at least {MIN_REVIEWED_LOGO_WIDTH}px wide"
-        )
-    max_pixels = int(getattr(core, "MAX_IMAGE_PIXELS", 40_000_000))
-    if image.width * image.height > max_pixels:
-        raise ValueError("reviewed logo exceeds the image pixel limit")
-
-    alpha = image.getchannel("A")
-    alpha_min, alpha_max = alpha.getextrema()
-    if alpha_min != 0 or alpha_max != 255:
-        raise ValueError("reviewed logo must contain transparent and opaque pixels")
-    bbox = alpha.getbbox()
-    if bbox is None:
-        raise ValueError("reviewed logo has no visible artwork")
-    tolerance_x = max(1, round(image.width * 0.01))
-    tolerance_y = max(1, round(image.height * 0.01))
-    if (
-        bbox[0] > tolerance_x
-        or bbox[1] > tolerance_y
-        or image.width - bbox[2] > tolerance_x
-        or image.height - bbox[3] > tolerance_y
-    ):
-        raise ValueError("reviewed logo still has excess transparent padding")
-
-    session_id = f"outreach-{handle}-{uuid.uuid4().hex[:12]}"
-    paths = core._paths(session_id)
-    core._save_png(image, paths["orig_master"])
-    # The interactive page normalizes originals to its smaller editor target.
-    # Direct outreach assets have already passed 4K QA, so preserve those exact
-    # pixels for the Printful/Shopify provisioning session.
-    core._save_png(image, paths["orig_curr"])
-    core._save_png(image, paths["curr"])
-    preview = image.copy()
-    preview.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
-    core._save_png(preview, paths["orig_preview"])
-    core._sess_set(
-        session_id,
-        status="uploaded",
-        stage="uploaded",
-        created_at=time.time(),
-        quality_flags=[],
-        finalized=False,
-        processing=False,
-        processed_available=False,
-        active_version="original",
-        selected=True,
-        error="",
-    )
-    return session_id
+    return save_reviewed_logo_session(core, image, handle)
 
 
 def _update_tracking(core: Any, handle: str, patch: Dict[str, Any]) -> None:
@@ -217,7 +150,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
         email_authorized: bool = Form(False),
         storefront_logo_file: UploadFile = File(...),
     ):
-        denied = _require_outreach_secret(core, request)
+        denied = require_outreach_secret(core, request)
         if denied is not None:
             return denied
 
@@ -359,7 +292,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
 
     @app.get("/api/outreach/job/{job_id}")
     def direct_outreach_job_status(job_id: str, request: Request):
-        denied = _require_outreach_secret(core, request)
+        denied = require_outreach_secret(core, request)
         if denied is not None:
             return denied
         job = core._job_get(job_id)
@@ -380,7 +313,7 @@ def install_outreach_direct_routes(app: Any, core: Any) -> bool:
 
     @app.post("/api/outreach/store/{handle}/mark-sent")
     def mark_direct_outreach_sent(handle: str, request: Request):
-        denied = _require_outreach_secret(core, request)
+        denied = require_outreach_secret(core, request)
         if denied is not None:
             return denied
         normalized = str(handle or "").strip().lower()

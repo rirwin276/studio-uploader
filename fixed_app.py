@@ -186,6 +186,20 @@ except Exception:
     log.exception("Could not install direct outreach routes")
 
 
+# Vendor-neutral JSON intake persists requests before a separate worker fetches
+# the reviewed public logo and calls the same normal provisioning pipeline.
+try:
+    from outreach_intake import (
+        install_outreach_intake_routes,
+        install_outreach_intake_worker,
+    )
+
+    install_outreach_intake_routes(app, core)
+    install_outreach_intake_worker(core)
+except Exception:
+    log.exception("Could not install outreach intake")
+
+
 # The prospect-demo ledger and one-product reservation API are private
 # server-to-server routes used by Printful_Automation's signed App Proxy relay.
 try:
@@ -196,11 +210,11 @@ except Exception:
     log.exception("Could not install prospect demo routes")
 
 
-# Keep the legacy maintenance worker for due follow-ups and explicit retire
-# requests. Per-store build manifests are no longer kept in the repository.
+# Follow-ups are isolated from intake/build behavior and remain inert unless
+# SMTP is configured and a store has explicitly been marked as sent.
 try:
-    from outreach_manifest import install_outreach_manifest_runner
+    from outreach_followups import install_outreach_followup_scheduler
 
-    install_outreach_manifest_runner(core)
+    install_outreach_followup_scheduler(core)
 except Exception:
-    log.exception("Could not install outreach manifest runner")
+    log.exception("Could not install outreach follow-up scheduler")

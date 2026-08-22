@@ -1,8 +1,28 @@
 # Direct outreach automation
 
-Prospect records and artwork do not belong in this repository. Automated
-outreach stores are submitted directly to Railway through the authenticated
-multipart route:
+Prospect records and artwork do not belong in this repository. The original
+GitHub manifest build/delete runner has been removed. Approved research agents
+now feed a durable Railway queue through one vendor-neutral JSON route:
+
+`POST /api/outreach/intake`
+
+The JSON contract is the same for OpenAI, Claude, or another approved caller.
+It includes a caller-generated `provider_request_id`, `source_agent`, store and
+contact fields, three public source URLs, and the two required confirmations
+`screening_confirmed=true` and `logo_source_reviewed=true`. Email authorization
+must remain false. The request is authenticated with `X-Outreach-Secret` and is
+persisted in Shopify's `outreach_tracking` ledger before the worker begins.
+
+The worker safely downloads the official public logo, rejects private-network
+or non-HTTPS targets, removes a background when needed, fails closed when 4K
+logo QA cannot be satisfied, and calls the unchanged normal provisioning
+pipeline. Interrupted `intake_processing` jobs become recoverable after 30
+minutes. Status is available at:
+
+`GET /api/outreach/intake/{storefront_handle}`
+
+The reviewed-file route remains available for a human or tool that already has
+the final 4K transparent logo:
 
 `POST /api/outreach/storefront-request`
 
@@ -25,6 +45,10 @@ The direct route defaults email authorization off, raises the tri-blend and
 kids hoodie artwork by approximately one inch, prevents duplicate builds by
 store handle, and records build state in the Shopify outreach-tracking
 metaobject used by the Command Center.
+
+Neither intake route sends email, edits orders, creates Printful fulfillments,
+or changes the paid-order webhook. Product and ordering behavior remain owned
+by their existing pipelines.
 
 After the initial email is actually sent, call:
 
