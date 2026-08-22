@@ -267,3 +267,91 @@ def test_a_run_can_override_the_model_without_a_redeploy(wired, monkeypatch):
 
     outreach_discovery.run_discovery(core, limit=1, dry_run=True)
     assert seen["model"] == ""  # falls back to the configured default
+
+
+class FakeResponse:
+    def __init__(self, status_code, text="", payload=None, headers=None):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+
+_OK_BODY = {
+    "output": [{"content": [{"type": "output_text", "text": json.dumps({"candidates": []})}]}],
+    "usage": {"input_tokens": 10, "output_tokens": 2},
+}
+
+_RATE_LIMITED = (
+    '{"error": {"message": "Rate limit reached for gpt-5.6-luna on tokens per min '
+    '(TPM): Limit 200000, Used 185927, Requested 37853. Please try again in 7.134s.", '
+    '"code": "rate_limit_exceeded"}}'
+)
+
+
+def test_a_rate_limit_waits_and_retries_instead_of_failing(monkeypatch):
+    """A tokens-per-minute ceiling is a budget, not a fault. The response even
+    says how long to wait, and the search has already been paid for."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls = []
+    slept = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResponse(429, _RATE_LIMITED)
+        return FakeResponse(200, payload=_OK_BODY)
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+    monkeypatch.setattr(outreach_discovery.time, "sleep", lambda s: slept.append(s))
+
+    candidates, telemetry = outreach_discovery._ask_for_candidates(2, [])
+
+    assert candidates == []
+    assert telemetry["attempts"] == 2
+    # It waits the time the provider asked for, not a guess.
+    assert 8.0 <= slept[0] <= 9.0
+
+
+def test_a_bad_model_fails_immediately_without_retrying(monkeypatch):
+    """A rename does not fix itself. Retrying it just spends the wait twice and
+    delays the message that says what to change."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        return FakeResponse(404, '{"error":{"message":"unknown model"}}')
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+    monkeypatch.setattr(outreach_discovery.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="unknown model"):
+        outreach_discovery._ask_for_candidates(2, [])
+    assert len(calls) == 1
+
+
+def test_retrying_gives_up_and_reports_the_providers_message(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        return FakeResponse(429, _RATE_LIMITED)
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+    monkeypatch.setattr(outreach_discovery.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="Rate limit reached"):
+        outreach_discovery._ask_for_candidates(2, [])
+    assert len(calls) == outreach_discovery._MAX_ATTEMPTS
+
+
+def test_a_retry_never_waits_longer_than_the_cap(monkeypatch):
+    """A browser is holding this request open, so the wait has to stay bounded
+    even when the provider asks for minutes."""
+    response = FakeResponse(429, "", headers={"retry-after": "600"})
+    assert outreach_discovery._retry_after(response, 0) == outreach_discovery._MAX_RETRY_WAIT

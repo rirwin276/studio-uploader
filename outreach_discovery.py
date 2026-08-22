@@ -257,6 +257,34 @@ def _rotation_for_run(core: Any) -> Tuple[List[str], List[str]]:
     return focus, recent[:12]
 
 
+# A token-per-minute ceiling is a budget, not a fault. It is shared across the
+# organization, every model has one, and the response says how long to wait —
+# so a run that hits it should wait rather than report failure and lose the
+# search it already paid for.
+_RETRYABLE = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3
+_MAX_RETRY_WAIT = 30.0
+
+
+def _retry_after(response: Any, attempt: int) -> float:
+    """How long to wait, preferring what the provider asked for."""
+    header = str(getattr(response, "headers", {}).get("retry-after") or "").strip()
+    if header:
+        try:
+            return min(_MAX_RETRY_WAIT, max(1.0, float(header)))
+        except ValueError:
+            pass
+    # The Responses API puts the wait in prose rather than a header:
+    # "Please try again in 7.134s."
+    match = re.search(r"try again in ([0-9.]+)s", str(getattr(response, "text", "")))
+    if match:
+        try:
+            return min(_MAX_RETRY_WAIT, max(1.0, float(match.group(1)) + 1.0))
+        except ValueError:
+            pass
+    return min(_MAX_RETRY_WAIT, 5.0 * (2 ** attempt))
+
+
 def _ask_for_candidates(
     limit: int,
     avoid: List[str],
@@ -295,18 +323,26 @@ def _ask_for_candidates(
         },
     }
     started = time.time()
-    response = requests.post(
-        _API_URL,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=(15, 300),
-    )
-    if response.status_code >= 300:
-        # Surfaced verbatim: a model rename or a tool-name change is the most
-        # likely failure here, and the provider's own message says which.
-        raise RuntimeError(
-            f"OpenAI returned HTTP {response.status_code}: {response.text[:400]}"
+    response = None
+    attempts = 0
+    for attempt in range(_MAX_ATTEMPTS):
+        attempts = attempt + 1
+        response = requests.post(
+            _API_URL,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=(15, 300),
         )
+        if response.status_code < 300:
+            break
+        if response.status_code not in _RETRYABLE or attempt == _MAX_ATTEMPTS - 1:
+            # A model rename, a bad key or a renamed tool is not going to fix
+            # itself, so fail immediately and hand back the provider's own
+            # message — it is the thing that says which of them it was.
+            raise RuntimeError(
+                f"OpenAI returned HTTP {response.status_code}: {response.text[:400]}"
+            )
+        time.sleep(_retry_after(response, attempt))
     body = response.json()
 
     text = ""
@@ -326,6 +362,7 @@ def _ask_for_candidates(
 
     usage = body.get("usage") or {}
     telemetry = {
+        "attempts": attempts,
         "focus": list(focus or []),
         "model": model,
         "search_tool": tool,
