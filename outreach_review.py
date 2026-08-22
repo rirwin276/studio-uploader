@@ -173,6 +173,61 @@ def _activity(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _steps(state: Dict[str, Any], job: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """The trail a store left on its way through, as timestamps not prose.
+
+    The ledger already records each transition. Showing them in order answers
+    "is this stuck or moving" without any new instrumentation, and the gap
+    between two of them says where the time went.
+    """
+    status = str(state.get("status") or "").strip().lower()
+    trail = [
+        ("Queued", state.get("created_at"), True),
+        ("Logo prepared, build started", state.get("build_started_at"), True),
+        ("Store and products built", state.get("built_at"), True),
+    ]
+    if status in {"intake_failed", "failed"}:
+        trail.append(("Stopped", state.get("failed_at"), True))
+    elif state.get("sent_at"):
+        trail.append(("Emailed", state.get("sent_at"), True))
+
+    rows = []
+    for label, at, _always in trail:
+        rows.append({"label": label, "at": at, "done": bool(at)})
+    if job:
+        rows.append({
+            "label": "Provisioner: " + str(job.get("status") or "unknown"),
+            "at": None,
+            "done": str(job.get("status") or "") == "succeeded",
+        })
+    return rows
+
+
+def _job(core: Any, state: Dict[str, Any]) -> Dict[str, Any]:
+    """The provisioning job, when there is one to look at."""
+    job_id = str(state.get("job_id") or "").strip()
+    getter = getattr(core, "_job_get", None)
+    if not job_id or not callable(getter):
+        return {}
+    try:
+        return getter(job_id) or {}
+    except Exception:
+        return {}
+
+
+def _log_tail(job: Dict[str, Any], lines: int = 12) -> List[str]:
+    """The end of the provisioner's own output.
+
+    Only the tail: the full log is hundreds of lines of Shopify and Printful
+    chatter, and the part that explains a failure is always at the bottom.
+    """
+    text = str(job.get("stderr") or "") or str(job.get("stdout") or "")
+    if not text.strip():
+        return []
+    kept = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return kept[-lines:]
+
+
 def _stage(state: Dict[str, Any]) -> str:
     """Where this store sits in the funnel."""
     status = str(state.get("status") or "").strip().lower()
@@ -189,10 +244,17 @@ def _stage(state: Dict[str, Any]) -> str:
     return "building"
 
 
-def _pipeline_row(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+def _pipeline_row(core: Any, handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    stage = _stage(state)
+    # The provisioner is only worth asking about while a store is still moving
+    # or has stopped. A sent or claimed store's job finished days ago.
+    job = _job(core, state) if stage in {"building", "failed"} else {}
     row = _row(handle, state)
     row.update({
-        "stage": _stage(state),
+        "stage": stage,
+        "error": state.get("intake_error") or state.get("build_error") or "",
+        "steps": _steps(state, job),
+        "log": _log_tail(job),
         "status": state.get("status") or "",
         "sent_at": state.get("sent_at"),
         "followup_sent_at": state.get("followup_sent_at"),
@@ -215,7 +277,7 @@ def pipeline(core: Any) -> Dict[str, Any]:
     for handle, state in outreach_tracking.list_all(core).items():
         if not outreach_tracking.is_outreach_source(state.get("source")):
             continue
-        rows.append(_pipeline_row(handle, state))
+        rows.append(_pipeline_row(core, handle, state))
 
     def when(row: Dict[str, Any]) -> str:
         return str(row.get("sent_at") or row.get("built_at") or "")
