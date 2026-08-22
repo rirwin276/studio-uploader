@@ -460,6 +460,92 @@ def process_intake_queue(core: Any, *, limit: int = 5) -> int:
     return attempted
 
 
+def queue_intake_payload(
+    core: Any,
+    payload: Dict[str, Any],
+    *,
+    normalized: bool = False,
+) -> Any:
+    """Queue one screened organization for a build.
+
+    Shared by the HTTP route and the discovery worker so an in-process caller
+    goes through the same duplicate checks, the same validation and the same
+    ledger write as an authenticated one, instead of a second implementation
+    that drifts from it. Callers holding a raw dict leave ``normalized`` false
+    and get the full contract check.
+    """
+    if not normalized:
+        payload = _normalize_payload(payload)
+
+    handle = payload["storefront_handle"]
+    urls = _store_urls(handle)
+    try:
+        existing_store = core._get_custom_shop(handle)
+        existing_state = outreach_tracking.read(core, handle)
+    except Exception:
+        return JSONResponse(
+            {"error": "Unable to check existing store and intake state"},
+            status_code=502,
+        )
+    if existing_store is not None:
+        return {"status": "existing", "storefront_handle": handle, **urls}
+    if existing_state:
+        same_request = (
+            str(existing_state.get("provider_request_id") or "")
+            == payload["provider_request_id"]
+        )
+        if same_request:
+            return {
+                "status": existing_state.get("status") or "unknown",
+                "job_id": existing_state.get("job_id"),
+                "storefront_handle": handle,
+                "provider_request_id": payload["provider_request_id"],
+                **urls,
+            }
+        if existing_state.get("status") != "intake_failed":
+            return JSONResponse(
+                {
+                    "error": "storefront_handle already has a different active intake",
+                    "storefront_handle": handle,
+                },
+                status_code=409,
+            )
+
+    created_at = outreach_tracking.utc_iso()
+    state = {
+        **payload,
+        "handle": handle,
+        "source": "vendor_neutral_outreach_intake",
+        "created_at": created_at,
+        "status": "intake_queued",
+        "job_id": None,
+        "built_at": None,
+        "sent_at": None,
+        "followup_due_at": None,
+        "delete_due_at": None,
+        "followup_sent_at": None,
+        "store_status": "prospect_unclaimed",
+        "claim_status": "unclaimed",
+        "placement_profile": dict(DEFAULT_PLACEMENT_PROFILE),
+        "intake_attempt_count": 0,
+    }
+    try:
+        outreach_tracking.upsert(core, handle, state)
+    except Exception:
+        return JSONResponse(
+            {"error": "Unable to persist outreach intake"},
+            status_code=502,
+        )
+    _QUEUE_WAKE.set()
+    return {
+        "status": "intake_queued",
+        "storefront_handle": handle,
+        "provider_request_id": payload["provider_request_id"],
+        "email_authorized": False,
+        **urls,
+    }
+
+
 def install_outreach_intake_routes(app: Any, core: Any) -> bool:
     """Install the JSON intake and persistent-status endpoints once."""
     with _INSTALL_LOCK:
@@ -478,74 +564,7 @@ def install_outreach_intake_routes(app: Any, core: Any) -> bool:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception:
             return JSONResponse({"error": "request body must be valid JSON"}, status_code=400)
-
-        handle = payload["storefront_handle"]
-        urls = _store_urls(handle)
-        try:
-            existing_store = core._get_custom_shop(handle)
-            existing_state = outreach_tracking.read(core, handle)
-        except Exception:
-            return JSONResponse(
-                {"error": "Unable to check existing store and intake state"},
-                status_code=502,
-            )
-        if existing_store is not None:
-            return {"status": "existing", "storefront_handle": handle, **urls}
-        if existing_state:
-            same_request = (
-                str(existing_state.get("provider_request_id") or "")
-                == payload["provider_request_id"]
-            )
-            if same_request:
-                return {
-                    "status": existing_state.get("status") or "unknown",
-                    "job_id": existing_state.get("job_id"),
-                    "storefront_handle": handle,
-                    "provider_request_id": payload["provider_request_id"],
-                    **urls,
-                }
-            if existing_state.get("status") != "intake_failed":
-                return JSONResponse(
-                    {
-                        "error": "storefront_handle already has a different active intake",
-                        "storefront_handle": handle,
-                    },
-                    status_code=409,
-                )
-
-        created_at = outreach_tracking.utc_iso()
-        state = {
-            **payload,
-            "handle": handle,
-            "source": "vendor_neutral_outreach_intake",
-            "created_at": created_at,
-            "status": "intake_queued",
-            "job_id": None,
-            "built_at": None,
-            "sent_at": None,
-            "followup_due_at": None,
-            "delete_due_at": None,
-            "followup_sent_at": None,
-            "store_status": "prospect_unclaimed",
-            "claim_status": "unclaimed",
-            "placement_profile": dict(DEFAULT_PLACEMENT_PROFILE),
-            "intake_attempt_count": 0,
-        }
-        try:
-            outreach_tracking.upsert(core, handle, state)
-        except Exception:
-            return JSONResponse(
-                {"error": "Unable to persist outreach intake"},
-                status_code=502,
-            )
-        _QUEUE_WAKE.set()
-        return {
-            "status": "intake_queued",
-            "storefront_handle": handle,
-            "provider_request_id": payload["provider_request_id"],
-            "email_authorized": False,
-            **urls,
-        }
+        return queue_intake_payload(core, payload, normalized=True)
 
     @app.get("/api/outreach/intake/{handle}")
     def outreach_intake_status(handle: str, request: Request):
