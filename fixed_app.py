@@ -210,6 +210,17 @@ except Exception:
     log.exception("Could not install prospect demo routes")
 
 
+# Prospect discovery. Inert without OPENAI_API_KEY, and the nightly run stays
+# off until OUTREACH_DISCOVERY_ENABLED is set — on-demand runs still work, so
+# the brief can be tried out before it is allowed to fire by itself.
+try:
+    from outreach_discovery import install_outreach_discovery_routes
+
+    install_outreach_discovery_routes(app, core)
+except Exception:
+    log.exception("Could not install outreach discovery routes")
+
+
 # The morning review queue. Read-only until somebody presses a button: it never
 # sends or deletes on a schedule of its own.
 try:
