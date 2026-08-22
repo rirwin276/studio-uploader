@@ -14,11 +14,11 @@ class FakeCore:
         return None
 
 
-def _client(monkeypatch):
+def _client(monkeypatch, source="direct_outreach_api"):
     states = {
         "example-club": {
             "handle": "example-club",
-            "source": "direct_outreach_api",
+            "source": source,
             "store_status": "prospect_unclaimed",
             "claim_status": "unclaimed",
         }
@@ -144,3 +144,37 @@ def test_events_are_allowlisted(monkeypatch):
         json={"event": "delete_everything"},
     )
     assert rejected.status_code == 400
+
+
+def test_json_intake_stores_get_the_same_demo_as_multipart_stores(monkeypatch):
+    """The JSON intake queue writes its own ``source`` value.
+
+    Every store the nightly pipeline builds arrives with
+    ``vendor_neutral_outreach_intake`` instead of ``direct_outreach_api``.  A
+    single-string comparison silently disabled the demo, the appearance editor
+    and claim tracking for exactly those stores, so pin the shared behavior.
+    """
+    client, states = _client(monkeypatch, source="vendor_neutral_outreach_intake")
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is True
+
+    event = client.post(
+        "/api/outreach/store/example-club/demo-event",
+        headers=_headers(),
+        json={"event": "store_appearance_changed", "session_id": "browser-1"},
+    )
+    assert event.status_code == 200
+    assert states["example-club"]["prospect_demo"]["event_counts"]["store_appearance_changed"] == 1
+
+    prospect_demo.mark_claimed(FakeCore(), "example-club", "101")
+    assert states["example-club"]["claim_status"] == "claimed"
+    assert states["example-club"]["claimed_customer_id"] == "101"
+
+
+def test_a_website_store_is_never_treated_as_a_prospect(monkeypatch):
+    client, _states = _client(monkeypatch, source="website_request_form")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False

@@ -63,6 +63,15 @@ def _make_fr_state_gql(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _stripe_ready() -> Dict[str, Any]:
+    """A not-yet-launched campaign that already has somewhere to send the money.
+
+    Launching without a connected payout account is refused, so any test that
+    exercises a first launch for some other reason has to start from here.
+    """
+    return {"stripe_connected": True, "stripe_account_id": "acct_test"}
+
+
 def _make_definition_gql(exists: bool = True) -> Dict[str, Any]:
     if exists:
         return {"metaobjectDefinitionByType": {"id": "gid://shopify/MetaobjectDefinition/1"}}
@@ -119,7 +128,9 @@ def test_launch_stamps_owner_from_header(monkeypatch):
         if "metaobjectDefinitionByType" in q:
             return _gql_resp(_make_definition_gql())
         if "metaobjectByHandle" in q:
-            return _gql_resp(_make_fr_state_gql({}))  # empty — no existing state
+            # No campaign yet, but Stripe is connected — launching without a
+            # payout account is refused, and this test is about owner stamping.
+            return _gql_resp(_make_fr_state_gql(_stripe_ready()))
         if "metaobjectUpsert" in q:
             # Capture the state that was saved.
             fields = (json.get("variables", {}).get("metaobject", {}).get("fields") or [])
@@ -161,7 +172,7 @@ def test_launch_falls_back_to_custom_shop_owner(monkeypatch):
             # Distinguish between store_fundraising and custom_shop reads.
             mo_type = handle_input.get("type", "")
             if mo_type == "store_fundraising":
-                return _gql_resp(_make_fr_state_gql({}))
+                return _gql_resp(_make_fr_state_gql(_stripe_ready()))
             if mo_type in ("custom_shop", ""):
                 # custom_shop with owner_customer_id
                 return _gql_resp({
@@ -601,7 +612,16 @@ def _webhook_headers(body: bytes) -> dict:
 def test_webhook_empty_order_id_uses_admin_graphql_api_id(monkeypatch):
     """When order id is empty, fallback to admin_graphql_api_id for deduplication."""
     # Start with a clean ledger.
-    fr_state = {"enabled": True, "amount": 5, "ledger": [], "total_raised": 0}
+    # A contribution is only credited when the line actually paid base + markup,
+    # so the campaign has to carry the price snapshot it was launched with.
+    fr_state = {
+        "enabled": True,
+        "amount": 5,
+        "ledger": [],
+        "total_raised": 0,
+        "markup_add": 5,
+        "base_prices": {"gid://shopify/ProductVariant/222": "20.00"},
+    }
     saved_states: list = []
 
     def fake_post(url, headers=None, json=None, **kwargs):
@@ -634,7 +654,9 @@ def test_webhook_empty_order_id_uses_admin_graphql_api_id(monkeypatch):
     order = {
         "id": "",  # empty — the bug path
         "admin_graphql_api_id": "gid://shopify/Order/9001",
-        "line_items": [{"product_id": "111", "quantity": 1}],
+        "line_items": [
+            {"product_id": "111", "variant_id": "222", "price": "25.00", "quantity": 1},
+        ],
     }
     body = _make_webhook_body(order)
     headers = _webhook_headers(body)

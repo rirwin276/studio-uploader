@@ -666,10 +666,10 @@ def _store_decision(store: Dict[str, Any], *, now: Optional[datetime] = None) ->
     source = str(store.get("source") or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
     is_cold_outreach = source in {
         "cold_outreach",
-        "direct_outreach_api",
         "outreach",
         "cold_email",
         "prospecting",
+        *outreach_tracking.OUTREACH_SOURCES,
     }
 
     reasons: list[str] = []
@@ -911,7 +911,7 @@ def _build_summary(core) -> Dict[str, Any]:
         }
         outreach_state = store.get("outreach") or {}
         demo = outreach_state.get("prospect_demo") or {}
-        if outreach_state.get("source") == "direct_outreach_api" and isinstance(demo, dict):
+        if outreach_tracking.is_outreach_source(outreach_state.get("source")) and isinstance(demo, dict):
             raw_counts = demo.get("event_counts") or {}
             counts = raw_counts if isinstance(raw_counts, dict) else {}
             store["prospect_demo"] = {

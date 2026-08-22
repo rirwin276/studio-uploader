@@ -287,6 +287,13 @@ def test_delete_review_requires_seven_real_tracking_days_and_never_acts_automati
     assert direct["delete_candidate"] is True
     assert direct["automatic_action"] is False
 
+    # Stores built by the JSON intake queue carry a different source string and
+    # must reach the same review queue as the multipart ones.
+    base["source"] = "vendor_neutral_outreach_intake"
+    intake = _store_decision(base, now=now)
+    assert intake["delete_candidate"] is True
+    assert intake["automatic_action"] is False
+
 
 def test_unknown_source_is_review_only_even_after_no_traction_window():
     store = {

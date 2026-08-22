@@ -78,7 +78,7 @@ def _normalize_handle(raw: Any) -> str:
 def _is_unclaimed_prospect(state: Dict[str, Any]) -> bool:
     return bool(
         state
-        and state.get("source") == "direct_outreach_api"
+        and outreach_tracking.is_outreach_source(state.get("source"))
         and str(state.get("store_status") or "").lower() == "prospect_unclaimed"
         and str(state.get("claim_status") or "unclaimed").lower() == "unclaimed"
     )
@@ -180,7 +180,7 @@ def mark_claimed(core: Any, handle: str, customer_id: str) -> None:
         return
     with _store_lock(normalized):
         state = outreach_tracking.read(core, normalized)
-        if not state or state.get("source") != "direct_outreach_api":
+        if not state or not outreach_tracking.is_outreach_source(state.get("source")):
             return
         if str(state.get("claim_status") or "").strip().lower() == "claimed":
             return
