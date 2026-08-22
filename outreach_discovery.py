@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Tuple
 import requests
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import outreach_tracking
 from outreach_auth import require_outreach_secret
@@ -598,8 +599,18 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
         if model and not _SAFE_MODEL.fullmatch(model):
             return JSONResponse({"ok": False, "error": "invalid model id"}, status_code=400)
         try:
-            run = run_discovery(
-                core, limit=limit, dry_run=dry_run, trigger="manual", model=model
+            # A run is a web search plus a model call: minutes of blocking HTTP.
+            # Calling it inline from an async route holds the event loop for the
+            # whole time, and this process serves the storefront — fundraiser
+            # lookups, store status, the review queue — so a two-minute run made
+            # the entire service look down rather than just busy.
+            run = await run_in_threadpool(
+                run_discovery,
+                core,
+                limit=limit,
+                dry_run=dry_run,
+                trigger="manual",
+                model=model,
             )
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
