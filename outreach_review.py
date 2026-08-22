@@ -1,0 +1,222 @@
+"""The morning review queue: one page, one decision per store.
+
+Discovery and building run unattended overnight. Building costs nothing — no
+one is charged until an order exists — so stores are built first and the only
+thing waiting on a human is whether a stranger gets an email. That is the
+decision worth a person's judgment, and it is one tap.
+
+Accept sends the first-contact email and starts the follow-up clock. Decline
+deletes the store and its artwork and emails nobody. Neither happens on a timer;
+this module never acts on its own.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+import time
+import uuid
+from typing import Any, Dict, List
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+import outreach_mail
+import outreach_tracking
+from outreach_auth import require_outreach_secret
+
+
+_SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+_INSTALL_LOCK = threading.Lock()
+_INSTALLED_APP_IDS: set[int] = set()
+
+# Built and waiting on a decision. Anything already sent, declined or failed has
+# left the queue.
+PENDING_STATUSES = {"provisioned"}
+
+
+def _pending(state: Dict[str, Any]) -> bool:
+    if str(state.get("status") or "").strip().lower() not in PENDING_STATUSES:
+        return False
+    if state.get("sent_at") or state.get("declined_at"):
+        return False
+    return outreach_tracking.is_outreach_source(state.get("source"))
+
+
+def _row(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    """What the reviewer needs to decide, and nothing else."""
+    return {
+        "handle": handle,
+        "organization": outreach_mail.organization_name(state),
+        "storefront_name": state.get("storefront_name") or handle,
+        "type_of_store": state.get("type_of_store") or "",
+        "primary_color": state.get("primary_color") or "",
+        "contact_email": state.get("contact_email") or "",
+        "organization_url": state.get("organization_url") or "",
+        "contact_source_url": state.get("contact_source_url") or "",
+        "logo_source_url": state.get("logo_source_url") or "",
+        "source_agent": state.get("source_agent") or "",
+        "built_at": state.get("built_at") or state.get("created_at"),
+        "preview_url": outreach_mail.preview_url(handle),
+        "claim_url": outreach_mail.claim_url(handle),
+    }
+
+
+def pending_queue(core: Any) -> List[Dict[str, Any]]:
+    rows = [
+        _row(handle, state)
+        for handle, state in outreach_tracking.list_all(core).items()
+        if _pending(state)
+    ]
+    rows.sort(key=lambda row: str(row.get("built_at") or ""), reverse=True)
+    return rows
+
+
+def accept(core: Any, handle: str) -> Dict[str, Any]:
+    """Send the first-contact email and start the clock.
+
+    The clock is started only after the send succeeds. Stamping the dates first
+    would leave a store that was never contacted counting down toward a
+    follow-up about an email nobody received, and toward deletion for not
+    replying to it.
+    """
+    state = outreach_tracking.read(core, handle)
+    if not state:
+        raise LookupError("Outreach tracking not found")
+    if not _pending(state):
+        raise PermissionError("Store is not waiting for a decision")
+    if not str(state.get("contact_email") or "").strip():
+        raise ValueError("Store has no contact email")
+    if not outreach_mail.configured():
+        raise RuntimeError("SMTP is not configured")
+
+    outreach_mail.send(outreach_mail.first_contact(state))
+
+    sent_at = outreach_tracking.utc_iso()
+    patch = {
+        "sent_at": sent_at,
+        "followup_due_at": outreach_tracking.add_days_iso(sent_at, 3),
+        "delete_due_at": outreach_tracking.add_days_iso(sent_at, 7),
+        "email_authorized": True,
+        "status": "outreach_sent",
+        "reviewed_at": sent_at,
+        "review_decision": "accepted",
+    }
+    updated = outreach_tracking.update(core, handle, patch)
+    return {
+        "ok": True,
+        "handle": handle,
+        "status": "outreach_sent",
+        "sent_at": updated.get("sent_at"),
+        "followup_due_at": updated.get("followup_due_at"),
+        "delete_due_at": updated.get("delete_due_at"),
+    }
+
+
+def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
+    """Delete the store and the artwork. Nobody is emailed.
+
+    Recorded before the deletion starts, because a nuke that half-finishes must
+    not leave the store looking like it is still waiting for a decision.
+    """
+    state = outreach_tracking.read(core, handle)
+    if not state:
+        raise LookupError("Outreach tracking not found")
+    if not _pending(state):
+        raise PermissionError("Store is not waiting for a decision")
+
+    declined_at = outreach_tracking.utc_iso()
+    outreach_tracking.update(
+        core,
+        handle,
+        {
+            "declined_at": declined_at,
+            "reviewed_at": declined_at,
+            "review_decision": "declined",
+            "review_note": str(reason or "")[:300],
+            "status": "declined",
+            "email_authorized": False,
+            "followup_due_at": None,
+            "delete_due_at": None,
+        },
+    )
+
+    job_id = str(uuid.uuid4())
+    core._job_set(job_id, status="queued", handle=handle, created_at=time.time())
+    threading.Thread(
+        target=core._run_shopify_deprovision_job,
+        args=(job_id, handle),
+        name=f"outreach-decline-{handle}",
+        daemon=True,
+    ).start()
+    return {"ok": True, "handle": handle, "status": "declined", "job_id": job_id}
+
+
+def install_outreach_review_routes(app: Any, core: Any) -> bool:
+    app_id = id(app)
+    with _INSTALL_LOCK:
+        if app_id in _INSTALLED_APP_IDS:
+            return False
+        _INSTALLED_APP_IDS.add(app_id)
+
+    def _handle(raw: str) -> str:
+        handle = str(raw or "").strip().lower()
+        return handle if _SAFE_HANDLE.fullmatch(handle) else ""
+
+    @app.get("/api/outreach/review/queue")
+    def review_queue(request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        return {
+            "ok": True,
+            "email_configured": outreach_mail.configured(),
+            "from": outreach_mail.display_from(),
+            "pending": pending_queue(core),
+        }
+
+    @app.post("/api/outreach/review/{handle}/accept")
+    def review_accept(handle: str, request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        normalized = _handle(handle)
+        if not normalized:
+            return JSONResponse({"error": "invalid store handle"}, status_code=400)
+        try:
+            return accept(core, normalized)
+        except LookupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:
+            # The send failed and no dates were written, so the store is still
+            # in the queue and the button can simply be pressed again.
+            print(f"[outreach-review] accept failed for {normalized}: {exc}")
+            return JSONResponse(
+                {"error": f"Could not send the email: {exc}"},
+                status_code=502,
+            )
+
+    @app.post("/api/outreach/review/{handle}/decline")
+    async def review_decline(handle: str, request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        normalized = _handle(handle)
+        if not normalized:
+            return JSONResponse({"error": "invalid store handle"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            return decline(core, normalized, str((body or {}).get("reason") or ""))
+        except LookupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    return True

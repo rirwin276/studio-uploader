@@ -210,6 +210,16 @@ except Exception:
     log.exception("Could not install prospect demo routes")
 
 
+# The morning review queue. Read-only until somebody presses a button: it never
+# sends or deletes on a schedule of its own.
+try:
+    from outreach_review import install_outreach_review_routes
+
+    install_outreach_review_routes(app, core)
+except Exception:
+    log.exception("Could not install outreach review routes")
+
+
 # Follow-ups are isolated from intake/build behavior and remain inert unless
 # SMTP is configured and a store has explicitly been marked as sent.
 try:
