@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import os
-import smtplib
 import threading
 import time
-from email.message import EmailMessage
 from typing import Any, Dict
 
+import outreach_mail
 import outreach_tracking
 
 
@@ -16,40 +15,9 @@ _INSTALL_LOCK = threading.Lock()
 _INSTALLED = False
 
 
-def _followup_message(state: Dict[str, Any]) -> EmailMessage:
-    handle = str(state.get("handle") or "").strip()
-    name = str(state.get("storefront_name") or handle).strip()
-    preview = f"https://stellasageco.com/collections/{handle}?preview=1"
-    claim = f"https://stellasageco.com/pages/join-store?shop={handle}"
-    message = EmailMessage()
-    message["Subject"] = f"Quick follow-up: {name} private store"
-    message["To"] = str(state.get("contact_email") or "").strip()
-    message["From"] = os.getenv("SMTP_USER", "").strip()
-    message.set_content(
-        f"""Hello {name} team,
-
-Just a quick follow-up on the private, unofficial {name} spirit-wear concept:
-{preview}
-
-If an authorized person claims the store, you can easily edit shirt and hoodie colors, move or resize the logo, add artwork, and add products from the admin dashboard. The first verified account to use the private claim link becomes the store administrator:
-{claim}
-
-If it is not useful, reply “no” and I will remove the private concept and artwork.
-
-Ryan Irwin
-Founder, Stella & Sage Co.
-Veteran Owned and Operated
-"""
-    )
-    return message
-
-
 def process_due_followups(core: Any) -> int:
     """Send authorized, due follow-ups; leave them pending when SMTP is unset."""
-    host = os.getenv("SMTP_HOST", "").strip()
-    user = os.getenv("SMTP_USER", "").strip()
-    password = os.getenv("SMTP_PASS", "").strip()
-    if not host or not user or not password:
+    if not outreach_mail.configured():
         return 0
 
     now = time.time()
@@ -70,16 +38,9 @@ def process_due_followups(core: Any) -> int:
             or not recipient
         ):
             continue
-        message = _followup_message(state)
+        message = outreach_mail.follow_up(state)
         try:
-            with smtplib.SMTP(
-                host,
-                int(os.getenv("SMTP_PORT", "587")),
-                timeout=20,
-            ) as server:
-                server.starttls()
-                server.login(user, password)
-                server.send_message(message)
+            outreach_mail.send(message)
             outreach_tracking.update(
                 core,
                 handle,

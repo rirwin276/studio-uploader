@@ -36,8 +36,8 @@ def test_unauthorized_email_is_never_sent(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        outreach_followups.smtplib,
-        "SMTP",
+        outreach_followups.outreach_mail,
+        "send",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("SMTP should not run")),
     )
     assert outreach_followups.process_due_followups(object()) == 0
