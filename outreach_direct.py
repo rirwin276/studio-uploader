@@ -26,7 +26,7 @@ import outreach_tracking
 _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _INSTALL_LOCK = threading.Lock()
-_INSTALLED_APP_IDS: set[int] = set()
+_INSTALL_ATTRIBUTE = "_stella_outreach_direct_routes_installed"
 
 DEFAULT_PLACEMENT_PROFILE = {
     # Print files are 300 dpi. Moving these designs -300 px raises the front
@@ -128,11 +128,10 @@ def _run_direct_job(
 
 def install_outreach_direct_routes(app: Any, core: Any) -> bool:
     """Install the authenticated machine-submission API once per FastAPI app."""
-    app_id = id(app)
     with _INSTALL_LOCK:
-        if app_id in _INSTALLED_APP_IDS:
+        if getattr(app, _INSTALL_ATTRIBUTE, False):
             return False
-        _INSTALLED_APP_IDS.add(app_id)
+        setattr(app, _INSTALL_ATTRIBUTE, True)
 
     @app.post("/api/outreach/storefront-request")
     async def direct_outreach_storefront_request(

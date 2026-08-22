@@ -38,7 +38,7 @@ _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_AGENT = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _INSTALL_LOCK = threading.Lock()
-_INSTALLED_APP_IDS: set[int] = set()
+_INSTALL_ATTRIBUTE = "_stella_outreach_intake_routes_installed"
 _WORKER_INSTALLED = False
 _QUEUE_WAKE = threading.Event()
 _ACTIVE_LOCK = threading.Lock()
@@ -462,11 +462,10 @@ def process_intake_queue(core: Any, *, limit: int = 5) -> int:
 
 def install_outreach_intake_routes(app: Any, core: Any) -> bool:
     """Install the JSON intake and persistent-status endpoints once."""
-    app_id = id(app)
     with _INSTALL_LOCK:
-        if app_id in _INSTALLED_APP_IDS:
+        if getattr(app, _INSTALL_ATTRIBUTE, False):
             return False
-        _INSTALLED_APP_IDS.add(app_id)
+        setattr(app, _INSTALL_ATTRIBUTE, True)
 
     @app.post("/api/outreach/intake")
     async def create_outreach_intake(request: Request):
