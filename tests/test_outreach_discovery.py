@@ -355,3 +355,35 @@ def test_a_retry_never_waits_longer_than_the_cap(monkeypatch):
     even when the provider asks for minutes."""
     response = FakeResponse(429, "", headers={"retry-after": "600"})
     assert outreach_discovery._retry_after(response, 0) == outreach_discovery._MAX_RETRY_WAIT
+
+
+def test_the_run_route_never_blocks_the_event_loop():
+    """A run is minutes of blocking HTTP, and this process also serves the
+    storefront. Calling it inline from an async route held the event loop for
+    the whole run, so fundraiser lookups, store status and the review queue all
+    queued behind it and the service looked down rather than busy."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(outreach_discovery.install_outreach_discovery_routes)
+    tree = ast.parse(source.strip())
+
+    run_route = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "discovery_run":
+            run_route = node
+    assert run_route is not None, "discovery_run is expected to be an async route"
+
+    calls = [
+        node for node in ast.walk(run_route)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "run_discovery"
+    ]
+    assert not calls, "run_discovery must not be called directly from the async route"
+
+    threadpooled = [
+        node for node in ast.walk(run_route)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "run_in_threadpool"
+    ]
+    assert threadpooled, "the run must go through run_in_threadpool"
