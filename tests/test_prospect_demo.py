@@ -8,17 +8,26 @@ import prospect_demo
 
 
 class FakeCore:
+    """``shopify_owner`` is what Shopify would report for the store's owner —
+    empty while unclaimed, a customer id once somebody has claimed it."""
+
+    def __init__(self, shopify_owner: str = ""):
+        self.shopify_owner = shopify_owner
+
     def _require_admin_secret(self, request: Request):
         if request.headers.get("X-Admin-Secret") != "test-secret":
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return None
 
+    def _fr_get_owner_from_custom_shop(self, _handle: str) -> str:
+        return self.shopify_owner
 
-def _client(monkeypatch):
+
+def _client(monkeypatch, source="direct_outreach_api", shopify_owner=""):
     states = {
         "example-club": {
             "handle": "example-club",
-            "source": "direct_outreach_api",
+            "source": source,
             "store_status": "prospect_unclaimed",
             "claim_status": "unclaimed",
         }
@@ -33,7 +42,7 @@ def _client(monkeypatch):
     monkeypatch.setattr(prospect_demo.outreach_tracking, "read", read)
     monkeypatch.setattr(prospect_demo.outreach_tracking, "upsert", upsert)
     app = FastAPI()
-    prospect_demo.install_prospect_demo_routes(app, FakeCore())
+    prospect_demo.install_prospect_demo_routes(app, FakeCore(shopify_owner))
     return TestClient(app), states
 
 
@@ -144,3 +153,80 @@ def test_events_are_allowlisted(monkeypatch):
         json={"event": "delete_everything"},
     )
     assert rejected.status_code == 400
+
+
+def test_json_intake_stores_get_the_same_demo_as_multipart_stores(monkeypatch):
+    """The JSON intake queue writes its own ``source`` value.
+
+    Every store the nightly pipeline builds arrives with
+    ``vendor_neutral_outreach_intake`` instead of ``direct_outreach_api``.  A
+    single-string comparison silently disabled the demo, the appearance editor
+    and claim tracking for exactly those stores, so pin the shared behavior.
+    """
+    client, states = _client(monkeypatch, source="vendor_neutral_outreach_intake")
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is True
+
+    event = client.post(
+        "/api/outreach/store/example-club/demo-event",
+        headers=_headers(),
+        json={"event": "store_appearance_changed", "session_id": "browser-1"},
+    )
+    assert event.status_code == 200
+    assert states["example-club"]["prospect_demo"]["event_counts"]["store_appearance_changed"] == 1
+
+    prospect_demo.mark_claimed(FakeCore(), "example-club", "101")
+    assert states["example-club"]["claim_status"] == "claimed"
+    assert states["example-club"]["claimed_customer_id"] == "101"
+
+
+def test_a_website_store_is_never_treated_as_a_prospect(monkeypatch):
+    client, _states = _client(monkeypatch, source="website_request_form")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+
+
+def test_a_claimed_store_offers_no_demo_even_if_the_ledger_missed_the_claim(monkeypatch):
+    """The join route grants the claim in Shopify, then calls mark_claimed inside
+    a try/except so demo bookkeeping can never fail a claim that already
+    succeeded. When that call is the thing that fails, claim_status stays
+    "unclaimed" on a store that genuinely has an owner — and members the new
+    admin invites would be handed the admin demo. Shopify is the authority."""
+    client, states = _client(monkeypatch, shopify_owner="8899")
+    assert states["example-club"]["claim_status"] == "unclaimed"
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+
+    # ...and the stale ledger row repairs itself rather than being re-checked
+    # against Shopify on every single page view.
+    assert states["example-club"]["claim_status"] == "claimed"
+
+
+def test_a_claimed_store_refuses_demo_events_and_products(monkeypatch):
+    client, _states = _client(monkeypatch, shopify_owner="8899")
+
+    event = client.post(
+        "/api/outreach/store/example-club/demo-event",
+        headers=_headers(),
+        json={"event": "store_appearance_changed", "session_id": "browser-1"},
+    )
+    assert event.status_code == 409
+
+    reserve = client.post(
+        "/api/outreach/store/example-club/demo-product/reserve",
+        headers=_headers(),
+        json={"model": "bc3413", "request_id": "session-1", "job_id": "job-1"},
+    )
+    assert reserve.status_code == 409
+
+
+def test_an_unclaimed_store_is_unaffected_by_the_owner_check(monkeypatch):
+    client, states = _client(monkeypatch, shopify_owner="")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.json()["enabled"] is True
+    assert states["example-club"]["claim_status"] == "unclaimed"

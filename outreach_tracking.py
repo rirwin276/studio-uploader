@@ -14,6 +14,20 @@ from typing import Any, Dict, Optional
 
 OUTREACH_TRACKING_TYPE = "outreach_tracking"
 
+# Every ``source`` value that means "this store was built by outreach, not by a
+# customer on the website".  The multipart route writes the first value and the
+# JSON intake queue writes the second; both are outreach stores and every
+# consumer (prospect demo, claim tracking, retention review) must treat them the
+# same.  Add new intake routes here rather than comparing to a single string.
+OUTREACH_SOURCES = frozenset({
+    "direct_outreach_api",
+    "vendor_neutral_outreach_intake",
+})
+
+
+def is_outreach_source(value: Any) -> bool:
+    return str(value or "").strip().lower() in OUTREACH_SOURCES
+
 
 def utc_iso(value: Optional[float] = None) -> str:
     moment = datetime.now(timezone.utc) if value is None else datetime.fromtimestamp(value, timezone.utc)
