@@ -247,3 +247,23 @@ def test_recent_categories_are_fed_back_as_things_to_skip(wired, monkeypatch):
     outreach_discovery.run_discovery(core, limit=2, dry_run=True)
 
     assert "rowing club" in (seen.get("avoid_categories") or [])
+
+
+def test_a_run_can_override_the_model_without_a_redeploy(wired, monkeypatch):
+    """Comparing a cheap model against a better one should not require editing a
+    Railway variable and waiting for a deploy between each comparison."""
+    core, _ledger, _submitted = wired
+    monkeypatch.setenv("OUTREACH_DISCOVERY_MODEL", "configured-default")
+    seen = {}
+
+    def ask(limit, avoid, **kwargs):
+        seen.update(kwargs)
+        return [], {"model": kwargs.get("model") or "configured-default"}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+
+    outreach_discovery.run_discovery(core, limit=1, dry_run=True, model="better-model")
+    assert seen["model"] == "better-model"
+
+    outreach_discovery.run_discovery(core, limit=1, dry_run=True)
+    assert seen["model"] == ""  # falls back to the configured default

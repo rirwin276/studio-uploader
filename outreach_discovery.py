@@ -35,6 +35,7 @@ RUN_LEDGER_HANDLE = "zz-discovery-runs"
 _MAX_RUNS_KEPT = 25
 
 _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+_SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED_APP_IDS: set[int] = set()
 _RUN_LOCK = threading.Lock()
@@ -263,12 +264,15 @@ def _ask_for_candidates(
     focus: List[str] | None = None,
     avoid_domains: List[str] | None = None,
     avoid_categories: List[str] | None = None,
+    model: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """One call out to the model. Returns (candidates, telemetry)."""
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
-    model = os.getenv("OUTREACH_DISCOVERY_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    # A per-run override exists so a more capable model can be tried against the
+    # same brief without a variable edit and a redeploy between comparisons.
+    model = (model or os.getenv("OUTREACH_DISCOVERY_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     tool = os.getenv("OUTREACH_DISCOVERY_SEARCH_TOOL", DEFAULT_SEARCH_TOOL).strip() or DEFAULT_SEARCH_TOOL
 
     payload = {
@@ -428,6 +432,7 @@ def run_discovery(
     limit: int | None = None,
     dry_run: bool = False,
     trigger: str = "manual",
+    model: str = "",
 ) -> Dict[str, Any]:
     """Find candidates and, unless this is a dry run, queue them for building.
 
@@ -456,6 +461,7 @@ def run_discovery(
                 focus=focus,
                 avoid_domains=sorted(known_domains),
                 avoid_categories=avoid_categories,
+                model=model,
             )
             run.update(telemetry)
         except Exception as exc:
@@ -551,8 +557,13 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
         except (TypeError, ValueError):
             limit = nightly_limit()
         dry_run = bool((body or {}).get("dry_run"))
+        model = str((body or {}).get("model") or "").strip()[:80]
+        if model and not _SAFE_MODEL.fullmatch(model):
+            return JSONResponse({"ok": False, "error": "invalid model id"}, status_code=400)
         try:
-            run = run_discovery(core, limit=limit, dry_run=dry_run, trigger="manual")
+            run = run_discovery(
+                core, limit=limit, dry_run=dry_run, trigger="manual", model=model
+            )
         except RuntimeError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
         except Exception as exc:
