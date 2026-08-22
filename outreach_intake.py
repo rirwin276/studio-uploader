@@ -100,10 +100,11 @@ def _public_https_url(value: Any, label: str, *, resolve_dns: bool) -> str:
         raise OutreachIntakeError(f"{label} host could not be resolved")
     for address in addresses:
         try:
-            if not ipaddress.ip_address(address).is_global:
-                raise OutreachIntakeError(f"{label} must resolve only to public addresses")
+            resolved = ipaddress.ip_address(address)
         except ValueError as exc:
             raise OutreachIntakeError(f"{label} host returned an invalid address") from exc
+        if not resolved.is_global:
+            raise OutreachIntakeError(f"{label} must resolve only to public addresses")
     return text
 
 
