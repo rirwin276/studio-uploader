@@ -152,6 +152,102 @@ def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
     return {"ok": True, "handle": handle, "status": "declined", "job_id": job_id}
 
 
+def _activity(state: Dict[str, Any]) -> Dict[str, Any]:
+    """What the prospect actually did, from the demo ledger."""
+    demo = state.get("prospect_demo") if isinstance(state.get("prospect_demo"), dict) else {}
+    counts = demo.get("event_counts") if isinstance(demo.get("event_counts"), dict) else {}
+
+    def seen(name: str) -> bool:
+        try:
+            return int(counts.get(name) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    return {
+        "opened_store": seen("prospect_store_opened"),
+        "opened_admin": seen("admin_demo_opened"),
+        "changed_look": seen("store_appearance_changed"),
+        "built_product": seen("demo_product_successfully_created"),
+        "started_claim": seen("authentication_started"),
+        "product_status": demo.get("product_status") or "available",
+    }
+
+
+def _stage(state: Dict[str, Any]) -> str:
+    """Where this store sits in the funnel."""
+    status = str(state.get("status") or "").strip().lower()
+    if str(state.get("claim_status") or "").strip().lower() in {"claimed", "active"}:
+        return "claimed"
+    if state.get("declined_at") or status == "declined":
+        return "declined"
+    if status in {"intake_failed", "failed"}:
+        return "failed"
+    if state.get("sent_at"):
+        return "sent"
+    if status in PENDING_STATUSES:
+        return "pending"
+    return "building"
+
+
+def _pipeline_row(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    row = _row(handle, state)
+    row.update({
+        "stage": _stage(state),
+        "status": state.get("status") or "",
+        "sent_at": state.get("sent_at"),
+        "followup_sent_at": state.get("followup_sent_at"),
+        "followup_due_at": state.get("followup_due_at"),
+        "delete_due_at": state.get("delete_due_at"),
+        "claimed_at": state.get("claimed_at"),
+        "activity": _activity(state),
+    })
+    return row
+
+
+def pipeline(core: Any) -> Dict[str, Any]:
+    """Every outreach store, grouped by where it is in the funnel.
+
+    One read of the ledger answers the whole page. Splitting this across a
+    request per stage would multiply Shopify calls for a view whose entire
+    point is seeing the stages next to each other.
+    """
+    rows: List[Dict[str, Any]] = []
+    for handle, state in outreach_tracking.list_all(core).items():
+        if not outreach_tracking.is_outreach_source(state.get("source")):
+            continue
+        rows.append(_pipeline_row(handle, state))
+
+    def when(row: Dict[str, Any]) -> str:
+        return str(row.get("sent_at") or row.get("built_at") or "")
+
+    stages: Dict[str, List[Dict[str, Any]]] = {
+        name: [] for name in ("pending", "sent", "claimed", "building", "failed", "declined")
+    }
+    for row in rows:
+        stages.setdefault(row["stage"], []).append(row)
+    for name in stages:
+        stages[name].sort(key=when, reverse=True)
+
+    live = [row for row in rows if row["stage"] != "declined"]
+    return {
+        "totals": {
+            "found": len(rows),
+            "built": sum(1 for row in live if row["stage"] in {"pending", "sent", "claimed"}),
+            "emailed": sum(1 for row in live if row.get("sent_at")),
+            "visited": sum(1 for row in live if row["activity"]["opened_store"]),
+            "tried_admin": sum(1 for row in live if row["activity"]["opened_admin"]),
+            "made_product": sum(1 for row in live if row["activity"]["built_product"]),
+            "claimed": len(stages["claimed"]),
+            "declined": len(stages["declined"]),
+        },
+        "pending": stages["pending"],
+        "sent": stages["sent"],
+        "claimed": stages["claimed"],
+        "building": stages["building"],
+        "failed": stages["failed"],
+    }
+
+
 def install_outreach_review_routes(app: Any, core: Any) -> bool:
     app_id = id(app)
     with _INSTALL_LOCK:
@@ -173,6 +269,18 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
             "email_configured": outreach_mail.configured(),
             "from": outreach_mail.display_from(),
             "pending": pending_queue(core),
+        }
+
+    @app.get("/api/outreach/review/pipeline")
+    def review_pipeline(request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        return {
+            "ok": True,
+            "email_configured": outreach_mail.configured(),
+            "from": outreach_mail.display_from(),
+            **pipeline(core),
         }
 
     @app.post("/api/outreach/review/{handle}/accept")
