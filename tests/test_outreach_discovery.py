@@ -52,7 +52,7 @@ def wired(monkeypatch):
 
 
 def _answer(monkeypatch, candidates):
-    def ask(limit, avoid):
+    def ask(limit, avoid, **_kwargs):
         return list(candidates), {"model": "test-model", "seconds": 0.1}
 
     monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
@@ -127,7 +127,7 @@ def test_duplicates_inside_one_batch_are_caught(wired, monkeypatch):
 def test_a_failed_run_is_recorded_rather_than_lost(wired, monkeypatch):
     core, ledger, _submitted = wired
 
-    def boom(limit, avoid):
+    def boom(limit, avoid, **_kwargs):
         raise RuntimeError("OpenAI returned HTTP 404: unknown model")
 
     monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", boom)
@@ -165,10 +165,85 @@ def test_the_brief_tells_the_model_what_not_to_return(wired, monkeypatch):
     ledger["already-built"] = {"handle": "already-built"}
     seen = {}
 
-    def ask(limit, avoid):
+    def ask(limit, avoid, **kwargs):
         seen["avoid"] = avoid
+        seen.update(kwargs)
         return [], {}
 
     monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
     outreach_discovery.run_discovery(core, limit=2, dry_run=True)
     assert "already-built" in seen["avoid"]
+
+
+def test_the_same_organization_under_a_new_handle_is_caught(wired, monkeypatch):
+    """A handle is a weak identity for an organization.
+
+    The same fire department is cassie-vfd one night and
+    cassie-volunteer-fire-department the next, and both pass a handle check.
+    The website does not move.
+    """
+    core, ledger, submitted = wired
+    ledger["westside-rowing"] = {
+        "handle": "westside-rowing",
+        "organization_url": "https://www.westside.org/about",
+    }
+    _answer(monkeypatch, [_candidate("westside-rowing-club")])
+
+    run = outreach_discovery.run_discovery(core, limit=3)
+
+    assert run["accepted"] == 0
+    assert submitted == []
+    assert "westside.org" in run["rejected"][0]["reason"]
+
+
+def test_each_run_chases_a_different_slice_of_the_rotation(wired, monkeypatch):
+    """Two runs in a row of nothing but fire departments is the failure this
+    prevents. Variety comes from the schedule, not from hoping."""
+    core, _ledger, _submitted = wired
+    seen = []
+
+    def ask(limit, avoid, **kwargs):
+        seen.append(list(kwargs.get("focus") or []))
+        return [], {}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    for _ in range(3):
+        outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+
+    assert all(len(focus) == outreach_discovery._CATEGORIES_PER_RUN for focus in seen)
+    # No category repeats while the rotation still has unused entries.
+    flat = [item for focus in seen for item in focus]
+    assert len(set(flat)) == len(flat)
+
+
+def test_the_rotation_wraps_instead_of_running_out(wired, monkeypatch):
+    core, _ledger, _submitted = wired
+    seen = []
+
+    def ask(limit, avoid, **kwargs):
+        seen.append(list(kwargs.get("focus") or []))
+        return [], {}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    for _ in range(len(outreach_discovery.CATEGORY_ROTATION) + 4):
+        outreach_discovery.run_discovery(core, limit=1, dry_run=True)
+
+    assert all(len(focus) == outreach_discovery._CATEGORIES_PER_RUN for focus in seen)
+    assert seen[-1]  # still producing a focus after wrapping
+
+
+def test_recent_categories_are_fed_back_as_things_to_skip(wired, monkeypatch):
+    core, _ledger, _submitted = wired
+    _answer(monkeypatch, [_candidate()])
+    outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+
+    seen = {}
+
+    def ask(limit, avoid, **kwargs):
+        seen.update(kwargs)
+        return [], {}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+
+    assert "rowing club" in (seen.get("avoid_categories") or [])
