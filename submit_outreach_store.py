@@ -31,14 +31,15 @@ def _required_environment(name: str) -> str:
 def submit_store(
     *,
     base_url: str,
-    admin_secret: str,
+    secret: str,
+    secret_header: str,
     logo_path: Path,
     fields: Dict[str, Any],
 ) -> Dict[str, Any]:
     with logo_path.open("rb") as logo:
         response = requests.post(
             f"{base_url.rstrip('/')}/api/outreach/storefront-request",
-            headers={"X-Admin-Secret": admin_secret},
+            headers={secret_header: secret},
             data=fields,
             files={
                 "storefront_logo_file": (
@@ -59,7 +60,8 @@ def submit_store(
 def wait_for_job(
     *,
     base_url: str,
-    admin_secret: str,
+    secret: str,
+    secret_header: str,
     job_id: str,
     timeout_seconds: int,
 ) -> Dict[str, Any]:
@@ -68,7 +70,7 @@ def wait_for_job(
     while True:
         response = requests.get(
             f"{base_url.rstrip('/')}/api/outreach/job/{job_id}",
-            headers={"X-Admin-Secret": admin_secret},
+            headers={secret_header: secret},
             timeout=(10, 30),
         )
         response.raise_for_status()
@@ -102,13 +104,17 @@ def main() -> int:
 
     try:
         base_url = os.getenv("OUTREACH_API_BASE_URL", DEFAULT_API_BASE_URL).strip()
-        admin_secret = (
-            os.getenv("OUTREACH_API_SECRET", "").strip()
-            or _required_environment("ADMIN_SECRET")
-        )
+        outreach_secret = os.getenv("OUTREACH_API_SECRET", "").strip()
+        if outreach_secret:
+            secret = outreach_secret
+            secret_header = "X-Outreach-Secret"
+        else:
+            secret = _required_environment("ADMIN_SECRET")
+            secret_header = "X-Admin-Secret"
         result = submit_store(
             base_url=base_url,
-            admin_secret=admin_secret,
+            secret=secret,
+            secret_header=secret_header,
             logo_path=args.logo,
             fields={
                 "contact_email": args.contact_email,
@@ -127,7 +133,8 @@ def main() -> int:
         if not args.no_wait and result.get("status") == "queued" and result.get("job_id"):
             job = wait_for_job(
                 base_url=base_url,
-                admin_secret=admin_secret,
+                secret=secret,
+                secret_header=secret_header,
                 job_id=str(result["job_id"]),
                 timeout_seconds=max(30, args.timeout),
             )

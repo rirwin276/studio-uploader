@@ -145,6 +145,40 @@ def test_direct_request_requires_admin_secret(monkeypatch, tmp_path):
     assert core.provision_calls == []
 
 
+def test_direct_request_accepts_scoped_outreach_secret(monkeypatch, tmp_path):
+    scoped_secret = "outreach-test-secret-abcdefghijklmnopqrstuvwxyz"
+    monkeypatch.setenv("OUTREACH_API_SECRET", scoped_secret)
+    client, core, states = _app_with_tracking(monkeypatch, tmp_path)
+    response = client.post(
+        "/api/outreach/storefront-request",
+        headers={"X-Outreach-Secret": scoped_secret},
+        data=_valid_form(),
+        files={"storefront_logo_file": ("logo.png", _logo_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert len(core.provision_calls) == 1
+    assert states["example-club"]["status"] == "provisioned"
+
+
+def test_direct_request_rejects_wrong_scoped_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "OUTREACH_API_SECRET",
+        "outreach-test-secret-abcdefghijklmnopqrstuvwxyz",
+    )
+    client, core, _states = _app_with_tracking(monkeypatch, tmp_path)
+    response = client.post(
+        "/api/outreach/storefront-request",
+        headers={"X-Outreach-Secret": "wrong-secret"},
+        data=_valid_form(),
+        files={"storefront_logo_file": ("logo.png", _logo_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 401
+    assert core.provision_calls == []
+
+
 def test_direct_request_builds_claimable_store_and_tracks_it(monkeypatch, tmp_path):
     client, core, states = _app_with_tracking(monkeypatch, tmp_path)
     response = client.post(
