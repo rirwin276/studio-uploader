@@ -135,3 +135,95 @@ def test_a_website_store_never_enters_the_review_queue(wired):
     core, states, _sent = wired
     states["westside-rowing"]["source"] = "website_request_form"
     assert outreach_review.pending_queue(core) == []
+
+
+def _store(handle, **overrides):
+    row = {
+        "handle": handle,
+        "source": "vendor_neutral_outreach_intake",
+        "storefront_name": handle.replace("-", " ").title() + " Team Store",
+        "contact_email": f"info@{handle}.org",
+        "organization_url": f"https://{handle}.org/",
+        "status": "provisioned",
+        "built_at": "2026-08-22T02:00:00+00:00",
+    }
+    row.update(overrides)
+    return row
+
+
+def _pipeline_core(monkeypatch, stores):
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+    return FakeCore()
+
+
+def test_the_pipeline_sorts_every_store_into_one_stage(monkeypatch):
+    core = _pipeline_core(monkeypatch, {
+        "waiting": _store("waiting"),
+        "emailed": _store("emailed", sent_at="2026-08-22T09:00:00+00:00", status="outreach_sent"),
+        "won": _store("won", sent_at="2026-08-20T09:00:00+00:00", claim_status="claimed",
+                      claimed_at="2026-08-21T09:00:00+00:00"),
+        "gone": _store("gone", declined_at="2026-08-22T10:00:00+00:00", status="declined"),
+        "broken": _store("broken", status="intake_failed"),
+        "mid": _store("mid", status="building"),
+    })
+    result = outreach_review.pipeline(core)
+
+    assert [r["handle"] for r in result["pending"]] == ["waiting"]
+    assert [r["handle"] for r in result["sent"]] == ["emailed"]
+    assert [r["handle"] for r in result["claimed"]] == ["won"]
+    assert [r["handle"] for r in result["failed"]] == ["broken"]
+    assert [r["handle"] for r in result["building"]] == ["mid"]
+
+
+def test_a_claimed_store_counts_as_claimed_not_as_emailed_only(monkeypatch):
+    """Claimed is the outcome, so it wins over every earlier stage the store
+    also passed through."""
+    core = _pipeline_core(monkeypatch, {
+        "won": _store("won", sent_at="2026-08-20T09:00:00+00:00", claim_status="claimed"),
+    })
+    result = outreach_review.pipeline(core)
+    assert result["totals"]["claimed"] == 1
+    assert result["totals"]["emailed"] == 1
+    assert result["pending"] == []
+
+
+def test_the_totals_report_what_prospects_actually_did(monkeypatch):
+    core = _pipeline_core(monkeypatch, {
+        "looked": _store("looked", sent_at="2026-08-22T09:00:00+00:00", prospect_demo={
+            "event_counts": {"prospect_store_opened": 3},
+        }),
+        "played": _store("played", sent_at="2026-08-22T09:00:00+00:00", prospect_demo={
+            "event_counts": {
+                "prospect_store_opened": 1,
+                "admin_demo_opened": 2,
+                "demo_product_successfully_created": 1,
+            },
+        }),
+        "ignored": _store("ignored", sent_at="2026-08-22T09:00:00+00:00"),
+    })
+    totals = outreach_review.pipeline(core)["totals"]
+
+    assert totals["emailed"] == 3
+    assert totals["visited"] == 2
+    assert totals["tried_admin"] == 1
+    assert totals["made_product"] == 1
+
+
+def test_a_declined_store_never_inflates_the_funnel(monkeypatch):
+    core = _pipeline_core(monkeypatch, {
+        "gone": _store("gone", declined_at="2026-08-22T10:00:00+00:00", status="declined",
+                       sent_at="2026-08-22T09:00:00+00:00"),
+    })
+    totals = outreach_review.pipeline(core)["totals"]
+    assert totals["declined"] == 1
+    assert totals["built"] == 0
+    assert totals["emailed"] == 0
+
+
+def test_a_website_store_is_not_in_the_outreach_funnel(monkeypatch):
+    core = _pipeline_core(monkeypatch, {
+        "customer": _store("customer", source="website_request_form"),
+    })
+    result = outreach_review.pipeline(core)
+    assert result["totals"]["found"] == 0
+    assert result["pending"] == []
