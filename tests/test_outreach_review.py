@@ -227,3 +227,73 @@ def test_a_website_store_is_not_in_the_outreach_funnel(monkeypatch):
     result = outreach_review.pipeline(core)
     assert result["totals"]["found"] == 0
     assert result["pending"] == []
+
+
+class JobCore(FakeCore):
+    def __init__(self, jobs=None):
+        super().__init__()
+        self._jobs = jobs or {}
+
+    def _job_get(self, job_id):
+        return self._jobs.get(job_id, {})
+
+
+def test_a_failed_store_shows_why_it_failed(monkeypatch):
+    """The reason was always recorded and never shown, which left the only
+    honest answer to 'did it work' as 'open Railway and read the logs'."""
+    stores = {
+        "oranco": _store("oranco", status="intake_failed",
+                         intake_error="logo_source_url did not return an image",
+                         failed_at="2026-08-22T22:45:31+00:00"),
+    }
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+    row = outreach_review.pipeline(FakeCore())["failed"][0]
+
+    assert row["error"] == "logo_source_url did not return an image"
+
+
+def test_the_steps_say_where_a_store_stopped(monkeypatch):
+    stores = {
+        "oranco": _store("oranco", status="intake_failed",
+                         created_at="2026-08-22T22:45:00+00:00",
+                         build_started_at=None, built_at=None,
+                         failed_at="2026-08-22T22:45:31+00:00"),
+    }
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+    steps = outreach_review.pipeline(FakeCore())["failed"][0]["steps"]
+    done = {step["label"]: step["done"] for step in steps}
+
+    assert done["Queued"] is True
+    assert done["Logo prepared, build started"] is False
+    assert done["Store and products built"] is False
+    assert done["Stopped"] is True
+
+
+def test_the_provisioner_log_tail_comes_back_with_a_stuck_store(monkeypatch):
+    stores = {"mid": _store("mid", status="building", job_id="job-1")}
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+    core = JobCore({"job-1": {
+        "status": "running",
+        "stdout": "\n".join("line %d" % n for n in range(1, 40)),
+    }})
+    row = outreach_review.pipeline(core)["building"][0]
+
+    assert row["log"][-1] == "line 39"
+    assert len(row["log"]) == 12  # tail only; the useful part is the bottom
+
+
+def test_a_settled_store_does_not_go_asking_about_old_jobs(monkeypatch):
+    """A sent store's provisioning finished days ago, and reading it back on
+    every page load costs a lookup per store for nothing."""
+    stores = {"emailed": _store("emailed", sent_at="2026-08-22T09:00:00+00:00", job_id="job-1")}
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+
+    asked = []
+
+    class Counting(JobCore):
+        def _job_get(self, job_id):
+            asked.append(job_id)
+            return {}
+
+    outreach_review.pipeline(Counting())
+    assert asked == []
