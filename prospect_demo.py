@@ -76,12 +76,55 @@ def _normalize_handle(raw: Any) -> str:
 
 
 def _is_unclaimed_prospect(state: Dict[str, Any]) -> bool:
+    """Cheap ledger check. Says "maybe" — see _confirm_unclaimed for the answer."""
     return bool(
         state
         and outreach_tracking.is_outreach_source(state.get("source"))
         and str(state.get("store_status") or "").lower() == "prospect_unclaimed"
         and str(state.get("claim_status") or "unclaimed").lower() == "unclaimed"
     )
+
+
+def _shopify_owner(core: Any, handle: str) -> str:
+    """The store's real owner id from Shopify, or "" when still unclaimed."""
+    reader = getattr(core, "_fr_get_owner_from_custom_shop", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(handle) or "").strip()
+    except Exception as exc:
+        print(f"[prospect-demo] owner lookup failed for {handle}: {exc}")
+        return ""
+
+
+def _confirm_unclaimed(core: Any, handle: str, state: Dict[str, Any]) -> bool:
+    """Whether this store may still be demoed, with Shopify as the authority.
+
+    claim_status is bookkeeping, and deliberately unreliable: the join route
+    grants the claim atomically in Shopify and only then calls mark_claimed,
+    inside a try/except that swallows failures so demo bookkeeping can never
+    fail a claim that already succeeded. That is the right trade for the claim
+    and the wrong one to authorize against — a dropped mark_claimed leaves a
+    genuinely claimed store reading "unclaimed" here forever, and the demo is
+    what a member invited by the new admin would then be handed.
+
+    So the ledger is only allowed to deny. Granting is checked against the
+    custom_shop owner field, which the claim writes before it reports success,
+    and a store found already claimed heals its own ledger on the way out.
+    """
+    if not _is_unclaimed_prospect(state):
+        return False
+    if not _shopify_owner(core, handle):
+        return True
+
+    try:
+        state["claim_status"] = "claimed"
+        state["store_status"] = "claimed"
+        state.setdefault("claimed_at", outreach_tracking.utc_iso())
+        outreach_tracking.upsert(core, handle, state)
+    except Exception as exc:
+        print(f"[prospect-demo] could not heal claim status for {handle}: {exc}")
+    return False
 
 
 def _demo(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,14 +139,24 @@ def _demo(state: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def _public_state(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+def _public_state(
+    handle: str,
+    state: Dict[str, Any],
+    *,
+    unclaimed: bool | None = None,
+) -> Dict[str, Any]:
+    """Pass ``unclaimed`` from _confirm_unclaimed wherever the answer must be
+    authoritative. Without it this falls back to the ledger, which can only be
+    stale in the permissive direction."""
     demo = _demo(state)
+    if unclaimed is None:
+        unclaimed = _is_unclaimed_prospect(state)
     return {
         "ok": True,
         "handle": handle,
         "store_status": state.get("store_status") or "",
         "claim_status": state.get("claim_status") or "unclaimed",
-        "enabled": _is_unclaimed_prospect(state) and bool(demo.get("enabled", True)),
+        "enabled": unclaimed and bool(demo.get("enabled", True)),
         "product_limit": 1,
         "product_status": demo.get("product_status") or "available",
         "product_model": demo.get("product_model"),
@@ -161,7 +214,7 @@ def record_event(
         state = outreach_tracking.read(core, normalized)
         if not state:
             raise LookupError("Outreach tracking not found")
-        if require_unclaimed and not _is_unclaimed_prospect(state):
+        if require_unclaimed and not _confirm_unclaimed(core, normalized, state):
             raise PermissionError("Store is not an unclaimed prospect")
         row = _append_event(
             state,
@@ -217,7 +270,13 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
         state = outreach_tracking.read(core, normalized)
         if not state:
             return JSONResponse({"error": "Outreach tracking not found"}, status_code=404)
-        return _public_state(normalized, state)
+        # This response is what unhides Try the admin and what mints the demo
+        # token, so the claim check here has to be the authoritative one.
+        return _public_state(
+            normalized,
+            state,
+            unclaimed=_confirm_unclaimed(core, normalized, state),
+        )
 
     @app.post("/api/outreach/store/{handle}/demo-event")
     async def demo_event(handle: str, request: Request):
@@ -264,7 +323,7 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
             state = outreach_tracking.read(core, normalized)
             if not state:
                 return JSONResponse({"error": "Outreach tracking not found"}, status_code=404)
-            if not _is_unclaimed_prospect(state):
+            if not _confirm_unclaimed(core, normalized, state):
                 return JSONResponse({"error": "Store is not an unclaimed prospect"}, status_code=409)
             demo = _demo(state)
             status = str(demo.get("product_status") or "available")

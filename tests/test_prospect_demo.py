@@ -8,13 +8,22 @@ import prospect_demo
 
 
 class FakeCore:
+    """``shopify_owner`` is what Shopify would report for the store's owner —
+    empty while unclaimed, a customer id once somebody has claimed it."""
+
+    def __init__(self, shopify_owner: str = ""):
+        self.shopify_owner = shopify_owner
+
     def _require_admin_secret(self, request: Request):
         if request.headers.get("X-Admin-Secret") != "test-secret":
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return None
 
+    def _fr_get_owner_from_custom_shop(self, _handle: str) -> str:
+        return self.shopify_owner
 
-def _client(monkeypatch, source="direct_outreach_api"):
+
+def _client(monkeypatch, source="direct_outreach_api", shopify_owner=""):
     states = {
         "example-club": {
             "handle": "example-club",
@@ -33,7 +42,7 @@ def _client(monkeypatch, source="direct_outreach_api"):
     monkeypatch.setattr(prospect_demo.outreach_tracking, "read", read)
     monkeypatch.setattr(prospect_demo.outreach_tracking, "upsert", upsert)
     app = FastAPI()
-    prospect_demo.install_prospect_demo_routes(app, FakeCore())
+    prospect_demo.install_prospect_demo_routes(app, FakeCore(shopify_owner))
     return TestClient(app), states
 
 
@@ -178,3 +187,46 @@ def test_a_website_store_is_never_treated_as_a_prospect(monkeypatch):
     state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
     assert state.status_code == 200
     assert state.json()["enabled"] is False
+
+
+def test_a_claimed_store_offers_no_demo_even_if_the_ledger_missed_the_claim(monkeypatch):
+    """The join route grants the claim in Shopify, then calls mark_claimed inside
+    a try/except so demo bookkeeping can never fail a claim that already
+    succeeded. When that call is the thing that fails, claim_status stays
+    "unclaimed" on a store that genuinely has an owner — and members the new
+    admin invites would be handed the admin demo. Shopify is the authority."""
+    client, states = _client(monkeypatch, shopify_owner="8899")
+    assert states["example-club"]["claim_status"] == "unclaimed"
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+
+    # ...and the stale ledger row repairs itself rather than being re-checked
+    # against Shopify on every single page view.
+    assert states["example-club"]["claim_status"] == "claimed"
+
+
+def test_a_claimed_store_refuses_demo_events_and_products(monkeypatch):
+    client, _states = _client(monkeypatch, shopify_owner="8899")
+
+    event = client.post(
+        "/api/outreach/store/example-club/demo-event",
+        headers=_headers(),
+        json={"event": "store_appearance_changed", "session_id": "browser-1"},
+    )
+    assert event.status_code == 409
+
+    reserve = client.post(
+        "/api/outreach/store/example-club/demo-product/reserve",
+        headers=_headers(),
+        json={"model": "bc3413", "request_id": "session-1", "job_id": "job-1"},
+    )
+    assert reserve.status_code == 409
+
+
+def test_an_unclaimed_store_is_unaffected_by_the_owner_check(monkeypatch):
+    client, states = _client(monkeypatch, shopify_owner="")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.json()["enabled"] is True
+    assert states["example-club"]["claim_status"] == "unclaimed"
