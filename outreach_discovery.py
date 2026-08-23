@@ -28,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 import outreach_logo
 import outreach_tracking
+import outreach_verify
 from outreach_auth import require_outreach_secret
 
 
@@ -418,6 +419,17 @@ def _clean(
         # Cheaper to lose the candidate than to build a store wearing somebody
         # else's badge and email a stranger about it.
         return None, origin_problem
+
+    # Go and look. Everything above this line is the model's word, and a model
+    # that invents an organization invents its website to match.
+    verified, problem = outreach_verify.check_candidate({
+        "contact_email": email,
+        "organization_url": urls["organization_url"],
+        "storefront_name": candidate.get("storefront_name"),
+        "storefront_handle": handle,
+    })
+    if not verified:
+        return None, problem
 
     return {
         "provider_request_id": f"discovery-{time.strftime('%Y%m%d')}-{handle}"[:120],
