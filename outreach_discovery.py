@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -42,21 +43,60 @@ _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED_APP_IDS: set[int] = set()
 
-# One run at a time, but never forever. A plain lock has no way back: a run
-# that dies without unwinding, or a worker that is killed mid-flight, leaves
-# discovery permanently answering "already in progress" and the only cure is a
-# redeploy. Past this age the previous run is not busy, it is gone.
-#
-# Comfortably longer than the worst honest run: three attempts at a 300s read
-# timeout plus backoff is about sixteen minutes.
-_STALE_RUN_SECONDS = 20 * 60
+# One run at a time. The request used to be allowed to wait five minutes and
+# retry three times, which made a perfectly ordinary provider slowdown look
+# exactly like a dead worker. Discovery is deliberately bounded below, so an
+# eight-minute lease is generous and a stale lease cannot freeze the dashboard
+# for most of an hour.
+_STALE_RUN_SECONDS = 8 * 60
 _RUN_STATE_LOCK = threading.Lock()
 _RUN_STARTED_AT: float | None = None
+_RUN_TOKEN = ""
+_RUN_PHASE = ""
+_RUN_UPDATED_AT: float | None = None
+
+
+def _current_run_token() -> str:
+    with _RUN_STATE_LOCK:
+        return _RUN_TOKEN
+
+
+def _owns_run(token: str) -> bool:
+    with _RUN_STATE_LOCK:
+        return bool(token) and token == _RUN_TOKEN
+
+
+def _set_run_phase(token: str, phase: str) -> None:
+    """Publish a small, safe progress snapshot for the review screen.
+
+    The token matters when a worker is killed or a lease is taken over: an old
+    worker must never overwrite the status of the replacement that owns it.
+    """
+    global _RUN_PHASE, _RUN_UPDATED_AT
+    with _RUN_STATE_LOCK:
+        if token and token == _RUN_TOKEN:
+            _RUN_PHASE = str(phase or "")[:180]
+            _RUN_UPDATED_AT = time.time()
+
+
+def _run_snapshot() -> Dict[str, Any]:
+    now = time.time()
+    with _RUN_STATE_LOCK:
+        started = _RUN_STARTED_AT
+        age = max(0.0, now - started) if started is not None else 0.0
+        return {
+            "running": started is not None,
+            "age_seconds": round(age, 1) if started is not None else None,
+            "phase": _RUN_PHASE or None,
+            "updated_at_epoch": _RUN_UPDATED_AT,
+            "stale_after_seconds": _STALE_RUN_SECONDS,
+            "can_clear": started is not None and age >= _STALE_RUN_SECONDS,
+        }
 
 
 def _begin_run() -> Tuple[bool, float]:
     """Claim the right to run. Returns (allowed, age of the run in the way)."""
-    global _RUN_STARTED_AT
+    global _RUN_STARTED_AT, _RUN_TOKEN, _RUN_PHASE, _RUN_UPDATED_AT
     now = time.time()
     with _RUN_STATE_LOCK:
         started = _RUN_STARTED_AT
@@ -69,25 +109,46 @@ def _begin_run() -> Tuple[bool, float]:
                 "minutes ago — treating it as dead"
             )
         _RUN_STARTED_AT = now
+        _RUN_TOKEN = uuid.uuid4().hex
+        _RUN_PHASE = "Starting discovery"
+        _RUN_UPDATED_AT = now
         return True, 0.0
 
 
-def _end_run() -> None:
-    global _RUN_STARTED_AT
+def _end_run(token: str = "") -> None:
+    """Release a run only when its owner still has the lease.
+
+    Without the token, a pre-timeout worker that eventually wakes up could
+    clear the state for the newer worker that took over its stale lease.
+    """
+    global _RUN_STARTED_AT, _RUN_TOKEN, _RUN_PHASE, _RUN_UPDATED_AT
     with _RUN_STATE_LOCK:
+        if token and token != _RUN_TOKEN:
+            return
         _RUN_STARTED_AT = None
+        _RUN_TOKEN = ""
+        _RUN_PHASE = ""
+        _RUN_UPDATED_AT = time.time()
 
 
 def clear_stuck_run() -> bool:
     """Forget the run in progress. Returns whether there was one."""
-    global _RUN_STARTED_AT
+    global _RUN_STARTED_AT, _RUN_TOKEN, _RUN_PHASE, _RUN_UPDATED_AT
     with _RUN_STATE_LOCK:
         had = _RUN_STARTED_AT is not None
         _RUN_STARTED_AT = None
+        _RUN_TOKEN = ""
+        _RUN_PHASE = ""
+        _RUN_UPDATED_AT = time.time()
     return had
 
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 10
+# Ask for a small reserve. A candidate can be real and still fail one of the
+# deterministic checks (duplicate, bad direct-logo URL, dead contact domain).
+# Returning exactly five candidates to fill five slots made one normal miss
+# look like the model "couldn't find anyone".
+MAX_RESEARCH_CANDIDATES = 12
 
 # Left to its own devices the model finds one easy vein and stays in it — two
 # runs in a row of nothing but volunteer fire departments. The brief listing
@@ -118,7 +179,7 @@ _API_URL = "https://api.openai.com/v1/responses"
 # Both are environment-driven on purpose. Model names and the exact web-search
 # tool identifier change on the provider's schedule, not ours, and a rename
 # should be a variable edit rather than a deploy.
-DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_SEARCH_TOOL = "web_search"
 
 
@@ -246,6 +307,34 @@ def nightly_limit() -> int:
     return max(1, min(MAX_LIMIT, value))
 
 
+def _research_limit(requested: int) -> int:
+    """Return enough candidates to survive ordinary deterministic rejects.
+
+    This is intentionally capped. More web searching is not a substitute for a
+    better brief, and an overnight run should have a predictable ceiling.
+    """
+    return min(MAX_RESEARCH_CANDIDATES, max(requested + 2, requested * 2))
+
+
+def _timeouts() -> Tuple[float, float]:
+    """Bound provider waiting so one stalled search cannot hold discovery.
+
+    Environment overrides are useful for temporary provider incidents, but a
+    mistaken huge value must not reintroduce the old all-night freeze.
+    """
+    def number(name: str, fallback: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(os.getenv(name, str(fallback)))
+        except (TypeError, ValueError):
+            value = fallback
+        return min(maximum, max(minimum, value))
+
+    return (
+        number("OUTREACH_DISCOVERY_CONNECT_TIMEOUT_SECONDS", _CONNECT_TIMEOUT_SECONDS, 5, 30),
+        number("OUTREACH_DISCOVERY_READ_TIMEOUT_SECONDS", _READ_TIMEOUT_SECONDS, 30, 180),
+    )
+
+
 def _ledger(core: Any) -> Dict[str, Dict[str, Any]]:
     try:
         rows = outreach_tracking.list_all(core)
@@ -308,8 +397,10 @@ def _rotation_for_run(core: Any) -> Tuple[List[str], List[str]]:
 # so a run that hits it should wait rather than report failure and lose the
 # search it already paid for.
 _RETRYABLE = {429, 500, 502, 503, 504}
-_MAX_ATTEMPTS = 3
+_MAX_ATTEMPTS = 2
 _MAX_RETRY_WAIT = 30.0
+_CONNECT_TIMEOUT_SECONDS = 15
+_READ_TIMEOUT_SECONDS = 90
 
 
 def _retry_after(response: Any, attempt: int) -> float:
@@ -369,6 +460,7 @@ def _ask_for_candidates(
         },
     }
     started = time.time()
+    connect_timeout, read_timeout = _timeouts()
     response = None
     attempts = 0
     for attempt in range(_MAX_ATTEMPTS):
@@ -377,7 +469,7 @@ def _ask_for_candidates(
             _API_URL,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=(15, 300),
+            timeout=(connect_timeout, read_timeout),
         )
         if response.status_code < 300:
             break
@@ -412,6 +504,8 @@ def _ask_for_candidates(
         "focus": list(focus or []),
         "model": model,
         "search_tool": tool,
+        "connect_timeout_seconds": connect_timeout,
+        "read_timeout_seconds": read_timeout,
         "seconds": round(time.time() - started, 1),
         "input_tokens": usage.get("input_tokens"),
         "output_tokens": usage.get("output_tokens"),
@@ -535,34 +629,42 @@ def run_discovery(
     dry_run: bool = False,
     trigger: str = "manual",
     model: str = "",
+    _reserved_token: str = "",
 ) -> Dict[str, Any]:
     """Find candidates and, unless this is a dry run, queue them for building.
 
     A dry run does everything except create anything: it is how you check what
     the brief actually returns before letting it loose on a real Shopify store.
     """
-    allowed, age = _begin_run()
-    if not allowed:
-        raise RuntimeError(
-            "A discovery run has been going for "
-            f"{int(age // 60)}m {int(age % 60)}s. Wait for it, or clear it if it is stuck."
-        )
+    if _reserved_token:
+        token = _reserved_token
+    else:
+        allowed, age = _begin_run()
+        if not allowed:
+            raise RuntimeError(
+                "A discovery run has been going for "
+                f"{int(age // 60)}m {int(age % 60)}s. Wait for it, or clear it if it is stuck."
+            )
+        token = _current_run_token()
     try:
         requested = max(1, min(MAX_LIMIT, int(limit or nightly_limit())))
+        research_limit = _research_limit(requested)
         started_at = outreach_tracking.utc_iso()
         run: Dict[str, Any] = {
             "started_at": started_at,
             "trigger": trigger,
             "dry_run": bool(dry_run),
             "requested": requested,
+            "research_requested": research_limit,
         }
         known = set(_known_handles(core))
         known_domains = _known_domains(core)
         focus, avoid_categories = _rotation_for_run(core)
         run["focus"] = focus
         try:
+            _set_run_phase(token, f"Searching public sources for up to {research_limit} candidates")
             candidates, telemetry = _ask_for_candidates(
-                requested,
+                research_limit,
                 sorted(known),
                 focus=focus,
                 avoid_domains=sorted(known_domains),
@@ -577,9 +679,18 @@ def run_discovery(
             _record_run(core, run)
             raise
 
+        if not _owns_run(token):
+            raise RuntimeError("This discovery run lost its lease before candidate checks completed")
+
         accepted: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
-        for candidate in candidates[:requested]:
+        candidate_total = len(candidates)
+        for index, candidate in enumerate(candidates[:MAX_RESEARCH_CANDIDATES], start=1):
+            if len(accepted) >= requested:
+                break
+            if not _owns_run(token):
+                raise RuntimeError("This discovery run lost its lease during candidate checks")
+            _set_run_phase(token, f"Checking candidate {index} of {candidate_total}")
             payload, reason = _clean(candidate, known, known_domains)
             if payload is None:
                 rejected.append({
@@ -624,7 +735,7 @@ def run_discovery(
         _record_run(core, run)
         return run
     finally:
-        _end_run()
+        _end_run(token)
 
 
 def build_last_run(core: Any) -> Dict[str, Any]:
@@ -680,6 +791,46 @@ def build_last_run(core: Any) -> Dict[str, Any]:
     return run
 
 
+def _start_manual_run(
+    core: Any,
+    *,
+    token: str,
+    limit: int,
+    dry_run: bool,
+    model: str,
+) -> None:
+    """Run discovery after the HTTP response has returned.
+
+    The review page polls status. Holding its POST request open for search,
+    verification, and retries invites browser timeouts and makes people press
+    Run again, which is how a healthy slow run looked frozen.
+    """
+    def worker() -> None:
+        try:
+            run_discovery(
+                core,
+                limit=limit,
+                dry_run=dry_run,
+                trigger="manual",
+                model=model,
+                _reserved_token=token,
+            )
+        except Exception:
+            # The run records its own error before raising. Keep a server-side
+            # traceback too, without turning an expected provider failure into
+            # a silent background-thread death.
+            print("[outreach-discovery] manual run failed", flush=True)
+            import traceback
+            traceback.print_exc()
+
+    thread = threading.Thread(
+        target=worker,
+        name="outreach-discovery",
+        daemon=True,
+    )
+    thread.start()
+
+
 def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
     app_id = id(app)
     with _INSTALL_LOCK:
@@ -697,8 +848,9 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
             "configured": configured(),
             "nightly_enabled": enabled(),
             "nightly_limit": nightly_limit(),
-            "model": os.getenv("OUTREACH_DISCOVERY_MODEL", DEFAULT_MODEL),
-            "running": _RUN_STARTED_AT is not None,
+            "model": os.getenv("OUTREACH_DISCOVERY_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+            "research_limit": _research_limit(nightly_limit()),
+            **_run_snapshot(),
             "runs": recent_runs(core),
         }
 
@@ -724,25 +876,32 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
         model = str((body or {}).get("model") or "").strip()[:80]
         if model and not _SAFE_MODEL.fullmatch(model):
             return JSONResponse({"ok": False, "error": "invalid model id"}, status_code=400)
-        try:
-            # A run is a web search plus a model call: minutes of blocking HTTP.
-            # Calling it inline from an async route holds the event loop for the
-            # whole time, and this process serves the storefront — fundraiser
-            # lookups, store status, the review queue — so a two-minute run made
-            # the entire service look down rather than just busy.
-            run = await run_in_threadpool(
-                run_discovery,
-                core,
-                limit=limit,
-                dry_run=dry_run,
-                trigger="manual",
-                model=model,
+        allowed, age = _begin_run()
+        if not allowed:
+            snapshot = _run_snapshot()
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        "A discovery run has been going for "
+                        f"{int(age // 60)}m {int(age % 60)}s"
+                    ),
+                    **snapshot,
+                },
+                status_code=409,
             )
-        except RuntimeError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
-        except Exception as exc:
-            return JSONResponse({"ok": False, "error": str(exc)[:400]}, status_code=502)
-        return {"ok": True, "run": run}
+        token = _current_run_token()
+        _start_manual_run(
+            core,
+            token=token,
+            limit=limit,
+            dry_run=dry_run,
+            model=model,
+        )
+        return JSONResponse(
+            {"ok": True, "started": True, **_run_snapshot()},
+            status_code=202,
+        )
 
     @app.post("/api/outreach/discovery/clear")
     def discovery_clear(request: Request):
@@ -755,6 +914,16 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
         denied = require_outreach_secret(core, request)
         if denied is not None:
             return denied
+        snapshot = _run_snapshot()
+        if snapshot["running"] and not snapshot["can_clear"]:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "The current run is still within its bounded wait window.",
+                    **snapshot,
+                },
+                status_code=409,
+            )
         return {"ok": True, "cleared": clear_stuck_run()}
 
     @app.post("/api/outreach/discovery/build-last")

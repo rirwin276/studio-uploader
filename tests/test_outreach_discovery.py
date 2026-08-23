@@ -131,6 +131,27 @@ def test_duplicates_inside_one_batch_are_caught(wired, monkeypatch):
     assert len(submitted) == 1
 
 
+def test_discovery_asks_for_a_small_reserve_and_uses_it_after_rejections(wired, monkeypatch):
+    """A five-slot run should not come back empty because its first five
+    model results contain one duplicate or a broken logo URL."""
+    core, _ledger, submitted = wired
+    seen = {}
+
+    def ask(limit, avoid, **_kwargs):
+        seen["limit"] = limit
+        return [
+            _candidate("not a valid handle!"),
+            _candidate("good-club"),
+        ], {"model": "test-model", "seconds": 0.1}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    run = outreach_discovery.run_discovery(core, limit=1)
+
+    assert seen["limit"] > 1
+    assert run["accepted"] == 1
+    assert submitted[0]["storefront_handle"] == "good-club"
+
+
 def test_a_failed_run_is_recorded_rather_than_lost(wired, monkeypatch):
     core, ledger, _submitted = wired
 
@@ -364,11 +385,10 @@ def test_a_retry_never_waits_longer_than_the_cap(monkeypatch):
     assert outreach_discovery._retry_after(response, 0) == outreach_discovery._MAX_RETRY_WAIT
 
 
-def test_the_run_route_never_blocks_the_event_loop():
-    """A run is minutes of blocking HTTP, and this process also serves the
-    storefront. Calling it inline from an async route held the event loop for
-    the whole run, so fundraiser lookups, store status and the review queue all
-    queued behind it and the service looked down rather than busy."""
+def test_the_run_route_starts_work_without_holding_the_request_open():
+    """A run is minutes of blocking HTTP. The route must start it and return
+    immediately so the review screen can poll the published phase instead of
+    waiting until the browser decides the request froze."""
     import ast
     import inspect
 
@@ -388,12 +408,12 @@ def test_the_run_route_never_blocks_the_event_loop():
     ]
     assert not calls, "run_discovery must not be called directly from the async route"
 
-    threadpooled = [
+    starters = [
         node for node in ast.walk(run_route)
         if isinstance(node, ast.Call)
-        and getattr(node.func, "id", "") == "run_in_threadpool"
+        and getattr(node.func, "id", "") == "_start_manual_run"
     ]
-    assert threadpooled, "the run must go through run_in_threadpool"
+    assert starters, "the run must be started in the background"
 
 
 def test_the_candidates_you_just_reviewed_are_the_ones_that_get_built(wired, monkeypatch):
@@ -504,6 +524,23 @@ def test_a_dead_run_is_taken_over_rather_than_waited_on_forever(monkeypatch):
     discovery permanently answering "already in progress", curable only by a
     redeploy."""
     outreach_discovery._end_run()
+
+
+def test_an_old_worker_cannot_release_a_newer_workers_lease(monkeypatch):
+    outreach_discovery._end_run()
+    assert outreach_discovery._begin_run()[0]
+    old_token = outreach_discovery._current_run_token()
+    real_time = outreach_discovery.time.time
+    later = real_time() + outreach_discovery._STALE_RUN_SECONDS + 60
+    monkeypatch.setattr(outreach_discovery.time, "time", lambda: later)
+    assert outreach_discovery._begin_run()[0]
+    new_token = outreach_discovery._current_run_token()
+
+    outreach_discovery._end_run(old_token)
+
+    assert outreach_discovery._run_snapshot()["running"] is True
+    assert outreach_discovery._current_run_token() == new_token
+    outreach_discovery._end_run(new_token)
     assert outreach_discovery._begin_run()[0]
 
     # The run that claimed it is long dead. Capture the real clock first —

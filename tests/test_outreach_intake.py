@@ -206,6 +206,43 @@ def test_logo_url_rejects_private_dns(monkeypatch):
         raise AssertionError("private DNS result should be rejected")
 
 
+def test_background_removal_gets_a_transparent_edge_guard(monkeypatch):
+    """A logo touching the edge of its source must not be cut by the removal
+    provider before we have a chance to crop it correctly ourselves."""
+    source = Image.new("RGB", (100, 40), (20, 50, 90))
+    captured = []
+
+    class LogoCore:
+        MAX_IMAGE_PIXELS = 40_000_000
+
+        @staticmethod
+        def _is_svg_data(_raw):
+            return False
+
+        @staticmethod
+        def _pil_open_safe(_raw):
+            return source.copy()
+
+        @staticmethod
+        def _photoroom_remove_bg(image):
+            captured.append(image.copy())
+            return image
+
+    monkeypatch.setattr(
+        outreach_intake.outreach_logo,
+        "prepare",
+        lambda _core, image, **_kwargs: (image, {"verdict": "original"}),
+    )
+    monkeypatch.setattr(outreach_intake, "validate_reviewed_logo", lambda image, **_kwargs: image)
+
+    prepared, _report = outreach_intake._prepare_remote_logo(LogoCore(), b"opaque-logo")
+
+    assert captured
+    assert captured[0].width > source.width
+    assert captured[0].height > source.height
+    assert prepared.size == source.size
+
+
 def test_stale_processing_state_is_recovered(monkeypatch, tmp_path):
     _client, core, states = _app_with_tracking(monkeypatch, tmp_path)
     stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()

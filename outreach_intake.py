@@ -261,15 +261,31 @@ def _prepare_remote_logo(
     except Exception as exc:
         raise OutreachIntakeError("logo_source_url could not be decoded") from exc
 
+    # Some official logos run right to the edge of a JPEG or a PNG with an
+    # opaque white background. Give the background-removal service breathing
+    # room before it segments the subject; otherwise its own edge crop can
+    # shave off lettering, shield points, or the bottom of an emblem. The
+    # guard is transparent and is trimmed after segmentation, so the finished
+    # asset still follows the no-padding print-file rule.
+    guard = max(24, round(max(image.size) * 0.12))
+    guarded = Image.new(
+        "RGBA",
+        (image.width + guard * 2, image.height + guard * 2),
+        (0, 0, 0, 0),
+    )
+    guarded.alpha_composite(image, (guard, guard))
+
     alpha = image.getchannel("A")
     alpha_min, alpha_max = alpha.getextrema()
     if alpha_max == 0:
         raise OutreachIntakeError("logo image has no visible artwork")
     if alpha_min != 0:
         try:
-            image = core._photoroom_remove_bg(image).convert("RGBA")
+            image = core._photoroom_remove_bg(guarded).convert("RGBA")
         except Exception as exc:
             raise OutreachIntakeError("automatic logo background removal failed") from exc
+    else:
+        image = guarded
 
     alpha = image.getchannel("A")
     binary_alpha = alpha.point(lambda value: 255 if value > 6 else 0)
