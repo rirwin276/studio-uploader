@@ -24,7 +24,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import outreach_tracking
 
@@ -36,6 +36,31 @@ _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 # still produces a coherent store rather than a black one.
 _FALLBACK_PRIMARY = "#1f2937"
 _FALLBACK_SECONDARY = "#d4af37"
+
+
+# The storefront theme picks a design from a style+pattern pair rather than
+# from a name, so the names live here and the pairs go on the wire. "classic"
+# is what an unset store falls through to, and it is the plainest of them —
+# which is what an outreach store was getting while carrying the org's colours.
+LAYOUTS: Dict[str, Tuple[str, str]] = {
+    "classic": ("clean", "none"),
+    "split": ("clean", "diagonal"),
+    "heritage": ("clean", "stripes"),
+    "gradient": ("bold", "none"),
+    "spray": ("bold", "dots"),
+    "pro": ("dark", "grid"),
+}
+
+# A prospect decides in about a second whether this was made for them. The
+# loudest use of their own colours is the version that wins that second, so an
+# unattended store opens on the boldest design rather than the safest.
+DEFAULT_LAYOUT = "spray"
+
+
+def layout_pair() -> Tuple[str, str]:
+    """The style and pattern to build with, overridable without a deploy."""
+    name = os.getenv("OUTREACH_STORE_LAYOUT", DEFAULT_LAYOUT).strip().lower()
+    return LAYOUTS.get(name, LAYOUTS[DEFAULT_LAYOUT])
 
 
 def _contrast(hex_color: str) -> str:
@@ -101,12 +126,13 @@ def settings_for(state: Dict[str, Any]) -> Dict[str, Any]:
     # one. Inventing a contrast colour is how a store ends up wearing a stripe
     # that appears nowhere in the organization's branding.
     secondary = _valid(colors[1] if len(colors) > 1 else None, _FALLBACK_SECONDARY)
+    style, pattern = layout_pair()
 
     return {
         "version": 1,
         "enabled": True,
-        "style": "clean",
-        "pattern": "none",
+        "style": style,
+        "pattern": pattern,
         "primary_color": primary,
         "secondary_color": secondary,
         "primary_text": _contrast(primary),
