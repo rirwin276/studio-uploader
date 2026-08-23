@@ -120,6 +120,46 @@ def accept(core: Any, handle: str) -> Dict[str, Any]:
     }
 
 
+FAILED_STATUSES = {"intake_failed", "failed"}
+
+
+def retry(core: Any, handle: str) -> Dict[str, Any]:
+    """Put a failed store back in the queue.
+
+    A failure is otherwise permanent in both directions: the worker only picks
+    up queued work, so nothing retries it, and discovery avoids every domain
+    already in the ledger, so nothing rediscovers it either. An organization
+    that failed for a reason since fixed — a logo too small for the old
+    pipeline, say — would never be reached again without this.
+    """
+    state = outreach_tracking.read(core, handle)
+    if not state:
+        raise LookupError("Outreach tracking not found")
+    if not outreach_tracking.is_outreach_source(state.get("source")):
+        raise PermissionError("Not an outreach store")
+    status = str(state.get("status") or "").strip().lower()
+    if status not in FAILED_STATUSES:
+        # Requeuing a live store would build a second one over the top of it.
+        raise PermissionError(f"Store is not in a failed state (it is {status or 'unknown'})")
+
+    updated = outreach_tracking.update(
+        core,
+        handle,
+        {
+            "status": "intake_queued",
+            "intake_error": None,
+            "failed_at": None,
+            "requeued_at": outreach_tracking.utc_iso(),
+        },
+    )
+    return {
+        "ok": True,
+        "handle": handle,
+        "status": "intake_queued",
+        "attempts": updated.get("intake_attempt_count") or 0,
+    }
+
+
 def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
     """Delete the store and the artwork. Nobody is emailed.
 
@@ -376,6 +416,21 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
                 {"error": f"Could not send the email: {exc}"},
                 status_code=502,
             )
+
+    @app.post("/api/outreach/review/{handle}/retry")
+    def review_retry(handle: str, request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        normalized = _handle(handle)
+        if not normalized:
+            return JSONResponse({"error": "invalid store handle"}, status_code=400)
+        try:
+            return retry(core, normalized)
+        except LookupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
 
     @app.post("/api/outreach/review/{handle}/decline")
     async def review_decline(handle: str, request: Request):

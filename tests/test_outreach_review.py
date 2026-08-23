@@ -297,3 +297,69 @@ def test_a_settled_store_does_not_go_asking_about_old_jobs(monkeypatch):
 
     outreach_review.pipeline(Counting())
     assert asked == []
+
+
+# ---- retrying a failure ---------------------------------------------------
+
+
+def _failed_core(monkeypatch, stores):
+    monkeypatch.setattr(outreach_review.outreach_tracking, "list_all", lambda _c: dict(stores))
+    monkeypatch.setattr(
+        outreach_review.outreach_tracking, "read", lambda _c, h: dict(stores.get(h, {}))
+    )
+
+    def update(_core, handle, patch):
+        stores[handle] = {**stores.get(handle, {}), **patch}
+        return dict(stores[handle])
+
+    monkeypatch.setattr(outreach_review.outreach_tracking, "update", update)
+    return FakeCore()
+
+
+def test_a_failed_store_can_be_put_back_in_the_queue(monkeypatch):
+    """A failure is otherwise permanent in both directions: the worker only
+    picks up queued work, and discovery avoids every domain already in the
+    ledger. Nothing would ever reach this organization again."""
+    stores = {"oranco": _store("oranco", status="intake_failed",
+                               intake_error="logo source must be at least 256px wide",
+                               failed_at="2026-08-22T22:45:31+00:00")}
+    core = _failed_core(monkeypatch, stores)
+
+    result = outreach_review.retry(core, "oranco")
+
+    assert result["status"] == "intake_queued"
+    assert stores["oranco"]["status"] == "intake_queued"
+    assert stores["oranco"]["intake_error"] is None
+    assert stores["oranco"]["failed_at"] is None
+
+
+def test_a_live_store_is_never_requeued(monkeypatch):
+    """Requeuing a built store would build a second one over the top of it."""
+    stores = {"westside": _store("westside", status="provisioned")}
+    core = _failed_core(monkeypatch, stores)
+
+    with pytest.raises(PermissionError):
+        outreach_review.retry(core, "westside")
+    assert stores["westside"]["status"] == "provisioned"
+
+
+def test_an_emailed_store_is_never_requeued(monkeypatch):
+    stores = {"westside": _store("westside", status="outreach_sent",
+                                 sent_at="2026-08-22T09:00:00+00:00")}
+    core = _failed_core(monkeypatch, stores)
+    with pytest.raises(PermissionError):
+        outreach_review.retry(core, "westside")
+
+
+def test_a_website_store_is_not_retried_from_here(monkeypatch):
+    stores = {"customer": _store("customer", source="website_request_form",
+                                 status="intake_failed")}
+    core = _failed_core(monkeypatch, stores)
+    with pytest.raises(PermissionError):
+        outreach_review.retry(core, "customer")
+
+
+def test_retrying_something_that_does_not_exist_says_so(monkeypatch):
+    core = _failed_core(monkeypatch, {})
+    with pytest.raises(LookupError):
+        outreach_review.retry(core, "nobody")
