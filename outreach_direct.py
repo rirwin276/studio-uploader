@@ -20,6 +20,7 @@ from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from outreach_assets import save_reviewed_logo_session
+import outreach_appearance
 from outreach_auth import require_outreach_secret
 import outreach_tracking
 
@@ -139,6 +140,9 @@ def _run_direct_job(
                 "store_status": "prospect_unclaimed",
             },
         )
+        # Their colours, off their own logo. Best-effort: a built store that
+        # kept the default palette is still a store worth showing someone.
+        outreach_appearance.apply(core, handle)
         return
     _update_tracking(
         core,
