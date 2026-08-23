@@ -280,7 +280,7 @@ Skip immediately:
 Hard rules:
 - Only use information publicly visible on the organization's own website.
 - Never guess an email address or construct one from a pattern. If you cannot see a real published address, skip the organization.
-- logo_source_url must point directly at an image file (.png, .svg, .jpg) on their own domain or CDN — not at a page containing a logo.
+- logo_source_url must be the exact direct image URL copied from an official site's HTML or image link. Open that image first. Never invent a conventional path such as /logo.png, /images/logo.png, or /assets/logo.svg; the system fetches it before build and rejects broken links.
 - storefront_handle: lowercase letters, numbers and hyphens only. "St. Mary's Rowing" becomes st-marys-rowing.
 - storefront_name: the organization name followed by " Team Store".
 - primary_color: one common color name from their branding (Navy, Red, Royal Blue, Forest Green, Maroon, Black, Charcoal, Purple, Orange, Gold).
@@ -574,6 +574,13 @@ def _clean(
         # Cheaper to lose the candidate than to build a store wearing somebody
         # else's badge and email a stranger about it.
         return None, origin_problem
+
+    # This is the gap the initial verifier missed: it established that the
+    # organization was real, but not that the purported direct image was real.
+    # Do this before a candidate can be shown as "queued to build".
+    logo_ok, logo_problem = outreach_verify.logo_source_is_live(urls["logo_source_url"])
+    if not logo_ok:
+        return None, logo_problem
 
     # Go and look. Everything above this line is the model's word, and a model
     # that invents an organization invents its website to match.

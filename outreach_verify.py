@@ -157,3 +157,25 @@ def check_candidate(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     if not ok:
         return False, why
     return True, ""
+
+
+def logo_source_is_live(url: str) -> Tuple[bool, str]:
+    """Prove that a proposed logo URL is a public image before a build starts.
+
+    A language model can correctly identify an organization's web site and
+    still invent the conventional-looking path ``/logo.png``. The intake
+    downloader already has the right public-URL, redirect, content-type and
+    size protections, so discovery uses that same code path rather than a
+    weaker HEAD request that would only move the failure to the build queue.
+    """
+    try:
+        from outreach_intake import OutreachIntakeError, _download_public_image
+
+        _download_public_image(str(url or ""), 12 * 1024 * 1024)
+    except OutreachIntakeError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        # Do not allow an unexpected fetch failure to turn into a prospective
+        # store with an unknown asset. The reason is retained in the run log.
+        return False, f"logo source could not be verified ({type(exc).__name__})"
+    return True, ""

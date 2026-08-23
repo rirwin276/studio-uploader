@@ -54,6 +54,9 @@ def wired(monkeypatch):
     monkeypatch.setattr(
         outreach_discovery.outreach_verify, "check_candidate", lambda _c: (True, "")
     )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify, "logo_source_is_live", lambda _url: (True, "")
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     return FakeCore(), ledger, submitted
 
@@ -508,6 +511,24 @@ def test_a_candidate_that_fails_verification_never_becomes_a_store(wired, monkey
 
     assert submitted == []
     assert "bounce" in run["rejected"][0]["reason"]
+
+
+def test_a_dead_logo_url_never_reaches_the_build_queue(wired, monkeypatch):
+    """The source must be fetched before Find & build can create a failed
+    intake row. A plausible looking /logo.png is not evidence it exists."""
+    core, _ledger, submitted = wired
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "logo_source_is_live",
+        lambda _url: (False, "logo_source_url returned HTTP 404"),
+    )
+    _answer(monkeypatch, [_candidate("dead-logo")])
+
+    run = outreach_discovery.run_discovery(core, limit=1)
+
+    assert submitted == []
+    assert run["accepted"] == 0
+    assert run["rejected"][0]["reason"] == "logo_source_url returned HTTP 404"
 
 
 def test_verification_runs_after_the_cheap_checks(wired, monkeypatch):
