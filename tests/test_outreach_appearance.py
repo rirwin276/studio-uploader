@@ -123,3 +123,48 @@ def test_shopify_being_down_does_not_raise():
             raise RuntimeError("Shopify unavailable")
 
     assert outreach_appearance.apply(Broken(), "vero-beach-vfd", _state()) is False
+
+
+# ---- which design the store opens on --------------------------------------
+
+
+def test_an_unattended_store_gets_the_boldest_design(monkeypatch):
+    """The pair that was being sent — clean/none — is what an unset store
+    falls through to, so a store carrying the organization's own colours was
+    wearing the plainest design available."""
+    monkeypatch.delenv("OUTREACH_STORE_LAYOUT", raising=False)
+    settings = outreach_appearance.settings_for(_state())
+
+    assert (settings["style"], settings["pattern"]) == \
+        outreach_appearance.LAYOUTS[outreach_appearance.DEFAULT_LAYOUT]
+    assert (settings["style"], settings["pattern"]) != ("clean", "none")
+
+
+def test_the_design_can_be_changed_without_a_deploy(monkeypatch):
+    """Which design looks best is judged by looking at a store, and needing a
+    deploy between each look is how the plain one stayed."""
+    monkeypatch.setenv("OUTREACH_STORE_LAYOUT", "gradient")
+    settings = outreach_appearance.settings_for(_state())
+    assert (settings["style"], settings["pattern"]) == ("bold", "none")
+
+    monkeypatch.setenv("OUTREACH_STORE_LAYOUT", "spray")
+    settings = outreach_appearance.settings_for(_state())
+    assert (settings["style"], settings["pattern"]) == ("bold", "dots")
+
+
+def test_a_nonsense_layout_name_still_builds_a_store(monkeypatch):
+    monkeypatch.setenv("OUTREACH_STORE_LAYOUT", "sparkles")
+    settings = outreach_appearance.settings_for(_state())
+    assert (settings["style"], settings["pattern"]) == \
+        outreach_appearance.LAYOUTS[outreach_appearance.DEFAULT_LAYOUT]
+
+
+def test_every_layout_name_maps_to_a_pair_the_storefront_knows():
+    """These pairs are matched literally in private-store-layout-state.liquid.
+    A pair that is not in that list silently renders as the plain design."""
+    known = {
+        ("clean", "none"), ("clean", "diagonal"), ("clean", "stripes"),
+        ("bold", "none"), ("bold", "dots"), ("dark", "grid"),
+    }
+    for name, pair in outreach_appearance.LAYOUTS.items():
+        assert pair in known, f"{name} maps to {pair}, which the storefront does not match"
