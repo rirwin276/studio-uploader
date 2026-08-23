@@ -134,6 +134,58 @@ def logo_origin(logo_url: str, organization_url: str) -> Tuple[str, str]:
     return _logo_origin(logo_url, organization_url)
 
 
+# A mark is flat: a handful of colours cover almost all of it, however busy the
+# drawing is. A photograph is continuous tone and no small set of colours covers
+# much of anything. Measured on a detailed crest with a gradient ring and
+# antialiasing this sits near 0.97, and on a photograph near 0.21, so the line
+# between them is not a fine judgement.
+FLATNESS_FLOOR = 0.50
+_FLATNESS_TOP_COLORS = 8
+_FLATNESS_BUCKETS = 6
+_FLATNESS_SAMPLES = 120
+
+
+def flatness(image: Image.Image) -> Tuple[float, int]:
+    """What share of the visible artwork the few most common colours cover."""
+    rgba = image.convert("RGBA")
+    pixels = rgba.load()
+    width, height = rgba.size
+    step = 256 // _FLATNESS_BUCKETS
+    counts: Dict[Tuple[int, int, int], int] = {}
+    total = 0
+    for y in range(0, height, max(1, height // _FLATNESS_SAMPLES)):
+        for x in range(0, width, max(1, width // _FLATNESS_SAMPLES)):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha < 128:
+                continue
+            key = (red // step, green // step, blue // step)
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+    if not total:
+        return 0.0, 0
+    top = sorted(counts.values(), reverse=True)[:_FLATNESS_TOP_COLORS]
+    return sum(top) / total, len(counts)
+
+
+def looks_photographic(image: Image.Image) -> Tuple[bool, str]:
+    """Whether this is a photograph rather than a logo.
+
+    One store was built from a half-erased photo of a man swimming, lifted from
+    a hero banner. It passed every other check — it was on the right domain and
+    it was plenty big — and printing it on eight garments produced something
+    worse than no store at all. Nothing until now asked whether the image was
+    a mark.
+    """
+    covered, distinct = flatness(image)
+    if covered < FLATNESS_FLOOR:
+        return True, (
+            f"the image looks like a photograph rather than a logo — its "
+            f"{_FLATNESS_TOP_COLORS} commonest colours cover only "
+            f"{covered:.0%} of it, across {distinct} distinct tones"
+        )
+    return False, ""
+
+
 def recreation_available() -> bool:
     return bool(os.getenv("OPENAI_API_KEY", "").strip())
 
@@ -292,8 +344,16 @@ def prepare(
     Returns the 4096px image and a report naming the rung used, which the
     ledger stores and the email reads.
     """
-    report = assess(image)
     cropped = _crop_to_artwork(image)
+
+    # Asked before anything else. Enlarging a photograph gives a bigger
+    # photograph, and redrawing one gives a drawing of a photograph; neither is
+    # a logo, and both cost money to find that out.
+    photographic, photo_problem = looks_photographic(cropped)
+    if photographic:
+        raise ValueError(photo_problem)
+
+    report = assess(image)
 
     if is_vector and report["verdict"] == "recreated":
         # Vector artwork carries no resolution to lose, so there is nothing to
