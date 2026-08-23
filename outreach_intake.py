@@ -125,6 +125,7 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
         "screening_confirmed",
         "logo_source_reviewed",
         "email_authorized",
+        "logo_origin",
     }
     extras = sorted(str(key) for key in payload if key not in allowed)
     if extras:
@@ -148,6 +149,16 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
         raise OutreachIntakeError("logo_source_reviewed=true is required")
     if payload.get("email_authorized") not in {None, False}:
         raise OutreachIntakeError("email_authorized must remain false during intake")
+
+    # The submitter is asked for a logo on the organization's own site. Asking
+    # is not checking, and the failure is silent and expensive: a store gets
+    # built and emailed wearing a different club's badge. Checked here rather
+    # than only in discovery so every path in is covered.
+    logo_origin, logo_problem = outreach_logo.logo_origin(
+        payload.get("logo_source_url"), payload.get("organization_url")
+    )
+    if logo_origin == "foreign":
+        raise OutreachIntakeError(logo_problem)
 
     return {
         "provider_request_id": request_id,
@@ -177,6 +188,7 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
         "screening_confirmed": True,
         "logo_source_reviewed": True,
         "email_authorized": False,
+        "logo_origin": logo_origin,
     }
 
 

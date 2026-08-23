@@ -257,3 +257,82 @@ def test_the_email_stays_quiet_when_the_logo_is_theirs(monkeypatch):
     body = outreach_mail.first_contact(state).get_content()
 
     assert "redrew" not in body
+
+
+# ---- does this logo belong to this organization? --------------------------
+
+
+@pytest.mark.parametrize("logo,site,expected", [
+    ("https://westside-rowing.org/img/logo.png", "https://westside-rowing.org/", "own_domain"),
+    ("https://assets.westside-rowing.org/logo.png", "https://westside-rowing.org/", "own_domain"),
+    ("https://westside-rowing.org/logo.png", "https://www.westside-rowing.org/about", "own_domain"),
+    ("https://images.squarespace-cdn.com/x/logo.png", "https://westside-rowing.org/", "cdn"),
+    ("https://static.wixstatic.com/media/x.png", "https://westside-rowing.org/", "cdn"),
+    # The one that shipped a German club's badge on a Missouri store.
+    ("https://koelner-scheibengolf.de/logo.png", "https://columbiadiscgolf.org/", "foreign"),
+    ("https://orangebeltarchers.com/logo.png", "https://orancobowmen.org/", "foreign"),
+])
+def test_a_logo_is_checked_against_the_organizations_own_site(logo, site, expected):
+    assert outreach_logo.logo_origin(logo, site)[0] == expected
+
+
+def test_a_foreign_logo_explains_itself():
+    _origin, problem = outreach_logo.logo_origin(
+        "https://koelner-scheibengolf.de/logo.png", "https://columbiadiscgolf.org/"
+    )
+    assert "koelner-scheibengolf.de" in problem
+    assert "columbiadiscgolf.org" in problem
+
+
+def test_a_country_code_domain_is_not_split_wrongly():
+    """westside-rowing.co.uk and its CDN subdomain are the same people; taking
+    the last two labels would compare "co.uk" to "co.uk" and pass anything."""
+    assert outreach_logo.logo_origin(
+        "https://img.westside-rowing.co.uk/logo.png", "https://westside-rowing.co.uk/"
+    )[0] == "own_domain"
+    assert outreach_logo.logo_origin(
+        "https://someone-else.co.uk/logo.png", "https://westside-rowing.co.uk/"
+    )[0] == "foreign"
+
+
+def test_fidelity_is_asked_for(drawn):
+    """Faithfulness, not creativity, is the whole job. A beautiful redraw of
+    the wrong mark is a failure."""
+    outreach_logo.prepare(FakeCore(), _logo(90))
+    assert drawn[0]["data"]["input_fidelity"] == "high"
+
+
+def test_the_model_is_configurable(drawn, monkeypatch):
+    monkeypatch.setenv("OUTREACH_LOGO_MODEL", "gpt-image-9")
+    outreach_logo.prepare(FakeCore(), _logo(90))
+    assert drawn[0]["data"]["model"] == "gpt-image-9"
+
+
+def test_a_rejected_fidelity_field_does_not_lose_the_redraw(monkeypatch):
+    """Not every model or API version takes the parameter. Losing fidelity is
+    worth a redraw; losing the redraw over one rejected field is not."""
+    calls = []
+
+    class Rejected:
+        status_code = 400
+        text = "Unknown parameter: 'input_fidelity'."
+
+    class Ok:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(_png_bytes(_logo(900, pad=60))).decode()}]}
+
+    def post(_url, **kwargs):
+        calls.append(kwargs["data"])
+        return Ok() if "input_fidelity" not in kwargs["data"] else Rejected()
+
+    monkeypatch.setattr(outreach_logo.requests, "post", post)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    prepared, report = outreach_logo.prepare(FakeCore(), _logo(90))
+
+    assert len(calls) == 2
+    assert "input_fidelity" not in calls[1]
+    assert report["recreated"] is True
+    assert prepared.width == outreach_logo.TARGET_WIDTH
