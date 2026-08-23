@@ -482,3 +482,83 @@ def test_verification_runs_after_the_cheap_checks(wired, monkeypatch):
 
     outreach_discovery.run_discovery(core, limit=2)
     assert called == []
+
+
+# ---- a run that dies must not disable discovery forever --------------------
+
+
+def test_a_second_run_is_refused_while_one_is_genuinely_running(monkeypatch):
+    outreach_discovery._end_run()
+    allowed, _age = outreach_discovery._begin_run()
+    assert allowed
+    try:
+        again, age = outreach_discovery._begin_run()
+        assert not again
+        assert age >= 0
+    finally:
+        outreach_discovery._end_run()
+
+
+def test_a_dead_run_is_taken_over_rather_than_waited_on_forever(monkeypatch):
+    """A plain lock had no way back: a run that died without unwinding left
+    discovery permanently answering "already in progress", curable only by a
+    redeploy."""
+    outreach_discovery._end_run()
+    assert outreach_discovery._begin_run()[0]
+
+    # The run that claimed it is long dead. Capture the real clock first —
+    # patching time.time with something that calls time.time recurses forever.
+    real_time = outreach_discovery.time.time
+    later = real_time() + outreach_discovery._STALE_RUN_SECONDS + 60
+    monkeypatch.setattr(outreach_discovery.time, "time", lambda: later)
+    allowed, _age = outreach_discovery._begin_run()
+    assert allowed, "a run older than the deadline should be taken over"
+    outreach_discovery._end_run()
+
+
+def test_the_refusal_says_how_long_it_has_been(wired, monkeypatch):
+    """"Already in progress" with no number is indistinguishable from stuck."""
+    core, _ledger, _submitted = wired
+    outreach_discovery._end_run()
+    outreach_discovery._begin_run()
+    try:
+        with pytest.raises(RuntimeError, match=r"\d+m \d+s"):
+            outreach_discovery.run_discovery(core, limit=2)
+    finally:
+        outreach_discovery._end_run()
+
+
+def test_a_finished_run_releases_immediately(wired, monkeypatch):
+    core, _ledger, _submitted = wired
+    outreach_discovery._end_run()
+    _answer(monkeypatch, [_candidate("first-club")])
+
+    outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+    assert outreach_discovery._begin_run()[0], "the lock was not released"
+    outreach_discovery._end_run()
+
+
+def test_a_failed_run_releases_too(wired, monkeypatch):
+    """The failure path is exactly where a leaked lock would come from."""
+    core, _ledger, _submitted = wired
+    outreach_discovery._end_run()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("OpenAI exploded")
+
+    monkeypatch.setattr(outreach_discovery, "_ask", boom, raising=False)
+    monkeypatch.setattr(outreach_discovery.requests, "post", boom)
+
+    with pytest.raises(Exception):
+        outreach_discovery.run_discovery(core, limit=2)
+    assert outreach_discovery._begin_run()[0], "the lock leaked on the failure path"
+    outreach_discovery._end_run()
+
+
+def test_clearing_reports_whether_there_was_anything_to_clear():
+    outreach_discovery._end_run()
+    assert outreach_discovery.clear_stuck_run() is False
+    outreach_discovery._begin_run()
+    assert outreach_discovery.clear_stuck_run() is True
+    assert outreach_discovery._begin_run()[0]
+    outreach_discovery._end_run()

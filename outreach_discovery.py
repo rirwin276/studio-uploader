@@ -41,7 +41,50 @@ _SAFE_HANDLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED_APP_IDS: set[int] = set()
-_RUN_LOCK = threading.Lock()
+
+# One run at a time, but never forever. A plain lock has no way back: a run
+# that dies without unwinding, or a worker that is killed mid-flight, leaves
+# discovery permanently answering "already in progress" and the only cure is a
+# redeploy. Past this age the previous run is not busy, it is gone.
+#
+# Comfortably longer than the worst honest run: three attempts at a 300s read
+# timeout plus backoff is about sixteen minutes.
+_STALE_RUN_SECONDS = 20 * 60
+_RUN_STATE_LOCK = threading.Lock()
+_RUN_STARTED_AT: float | None = None
+
+
+def _begin_run() -> Tuple[bool, float]:
+    """Claim the right to run. Returns (allowed, age of the run in the way)."""
+    global _RUN_STARTED_AT
+    now = time.time()
+    with _RUN_STATE_LOCK:
+        started = _RUN_STARTED_AT
+        if started is not None:
+            age = now - started
+            if age < _STALE_RUN_SECONDS:
+                return False, age
+            print(
+                f"[outreach-discovery] taking over from a run started {age / 60:.0f} "
+                "minutes ago — treating it as dead"
+            )
+        _RUN_STARTED_AT = now
+        return True, 0.0
+
+
+def _end_run() -> None:
+    global _RUN_STARTED_AT
+    with _RUN_STATE_LOCK:
+        _RUN_STARTED_AT = None
+
+
+def clear_stuck_run() -> bool:
+    """Forget the run in progress. Returns whether there was one."""
+    global _RUN_STARTED_AT
+    with _RUN_STATE_LOCK:
+        had = _RUN_STARTED_AT is not None
+        _RUN_STARTED_AT = None
+    return had
 
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 10
@@ -498,8 +541,12 @@ def run_discovery(
     A dry run does everything except create anything: it is how you check what
     the brief actually returns before letting it loose on a real Shopify store.
     """
-    if not _RUN_LOCK.acquire(blocking=False):
-        raise RuntimeError("A discovery run is already in progress")
+    allowed, age = _begin_run()
+    if not allowed:
+        raise RuntimeError(
+            "A discovery run has been going for "
+            f"{int(age // 60)}m {int(age % 60)}s. Wait for it, or clear it if it is stuck."
+        )
     try:
         requested = max(1, min(MAX_LIMIT, int(limit or nightly_limit())))
         started_at = outreach_tracking.utc_iso()
@@ -577,7 +624,7 @@ def run_discovery(
         _record_run(core, run)
         return run
     finally:
-        _RUN_LOCK.release()
+        _end_run()
 
 
 def build_last_run(core: Any) -> Dict[str, Any]:
@@ -651,7 +698,7 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
             "nightly_enabled": enabled(),
             "nightly_limit": nightly_limit(),
             "model": os.getenv("OUTREACH_DISCOVERY_MODEL", DEFAULT_MODEL),
-            "running": _RUN_LOCK.locked(),
+            "running": _RUN_STARTED_AT is not None,
             "runs": recent_runs(core),
         }
 
@@ -696,6 +743,19 @@ def install_outreach_discovery_routes(app: Any, core: Any) -> bool:
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)[:400]}, status_code=502)
         return {"ok": True, "run": run}
+
+    @app.post("/api/outreach/discovery/clear")
+    def discovery_clear(request: Request):
+        """Forget a run that is stuck, without a redeploy.
+
+        The takeover deadline handles the common case on its own. This is for
+        the moment you know it is dead and would rather not wait out the
+        remainder of twenty minutes.
+        """
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        return {"ok": True, "cleared": clear_stuck_run()}
 
     @app.post("/api/outreach/discovery/build-last")
     async def discovery_build_last(request: Request):
