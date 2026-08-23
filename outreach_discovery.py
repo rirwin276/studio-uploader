@@ -280,7 +280,7 @@ Skip immediately:
 Hard rules:
 - Only use information publicly visible on the organization's own website.
 - Never guess an email address or construct one from a pattern. If you cannot see a real published address, skip the organization.
-- logo_source_url must be the exact direct image URL copied from an official site's HTML or image link. Open that image first. Never invent a conventional path such as /logo.png, /images/logo.png, or /assets/logo.svg; the system fetches it before build and rejects broken links.
+- logo_source_url should be the exact direct image URL copied from the official site's HTML or image link. Never invent a conventional path such as /logo.png, /images/logo.png, or /assets/logo.svg. The system will also extract and verify the official site's header logo when needed.
 - storefront_handle: lowercase letters, numbers and hyphens only. "St. Mary's Rowing" becomes st-marys-rowing.
 - storefront_name: the organization name followed by " Team Store".
 - primary_color: one common color name from their branding (Navy, Red, Royal Blue, Forest Green, Maroon, Black, Charcoal, Purple, Orange, Gold).
@@ -567,20 +567,33 @@ def _clean(
     if host and host in (known_domains or set()):
         return None, f"{host} is already in the system"
 
-    origin, origin_problem = outreach_logo.logo_origin(
-        urls["logo_source_url"], urls["organization_url"]
+    # A model often gets the right organization but invents a plausible
+    # `/logo.png`. Start with its proposed URL, then fall back to direct image
+    # URLs actually embedded by the official homepage. This keeps the strict
+    # image check without turning each mistaken model path into zero results.
+    page_sources, page_problem = outreach_verify.logo_sources_on_organization_site(
+        urls["organization_url"]
     )
-    if origin == "foreign":
-        # Cheaper to lose the candidate than to build a store wearing somebody
-        # else's badge and email a stranger about it.
-        return None, origin_problem
-
-    # This is the gap the initial verifier missed: it established that the
-    # organization was real, but not that the purported direct image was real.
-    # Do this before a candidate can be shown as "queued to build".
-    logo_ok, logo_problem = outreach_verify.logo_source_is_live(urls["logo_source_url"])
-    if not logo_ok:
+    logo_candidates = [urls["logo_source_url"]] + [
+        source for source in page_sources if source != urls["logo_source_url"]
+    ]
+    logo_problem = page_problem or "no verified official logo image"
+    chosen_logo = ""
+    for logo_url in logo_candidates:
+        origin, origin_problem = outreach_logo.logo_origin(
+            logo_url, urls["organization_url"]
+        )
+        if origin == "foreign":
+            logo_problem = origin_problem
+            continue
+        logo_ok, problem = outreach_verify.logo_source_is_live(logo_url)
+        if logo_ok:
+            chosen_logo = logo_url
+            break
+        logo_problem = problem
+    if not chosen_logo:
         return None, logo_problem
+    urls["logo_source_url"] = chosen_logo
 
     # Go and look. Everything above this line is the model's word, and a model
     # that invents an organization invents its website to match.

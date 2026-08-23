@@ -110,6 +110,25 @@ def test_a_name_with_nothing_distinctive_is_not_blocked(site):
     assert ok
 
 
+# ---- finding the real logo in the official page ---------------------------
+
+
+def test_header_logo_is_preferred_over_hero_and_social_images():
+    html = '''
+        <img class="hero-banner" src="/photos/team.jpg">
+        <img id="site-logo" alt="Westside Rowing logo" src="/assets/crest.svg">
+        <meta property="og:image" content="https://westside-rowing.org/photos/social.jpg">
+    '''
+    urls = outreach_verify._logo_candidates_from_html(html, "https://westside-rowing.org/")
+    assert urls[0] == "https://westside-rowing.org/assets/crest.svg"
+
+
+def test_relative_and_lazy_header_logo_urls_are_found():
+    html = '<img data-src="images/logo.png" class="site-header">'
+    urls = outreach_verify._logo_candidates_from_html(html, "https://club.org/about")
+    assert urls == ["https://club.org/images/logo.png"]
+
+
 # ---- can the address receive mail? ----------------------------------------
 
 

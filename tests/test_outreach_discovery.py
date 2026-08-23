@@ -57,6 +57,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(
         outreach_discovery.outreach_verify, "logo_source_is_live", lambda _url: (True, "")
     )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "logo_sources_on_organization_site",
+        lambda _url: ([], "organization page did not expose a usable logo image"),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     return FakeCore(), ledger, submitted
 
@@ -529,6 +534,29 @@ def test_a_dead_logo_url_never_reaches_the_build_queue(wired, monkeypatch):
     assert submitted == []
     assert run["accepted"] == 0
     assert run["rejected"][0]["reason"] == "logo_source_url returned HTTP 404"
+
+
+def test_a_dead_model_logo_falls_back_to_the_official_page_image(wired, monkeypatch):
+    """The image that is actually embedded on the official home page wins over
+    a model's invented `/logo.png`, but both still go through image checks."""
+    core, _ledger, submitted = wired
+    source = "https://westside.org/assets/crest.svg"
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "logo_sources_on_organization_site",
+        lambda _url: ([source], ""),
+    )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "logo_source_is_live",
+        lambda url: (url == source, "logo_source_url returned HTTP 404"),
+    )
+    _answer(monkeypatch, [_candidate("page-logo")])
+
+    run = outreach_discovery.run_discovery(core, limit=1)
+
+    assert run["accepted"] == 1
+    assert submitted[0]["logo_source_url"] == source
 
 
 def test_verification_runs_after_the_cheap_checks(wired, monkeypatch):

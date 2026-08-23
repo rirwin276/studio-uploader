@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 import socket
 from typing import Any, Dict, List, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -26,6 +26,7 @@ import requests
 _TIMEOUT = (5, 12)
 _MAX_HTML = 400_000
 _UA = "Stella-Sage-Outreach-Verify/1.0"
+_MAX_LOGO_CANDIDATES = 24
 
 # Words that carry no identifying weight, so matching on them would let any
 # page pass for any organization.
@@ -47,6 +48,115 @@ def _text_of(html: str) -> str:
         r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S | re.I
     )
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", without_scripts)).lower()
+
+
+def _html_attributes(tag: str) -> Dict[str, str]:
+    """Small, dependency-free attribute reader for the few tags we need.
+
+    These sites range from hand-written pages to site builders. Pulling in a
+    browser or a full HTML parser just to find the header logo makes this job
+    slower and more fragile than the discovery itself.
+    """
+    values: Dict[str, str] = {}
+    for match in re.finditer(
+        r'''([:\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>`]+))''', tag, re.I
+    ):
+        values[match.group(1).lower()] = next(
+            (part for part in match.groups()[1:] if part is not None), ""
+        )
+    return values
+
+
+def _logo_candidates_from_html(html: str, page_url: str) -> List[str]:
+    """Return likely direct logo images referenced by the official page.
+
+    Models regularly identify the right organization and then manufacture a
+    conventional-looking `/logo.png`. The public page itself is the source of
+    truth: header logo image first, then its declared social/logo image as a
+    last resort. Every returned URL is still downloaded and verified later.
+    """
+    ranked: List[Tuple[int, int, str]] = []
+    order = 0
+
+    def add(raw_url: str, context: str, base_score: int) -> None:
+        nonlocal order
+        raw_url = str(raw_url or "").strip()
+        if not raw_url or raw_url.startswith("data:"):
+            return
+        absolute = urljoin(page_url, raw_url)
+        if not absolute.lower().startswith("https://"):
+            return
+        lower = (context + " " + absolute).lower()
+        score = base_score
+        if "logo" in lower:
+            score += 200
+        if any(word in lower for word in ("brand", "identity", "site-header", "navbar")):
+            score += 60
+        if any(word in lower for word in ("favicon", "avatar", "social-icon", "sprite")):
+            score -= 160
+        if any(word in lower for word in ("hero", "banner", "carousel", "gallery", "background")):
+            score -= 35
+        ranked.append((score, order, absolute))
+        order += 1
+
+    for tag in re.findall(r"<(?:img|source)\b[^>]*>", html, flags=re.I):
+        attrs = _html_attributes(tag)
+        context = " ".join(attrs.values())
+        # Lazy-loading builders use any of these. srcset is deliberately not
+        # used: selecting one of several responsive sources needs browser
+        # rules, while their normal src/data-src is the stable original.
+        for field in ("src", "data-src", "data-original", "data-lazy-src"):
+            if attrs.get(field):
+                add(attrs[field], context, 40)
+
+    for tag in re.findall(r"<(?:meta|link)\b[^>]*>", html, flags=re.I):
+        attrs = _html_attributes(tag)
+        marker = " ".join((attrs.get("property", ""), attrs.get("name", ""), attrs.get("rel", ""))).lower()
+        if marker in {"og:image", "twitter:image", "image_src"} or "logo" in marker:
+            add(attrs.get("content") or attrs.get("href") or "", " ".join(attrs.values()), 5)
+
+    seen = set()
+    result: List[str] = []
+    for _score, _position, url in sorted(ranked, key=lambda item: (-item[0], item[1])):
+        if url not in seen:
+            seen.add(url)
+            result.append(url)
+        if len(result) >= _MAX_LOGO_CANDIDATES:
+            break
+    return result
+
+
+def logo_sources_on_organization_site(url: str) -> Tuple[List[str], str]:
+    """Find actual image URLs embedded by an organization's home page.
+
+    This deliberately does not accept a search engine's image result. The URL
+    must be present in the organization's own markup, and the caller then
+    applies the existing origin and binary-image checks before it can build.
+    """
+    try:
+        response = requests.get(
+            url,
+            timeout=_TIMEOUT,
+            headers={"User-Agent": _UA},
+            allow_redirects=True,
+            stream=True,
+        )
+    except Exception as exc:
+        return [], f"organization page could not be read ({type(exc).__name__})"
+    try:
+        if response.status_code >= 400:
+            return [], f"organization page returned HTTP {response.status_code}"
+        html = response.raw.read(_MAX_HTML, decode_content=True).decode(
+            response.encoding or "utf-8", errors="replace"
+        )
+        urls = _logo_candidates_from_html(html, str(response.url or url))
+        if not urls:
+            return [], "organization page did not expose a usable logo image"
+        return urls, ""
+    except Exception:
+        return [], "organization page could not be read"
+    finally:
+        response.close()
 
 
 def organization_is_real(url: str, organization_name: str) -> Tuple[bool, str]:
