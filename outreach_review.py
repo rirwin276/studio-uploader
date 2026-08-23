@@ -22,6 +22,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 import outreach_mail
+import outreach_mockups
 import outreach_tracking
 from outreach_auth import require_outreach_secret
 
@@ -90,7 +91,8 @@ def accept(core: Any, handle: str) -> Dict[str, Any]:
     if not outreach_mail.configured():
         raise RuntimeError("SMTP is not configured")
 
-    outreach_mail.send(outreach_mail.first_contact(state))
+    photos = outreach_mockups.for_email(core, handle)
+    outreach_mail.send(outreach_mail.first_contact(state, photos))
 
     sent_at = outreach_tracking.utc_iso()
     patch = {
