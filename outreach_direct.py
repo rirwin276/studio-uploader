@@ -8,6 +8,7 @@ check the job through the authenticated status route.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -28,12 +29,35 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _INSTALL_LOCK = threading.Lock()
 _INSTALL_ATTRIBUTE = "_stella_outreach_direct_routes_installed"
 
-DEFAULT_PLACEMENT_PROFILE = {
-    # Print files are 300 dpi. Moving these designs -300 px raises the front
-    # artwork approximately one inch for all newly automated outreach stores.
+# Print files are 300 dpi, so -300 px raises the front artwork about one inch.
+# Youth garments need more of it than adult ones: the body is shorter, so the
+# same print zone puts the art nearer the middle of the chest than the top of
+# it, and a logo floating at a child's stomach is the tell that nobody looked.
+_PLACEMENT_DEFAULTS = {
     "bc3413_front_vertical_offset_px": -300,
-    "cc1467y_front_vertical_offset_px": -300,
+    "cc1467y_front_vertical_offset_px": -500,
+    "bc3001y_front_vertical_offset_px": -300,
 }
+
+
+def _placement_profile() -> Dict[str, int]:
+    """The offsets, with an environment override per garment.
+
+    Print placement is judged by looking at a mockup, not by reasoning about
+    percentages, so this has to be adjustable without a deploy between each
+    look.
+    """
+    profile = {}
+    for key, fallback in _PLACEMENT_DEFAULTS.items():
+        raw = os.getenv(key.upper(), "").strip()
+        try:
+            profile[key] = int(float(raw)) if raw else fallback
+        except ValueError:
+            profile[key] = fallback
+    return profile
+
+
+DEFAULT_PLACEMENT_PROFILE = _placement_profile()
 def _required(value: Any, label: str, *, maximum: int = 300) -> str:
     text = str(value or "").strip()
     if not text:
