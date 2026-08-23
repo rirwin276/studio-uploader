@@ -47,6 +47,13 @@ def wired(monkeypatch):
         return {"status": "intake_queued", "storefront_handle": payload["storefront_handle"]}
 
     monkeypatch.setattr(outreach_intake, "queue_intake_payload", queue, raising=False)
+    # Screening now goes out to DNS and to the organization's website. Left
+    # live these tests would depend on the network and on whether a made-up
+    # domain happens to resolve — see the dedicated tests below for the
+    # wiring itself.
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify, "check_candidate", lambda _c: (True, "")
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     return FakeCore(), ledger, submitted
 
@@ -442,3 +449,36 @@ def test_building_refuses_when_the_last_run_already_built(wired, monkeypatch):
     outreach_discovery.run_discovery(core, limit=2)  # a real run, not a test
     with pytest.raises(LookupError, match="not a test run"):
         outreach_discovery.build_last_run(core)
+
+
+def test_a_candidate_that_fails_verification_never_becomes_a_store(wired, monkeypatch):
+    """Screening is where the model's word gets checked. A candidate that
+    fails must not reach the build queue, and the reason has to survive to the
+    run log or nobody learns why the night was quiet."""
+    core, _ledger, submitted = wired
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "check_candidate",
+        lambda _c: (False, "example.org does not accept mail — the address would bounce"),
+    )
+    _answer(monkeypatch, [_candidate("ghost-club")])
+
+    run = outreach_discovery.run_discovery(core, limit=2)
+
+    assert submitted == []
+    assert "bounce" in run["rejected"][0]["reason"]
+
+
+def test_verification_runs_after_the_cheap_checks(wired, monkeypatch):
+    """A candidate with an unusable handle should never cost a DNS lookup or
+    an HTTP request."""
+    core, _ledger, _submitted = wired
+    called = []
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify, "check_candidate",
+        lambda candidate: (called.append(candidate), (True, ""))[1],
+    )
+    _answer(monkeypatch, [_candidate("Not A Valid Handle!")])
+
+    outreach_discovery.run_discovery(core, limit=2)
+    assert called == []
