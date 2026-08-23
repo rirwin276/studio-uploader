@@ -336,3 +336,96 @@ def test_a_rejected_fidelity_field_does_not_lose_the_redraw(monkeypatch):
     assert "input_fidelity" not in calls[1]
     assert report["recreated"] is True
     assert prepared.width == outreach_logo.TARGET_WIDTH
+
+
+# ---- is this even a logo? -------------------------------------------------
+
+
+def _photograph(size=600, seed=7):
+    """Continuous tone with noise — what a hero banner photo looks like."""
+    import math
+    import random
+    from PIL import ImageFilter
+
+    image = Image.new("RGB", (size, size))
+    pixels = image.load()
+    random.seed(seed)
+    for y in range(size):
+        for x in range(size):
+            pixels[x, y] = (
+                max(0, min(255, int(120 + 80 * math.sin(x / 60) + random.randint(-25, 25)))),
+                max(0, min(255, int(140 + 70 * math.cos(y / 50) + random.randint(-25, 25)))),
+                max(0, min(255, int(160 + 60 * math.sin((x + y) / 70) + random.randint(-25, 25)))),
+            )
+    return image.filter(ImageFilter.GaussianBlur(2)).convert("RGBA")
+
+
+def _detailed_crest(size=600):
+    """A busy emblem: gradient ring, several fills, antialiasing. The kind of
+    real logo a flatness test must not throw away."""
+    import math
+    from PIL import ImageDraw, ImageFilter
+
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    for i in range(size // 9):
+        t = i / (size / 9)
+        draw.ellipse((20 + i, 20 + i, size - 20 - i, size - 20 - i),
+                     outline=(int(200 - 60 * t), int(20 + 40 * t), int(30 + 20 * t), 255), width=2)
+    draw.ellipse((size * 0.15, size * 0.15, size * 0.85, size * 0.85), fill=(245, 242, 232, 255))
+    for angle in range(0, 360, 90):
+        radians = math.radians(angle)
+        cx, cy = size / 2 + size * 0.24 * math.cos(radians), size / 2 + size * 0.24 * math.sin(radians)
+        draw.polygon([(cx - 68, cy - 68), (cx + 68, cy - 68), (cx + 34, cy + 34), (cx - 34, cy + 34)],
+                     fill=(190, 25, 35, 255))
+    draw.ellipse((size * 0.37, size * 0.37, size * 0.63, size * 0.63), fill=(30, 40, 90, 255))
+    return image.filter(ImageFilter.SMOOTH)
+
+
+def test_a_photograph_is_not_a_logo():
+    """One store was built from a half-erased photo of a man swimming, lifted
+    from a hero banner. It passed every other check."""
+    photographic, reason = outreach_logo.looks_photographic(_photograph())
+    assert photographic
+    assert "photograph" in reason
+
+
+def test_a_half_erased_photograph_is_still_a_photograph():
+    """Background removal on a photo does not make it a mark; it makes a
+    ragged photo."""
+    from PIL import ImageDraw, ImageFilter
+
+    photo = _photograph()
+    mask = Image.new("L", photo.size, 0)
+    ImageDraw.Draw(mask).ellipse((60, 40, 520, 560), fill=255)
+    photo.putalpha(mask.filter(ImageFilter.GaussianBlur(6)))
+
+    assert outreach_logo.looks_photographic(photo)[0]
+
+
+def test_a_busy_detailed_crest_is_still_a_logo():
+    """The check has to survive a real emblem — gradient ring, several fills,
+    antialiased edges — or it throws away the good ones with the bad."""
+    photographic, reason = outreach_logo.looks_photographic(_detailed_crest())
+    assert not photographic, reason
+
+
+def test_a_simple_flat_mark_is_obviously_a_logo():
+    assert not outreach_logo.looks_photographic(_logo(600))[0]
+
+
+def test_the_gap_between_the_two_is_not_a_fine_judgement():
+    """If these were close the threshold would be luck rather than a rule."""
+    crest, _ = outreach_logo.flatness(_detailed_crest())
+    photo, _ = outreach_logo.flatness(_photograph())
+
+    assert crest > outreach_logo.FLATNESS_FLOOR + 0.25
+    assert photo < outreach_logo.FLATNESS_FLOOR - 0.15
+
+
+def test_a_photograph_never_reaches_the_image_model(drawn):
+    """Enlarging a photograph gives a bigger photograph and redrawing one gives
+    a drawing of a photograph. Neither is a logo, and both cost money."""
+    with pytest.raises(ValueError, match="photograph"):
+        outreach_logo.prepare(FakeCore(), _photograph())
+    assert drawn == []

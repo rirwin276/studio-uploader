@@ -24,9 +24,11 @@ early and the store is not built, which is the behaviour this replaced.
 from __future__ import annotations
 
 import base64
+import colorsys
 import io
+import math
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 from PIL import Image
@@ -132,6 +134,156 @@ def _logo_origin(logo_url: str, organization_url: str) -> Tuple[str, str]:
 def logo_origin(logo_url: str, organization_url: str) -> Tuple[str, str]:
     """Public name for the origin check. See _logo_origin."""
     return _logo_origin(logo_url, organization_url)
+
+
+# A mark is flat: a handful of colours cover almost all of it, however busy the
+# drawing is. A photograph is continuous tone and no small set of colours covers
+# much of anything. Measured on a detailed crest with a gradient ring and
+# antialiasing this sits near 0.97, and on a photograph near 0.21, so the line
+# between them is not a fine judgement.
+FLATNESS_FLOOR = 0.50
+_FLATNESS_TOP_COLORS = 8
+_FLATNESS_BUCKETS = 6
+_FLATNESS_SAMPLES = 120
+
+
+def flatness(image: Image.Image) -> Tuple[float, int]:
+    """What share of the visible artwork the few most common colours cover."""
+    rgba = image.convert("RGBA")
+    pixels = rgba.load()
+    width, height = rgba.size
+    step = 256 // _FLATNESS_BUCKETS
+    counts: Dict[Tuple[int, int, int], int] = {}
+    total = 0
+    for y in range(0, height, max(1, height // _FLATNESS_SAMPLES)):
+        for x in range(0, width, max(1, width // _FLATNESS_SAMPLES)):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha < 128:
+                continue
+            key = (red // step, green // step, blue // step)
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+    if not total:
+        return 0.0, 0
+    top = sorted(counts.values(), reverse=True)[:_FLATNESS_TOP_COLORS]
+    return sum(top) / total, len(counts)
+
+
+def looks_photographic(image: Image.Image) -> Tuple[bool, str]:
+    """Whether this is a photograph rather than a logo.
+
+    One store was built from a half-erased photo of a man swimming, lifted from
+    a hero banner. It passed every other check — it was on the right domain and
+    it was plenty big — and printing it on eight garments produced something
+    worse than no store at all. Nothing until now asked whether the image was
+    a mark.
+    """
+    covered, distinct = flatness(image)
+    if covered < FLATNESS_FLOOR:
+        return True, (
+            f"the image looks like a photograph rather than a logo — its "
+            f"{_FLATNESS_TOP_COLORS} commonest colours cover only "
+            f"{covered:.0%} of it, across {distinct} distinct tones"
+        )
+    return False, ""
+
+
+# ─── Brand colours ──────────────────────────────────────────────────────────
+# The organization's colours are sitting in their logo. Reading them there is
+# free and exact, where the intake's primary_color is one word a model guessed
+# — "Red" for a department whose actual red is #b6001e.
+
+_BRAND_BUCKETS = 12
+_BRAND_SAMPLES = 160
+# Two colours closer than this read as one colour to a person, so returning
+# both would give a store two shades of the same thing and call it variety.
+_BRAND_MIN_DISTANCE = 26.0
+
+
+def _srgb_to_lab(rgb: Tuple[int, int, int]) -> Tuple[float, float, float]:
+    def linear(channel: float) -> float:
+        channel /= 255.0
+        return channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (linear(float(c)) for c in rgb)
+    x = (red * 0.4124 + green * 0.3576 + blue * 0.1805) / 0.95047
+    y = red * 0.2126 + green * 0.7152 + blue * 0.0722
+    z = (red * 0.0193 + green * 0.1192 + blue * 0.9505) / 1.08883
+
+    def f(t: float) -> float:
+        return t ** (1 / 3) if t > 0.008856 else (7.787 * t) + (16 / 116)
+
+    fx, fy, fz = f(x), f(y), f(z)
+    return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+
+
+def _lab_distance(a: Tuple[int, int, int], b: Tuple[int, int, int]) -> float:
+    la, aa, ba = _srgb_to_lab(a)
+    lb, ab, bb = _srgb_to_lab(b)
+    return math.sqrt((la - lb) ** 2 + (aa - ab) ** 2 + (ba - bb) ** 2)
+
+
+def _hex(rgb: Tuple[int, int, int]) -> str:
+    return "#%02x%02x%02x" % rgb
+
+
+def brand_colors(image: Image.Image, count: int = 3) -> List[str]:
+    """The colours this logo is actually made of, most prominent first.
+
+    Ranked by coverage weighted toward saturation, so a crest that is mostly
+    off-white paper with a red cross returns the red. A genuinely monochrome
+    mark still returns its greys rather than nothing, because a black-and-white
+    logo's brand colour really is black.
+    """
+    rgba = image.convert("RGBA")
+    pixels = rgba.load()
+    width, height = rgba.size
+    step = 256 // _BRAND_BUCKETS
+    tally: Dict[Tuple[int, int, int], List[float]] = {}
+
+    for y in range(0, height, max(1, height // _BRAND_SAMPLES)):
+        for x in range(0, width, max(1, width // _BRAND_SAMPLES)):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha < 200:
+                continue
+            key = (red // step, green // step, blue // step)
+            entry = tally.setdefault(key, [0.0, 0.0, 0.0, 0.0])
+            entry[0] += red
+            entry[1] += green
+            entry[2] += blue
+            entry[3] += 1
+
+    if not tally:
+        return []
+
+    candidates = []
+    for totals in tally.values():
+        pixel_count = totals[3]
+        average = (
+            int(totals[0] / pixel_count),
+            int(totals[1] / pixel_count),
+            int(totals[2] / pixel_count),
+        )
+        _hue, saturation, value = colorsys.rgb_to_hsv(*(c / 255 for c in average))
+        # A colour earns its place by how much of the mark it covers and how
+        # much of a colour it is. Pure coverage alone returns the white paper
+        # every crest is printed on.
+        weight = pixel_count * (0.35 + saturation)
+        # Near-black and near-white are structure — outlines and paper — before
+        # they are brand, so they only win when there is nothing else.
+        if value < 0.12 or (saturation < 0.12 and value > 0.9):
+            weight *= 0.25
+        candidates.append((weight, average))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    chosen: List[Tuple[int, int, int]] = []
+    for _weight, rgb in candidates:
+        if all(_lab_distance(rgb, taken) >= _BRAND_MIN_DISTANCE for taken in chosen):
+            chosen.append(rgb)
+        if len(chosen) >= count:
+            break
+    return [_hex(rgb) for rgb in chosen]
 
 
 def recreation_available() -> bool:
@@ -292,8 +444,18 @@ def prepare(
     Returns the 4096px image and a report naming the rung used, which the
     ledger stores and the email reads.
     """
-    report = assess(image)
     cropped = _crop_to_artwork(image)
+
+    # Asked before anything else. Enlarging a photograph gives a bigger
+    # photograph, and redrawing one gives a drawing of a photograph; neither is
+    # a logo, and both cost money to find that out.
+    photographic, photo_problem = looks_photographic(cropped)
+    if photographic:
+        raise ValueError(photo_problem)
+
+    report = assess(image)
+    # Read off the source, before any upscaling or redrawing can shift them.
+    report["brand_colors"] = brand_colors(cropped)
 
     if is_vector and report["verdict"] == "recreated":
         # Vector artwork carries no resolution to lose, so there is nothing to

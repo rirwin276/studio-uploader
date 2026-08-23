@@ -362,6 +362,8 @@ def _process_intake_state(core: Any, handle: str, state: Dict[str, Any]) -> None
             "logo_quality_reason": logo_report.get("reason"),
             "logo_recreated": bool(logo_report.get("recreated")),
             "logo_source_width": logo_report.get("artwork_width"),
+            # Read off the logo, and the source for the store's own palette.
+            "brand_colors": logo_report.get("brand_colors") or [],
         },
     )
     core._job_set(
