@@ -11,11 +11,12 @@ review queue can be exercised long before mail is live.
 
 from __future__ import annotations
 
+import html
 import os
 import smtplib
 from email.message import EmailMessage
-from email.utils import formataddr, parseaddr
-from typing import Any, Dict
+from email.utils import formataddr, parseaddr, make_msgid
+from typing import Any, Dict, List, Sequence, Tuple
 
 
 STORE_BASE_URL = "https://stellasageco.com"
@@ -113,66 +114,188 @@ def _message(*, to: str, subject: str, body: str) -> EmailMessage:
     return message
 
 
-def first_contact(state: Dict[str, Any]) -> EmailMessage:
+# A message is written once as blocks and rendered twice. Writing the plain
+# text and the HTML separately means every future edit to the pitch has to be
+# made in both, and the one that gets forgotten is the one somebody reads.
+Block = Tuple[str, str]
+
+# Deliberately close to no styling at all. A designed template with a logo bar
+# and a call-to-action button is the visual signature of bulk mail; this should
+# read as a person who wrote an email and attached two photos.
+_HTML_WRAP = (
+    '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+    'Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.55;'
+    'color:#1c1c1e;max-width:560px;">{body}</div>'
+)
+
+
+def _render_text(blocks: Sequence[Block]) -> str:
+    out: List[str] = []
+    for kind, value in blocks:
+        # A photos block carries the line that stands in for the pictures when
+        # there are none to show — a reader in plain text gets told they were
+        # attached rather than a sentence pointing at nothing.
+        if not value:
+            continue
+        out.append(value)
+    return "\n\n".join(out).strip() + "\n"
+
+
+def _render_html(blocks: Sequence[Block], photo_cids: Sequence[str]) -> str:
+    out: List[str] = []
+    for kind, value in blocks:
+        if kind == "url":
+            safe = html.escape(value, quote=True)
+            out.append(f'<p style="margin:0 0 14px;"><a href="{safe}">{safe}</a></p>')
+        elif kind == "photos":
+            for cid in photo_cids:
+                # cid: references the attached part, so the picture shows even
+                # when a client blocks remote images — which, for a first email
+                # from an unknown sender, most of them do.
+                out.append(
+                    f'<p style="margin:0 0 14px;"><img src="cid:{cid}" '
+                    'alt="Your logo on one of the garments" '
+                    'style="width:100%;max-width:320px;height:auto;'
+                    'border-radius:8px;border:1px solid #e5e5e7;"></p>'
+                )
+        elif kind == "sig":
+            safe = html.escape(value).replace("\n", "<br>")
+            out.append(
+                f'<p style="margin:18px 0 0;color:#6e6e73;font-size:13px;'
+                f'line-height:1.5;">{safe}</p>'
+            )
+        else:
+            safe = html.escape(value).replace("\n", "<br>")
+            out.append(f'<p style="margin:0 0 14px;">{safe}</p>')
+    return _HTML_WRAP.format(body="".join(out))
+
+
+def _compose(
+    *,
+    to: str,
+    subject: str,
+    blocks: Sequence[Block],
+    photos: Sequence[Dict[str, Any]] = (),
+) -> EmailMessage:
+    """Build the message, with the photos inline when there are any.
+
+    Without photos this stays a plain-text email, exactly as before. Adding an
+    empty HTML alternative would make every message multipart for no gain.
+    """
+    message = _message(to=to, subject=subject, body=_render_text(blocks))
+    if not photos:
+        return message
+
+    cids = [make_msgid()[1:-1] for _ in photos]
+    message.add_alternative(_render_html(blocks, cids), subtype="html")
+    related = message.get_payload()[-1]
+    for photo, cid in zip(photos, cids):
+        related.add_related(
+            photo["data"],
+            maintype="image",
+            subtype=str(photo.get("subtype") or "jpeg"),
+            cid=f"<{cid}>",
+            filename=_photo_filename(photo),
+            disposition="inline",
+        )
+    return message
+
+
+def _photo_filename(photo: Dict[str, Any]) -> str:
+    """A name a person would recognise if their client lists attachments."""
+    title = str(photo.get("title") or "mockup").strip() or "mockup"
+    safe = "".join(char if char.isalnum() or char in " -_" else "" for char in title)
+    extension = str(photo.get("subtype") or "jpeg").lower()
+    if extension == "jpeg":
+        extension = "jpg"
+    return f"{safe.strip()[:60] or 'mockup'}.{extension}"
+
+
+def first_contact(
+    state: Dict[str, Any], photos: Sequence[Dict[str, Any]] = ()
+) -> EmailMessage:
     """The opening email.
 
-    Plain text on purpose. A designed template with a tracking pixel is the
-    visual signature of bulk mail, and this is one message to one organization
-    about a store that already exists for them.
+    No template and no tracking pixel. The only pictures are the prospect's own
+    logo on two garments, which is the part of this that does the persuading —
+    a link asks somebody to imagine it, a photo does the imagining for them.
     """
     handle = str(state.get("handle") or "").strip()
     org = organization_name(state)
 
-    body = f"""Hi {org} team,
-
-I run a small veteran-owned apparel company in California. I noticed {org} doesn't have a team store, so I put one together to show you what it could look like — your logo on a tri-blend tee and a hoodie:
-
-{preview_url(handle)}
-
-No sign-in needed. You can click into the admin and change the store's look, colors, and welcome message, or build a product yourself, before deciding anything.
-
-There's no cost and no catch. We make the shirts, we ship them, we handle returns. We make money only if your members actually buy something. If nobody does, I'm out a little time and that's the end of it.
-
-To be clear about the artwork: this is an unofficial concept I built to show you the idea. Your logo is yours. Nothing is public, nothing is for sale, and no one is being charged.
-
-If it looks useful, the first person from {org} to use this link becomes the store's admin, and anyone else who joins with the same link becomes a member:
-
-{claim_url(handle)}
-
-If it's not useful, just reply "no thanks" and I'll delete the whole thing, artwork included. I'll take it down in about a week anyway if I don't hear back.
-
-Happy to answer anything.
-
-{_footer()}"""
-    return _message(
+    blocks: List[Block] = [
+        ("p", f"Hi {org} team,"),
+        ("p", f"I run a small veteran-owned apparel company in California. I noticed "
+              f"{org} doesn't have a team store, so I put one together to show you "
+              f"what it could look like — your logo on a tri-blend tee and a hoodie:"),
+    ]
+    if photos:
+        blocks.append(
+            ("photos", "(I've attached the two photos so you can see them without "
+                       "clicking anything.)")
+        )
+    blocks += [
+        ("p", "The whole store is here:"),
+        ("url", preview_url(handle)),
+        ("p", "No sign-in needed. You can click into the admin and change the store's "
+              "look, colors, and welcome message, or build a product yourself, before "
+              "deciding anything."),
+        ("p", "There's no cost and no catch. We make the shirts, we ship them, we "
+              "handle returns. We make money only if your members actually buy "
+              "something. If nobody does, I'm out a little time and that's the end of it."),
+        ("p", "To be clear about the artwork: this is an unofficial concept I built to "
+              "show you the idea. Your logo is yours. Nothing is public, nothing is for "
+              "sale, and no one is being charged."),
+        ("p", f"If it looks useful, the first person from {org} to use this link becomes "
+              f"the store's admin, and anyone else who joins with the same link becomes "
+              f"a member:"),
+        ("url", claim_url(handle)),
+        ("p", 'If it\'s not useful, just reply "no thanks" and I\'ll delete the whole '
+              "thing, artwork included. I'll take it down in about a week anyway if I "
+              "don't hear back."),
+        ("p", "Happy to answer anything."),
+        ("sig", _footer().rstrip("\n")),
+    ]
+    return _compose(
         to=str(state.get("contact_email") or "").strip(),
         subject=f"Team store idea for {org} (already built, take a look)",
-        body=body,
+        blocks=blocks,
+        photos=photos,
     )
 
 
-def follow_up(state: Dict[str, Any]) -> EmailMessage:
-    """Day 3. Shorter than the first one — they already have the pitch."""
+def follow_up(
+    state: Dict[str, Any], photos: Sequence[Dict[str, Any]] = ()
+) -> EmailMessage:
+    """Day 3. Shorter than the first one — they already have the pitch.
+
+    One photo, not two. The pitch is the part they have already read; the
+    garment is the part worth showing again.
+    """
     handle = str(state.get("handle") or "").strip()
     org = organization_name(state)
+    photos = list(photos)[:1]
 
-    body = f"""Hi {org} team,
-
-Following up once on the team store I built for you:
-
-{preview_url(handle)}
-
-You can look around and even make a product without signing in. If an authorized person wants to keep it, the first one to use this link becomes the admin:
-
-{claim_url(handle)}
-
-If it's not for you, reply "no thanks" and I'll delete it and the artwork.
-
-{_footer()}"""
-    return _message(
+    blocks: List[Block] = [
+        ("p", f"Hi {org} team,"),
+        ("p", "Following up once on the team store I built for you:"),
+    ]
+    if photos:
+        blocks.append(("photos", "(Photo attached.)"))
+    blocks += [
+        ("url", preview_url(handle)),
+        ("p", "You can look around and even make a product without signing in. If an "
+              "authorized person wants to keep it, the first one to use this link "
+              "becomes the admin:"),
+        ("url", claim_url(handle)),
+        ("p", 'If it\'s not for you, reply "no thanks" and I\'ll delete it and the artwork.'),
+        ("sig", _footer().rstrip("\n")),
+    ]
+    return _compose(
         to=str(state.get("contact_email") or "").strip(),
         subject=f"Re: Team store idea for {org}",
-        body=body,
+        blocks=blocks,
+        photos=photos,
     )
 
 

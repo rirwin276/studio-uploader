@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict
 
 import outreach_mail
+import outreach_mockups
 import outreach_tracking
 
 
@@ -38,7 +39,9 @@ def process_due_followups(core: Any) -> int:
             or not recipient
         ):
             continue
-        message = outreach_mail.follow_up(state)
+        message = outreach_mail.follow_up(
+            state, outreach_mockups.for_email(core, handle)
+        )
         try:
             outreach_mail.send(message)
             outreach_tracking.update(

@@ -221,6 +221,16 @@ except Exception:
     log.exception("Could not install outreach discovery routes")
 
 
+# Inbound replies. Inert without OUTREACH_INBOUND_SECRET, and the only action it
+# ever takes on its own is honouring a plain request to be left alone.
+try:
+    from outreach_replies import install_outreach_reply_routes
+
+    install_outreach_reply_routes(app, core)
+except Exception:
+    log.exception("Could not install outreach reply routes")
+
+
 # The morning review queue. Read-only until somebody presses a button: it never
 # sends or deletes on a schedule of its own.
 try:
