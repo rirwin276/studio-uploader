@@ -57,6 +57,11 @@ def _row(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
         "contact_source_url": state.get("contact_source_url") or "",
         "logo_source_url": state.get("logo_source_url") or "",
         "source_agent": state.get("source_agent") or "",
+        # A redrawn logo is the one thing worth looking at the preview for
+        # before emailing a stranger about it.
+        "logo_recreated": bool(state.get("logo_recreated")),
+        "logo_quality": state.get("logo_quality") or "",
+        "logo_quality_reason": state.get("logo_quality_reason") or "",
         "built_at": state.get("built_at") or state.get("created_at"),
         "preview_url": outreach_mail.preview_url(handle),
         "claim_url": outreach_mail.claim_url(handle),

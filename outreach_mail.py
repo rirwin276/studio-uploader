@@ -234,6 +234,18 @@ def first_contact(
             ("photos", "(I've attached the two photos so you can see them without "
                        "clicking anything.)")
         )
+    # Said plainly, near the top, in our own words. A prospect who is told we
+    # redrew their mark finds it thorough; one who works it out for themselves
+    # finds it something else entirely.
+    if state.get("logo_recreated"):
+        blocks.append(
+            ("p", "One thing to flag: the logo I could find for you online was too "
+                  "low-resolution to print from, so the version on these is one I "
+                  "redrew at print quality. It should be a faithful copy, but it is "
+                  "my redraw and not your file. Send me your original artwork and "
+                  "I'll swap it in myself, or you can replace it in a couple of "
+                  "clicks once the store is yours.")
+        )
     blocks += [
         ("p", "The whole store is here:"),
         ("url", preview_url(handle)),

@@ -145,7 +145,10 @@ def test_worker_builds_through_normal_provisioner(monkeypatch, tmp_path):
         json=_payload(),
     )
     monkeypatch.setattr(outreach_intake, "_download_public_image", lambda *_args: b"logo")
-    monkeypatch.setattr(outreach_intake, "_prepare_remote_logo", lambda *_args: _reviewed_image())
+    monkeypatch.setattr(
+        outreach_intake, "_prepare_remote_logo",
+        lambda *_args: (_reviewed_image(), {"verdict": "original"}),
+    )
 
     assert outreach_intake.process_intake_queue(core) == 1
 
@@ -214,7 +217,10 @@ def test_stale_processing_state_is_recovered(monkeypatch, tmp_path):
         "intake_started_at": stale,
     }
     monkeypatch.setattr(outreach_intake, "_download_public_image", lambda *_args: b"logo")
-    monkeypatch.setattr(outreach_intake, "_prepare_remote_logo", lambda *_args: _reviewed_image())
+    monkeypatch.setattr(
+        outreach_intake, "_prepare_remote_logo",
+        lambda *_args: (_reviewed_image(), {"verdict": "original"}),
+    )
 
     assert outreach_intake.process_intake_queue(core) == 1
     assert states["example-club"]["status"] == "provisioned"
