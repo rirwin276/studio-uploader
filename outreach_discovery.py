@@ -179,7 +179,11 @@ _API_URL = "https://api.openai.com/v1/responses"
 # Both are environment-driven on purpose. Model names and the exact web-search
 # tool identifier change on the provider's schedule, not ours, and a rename
 # should be a variable edit rather than a deploy.
-DEFAULT_MODEL = "gpt-5.6-luna"
+# Discovery is a short, structured web lookup—not a long research task. The
+# fast non-reasoning model keeps a single search from consuming minutes of
+# background time or a high-reasoning-model budget. A stronger model remains a
+# per-run override for a deliberately reviewed experiment.
+DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_SEARCH_TOOL = "web_search"
 
 
@@ -400,7 +404,7 @@ _RETRYABLE = {429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 2
 _MAX_RETRY_WAIT = 30.0
 _CONNECT_TIMEOUT_SECONDS = 15
-_READ_TIMEOUT_SECONDS = 90
+_READ_TIMEOUT_SECONDS = 120
 
 
 def _retry_after(response: Any, attempt: int) -> float:
@@ -462,15 +466,25 @@ def _ask_for_candidates(
     started = time.time()
     connect_timeout, read_timeout = _timeouts()
     response = None
+    last_request_error: requests.RequestException | None = None
     attempts = 0
     for attempt in range(_MAX_ATTEMPTS):
         attempts = attempt + 1
-        response = requests.post(
-            _API_URL,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=(connect_timeout, read_timeout),
-        )
+        try:
+            response = requests.post(
+                _API_URL,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=(connect_timeout, read_timeout),
+            )
+        except requests.RequestException as exc:
+            last_request_error = exc
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise RuntimeError(
+                    f"OpenAI request timed out or could not connect after {attempts} attempts: {exc}"
+                ) from exc
+            time.sleep(_retry_after(None, attempt))
+            continue
         if response.status_code < 300:
             break
         if response.status_code not in _RETRYABLE or attempt == _MAX_ATTEMPTS - 1:
@@ -481,6 +495,10 @@ def _ask_for_candidates(
                 f"OpenAI returned HTTP {response.status_code}: {response.text[:400]}"
             )
         time.sleep(_retry_after(response, attempt))
+    if response is None:
+        raise RuntimeError(
+            f"OpenAI did not return a response: {last_request_error or 'unknown request failure'}"
+        )
     body = response.json()
 
     text = ""

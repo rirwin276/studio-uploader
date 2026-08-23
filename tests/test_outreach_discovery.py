@@ -344,6 +344,27 @@ def test_a_rate_limit_waits_and_retries_instead_of_failing(monkeypatch):
     assert 8.0 <= slept[0] <= 9.0
 
 
+def test_a_temporary_openai_read_timeout_retries(monkeypatch):
+    """A slow search response is transient. It must not turn a healthy
+    background job into an immediate no-candidates failure."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls = []
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise outreach_discovery.requests.ReadTimeout("slow search")
+        return FakeResponse(200, payload=_OK_BODY)
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+    monkeypatch.setattr(outreach_discovery.time, "sleep", lambda _s: None)
+
+    candidates, telemetry = outreach_discovery._ask_for_candidates(2, [])
+
+    assert candidates == []
+    assert telemetry["attempts"] == 2
+
+
 def test_a_bad_model_fails_immediately_without_retrying(monkeypatch):
     """A rename does not fix itself. Retrying it just spends the wait twice and
     delays the message that says what to change."""
