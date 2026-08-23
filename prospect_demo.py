@@ -167,18 +167,42 @@ def _public_state(
     }
 
 
+# Set by the relay once it has verified the visitor is a super-admin. These
+# routes are already behind the admin secret, so nothing but the relay can
+# supply it.
+STAFF_HEADER = "X-SS-Staff"
+
+
+def is_staff_request(request: Any) -> bool:
+    try:
+        return str(request.headers.get(STAFF_HEADER, "")).strip() == "1"
+    except Exception:
+        return False
+
+
 def _append_event(
     state: Dict[str, Any],
     event: str,
     *,
     session_id: str = "",
     details: Dict[str, Any] | None = None,
+    staff: bool = False,
 ) -> Dict[str, Any]:
+    """Record one thing that happened, and whether it counts.
+
+    Staff events are kept but never counted. Checking your own work is not
+    traction, and it must not read as it: the funnel would report interest
+    nobody had, and retention would keep a store alive because its owner was
+    the one poking at it.
+    """
     demo = _demo(state)
     now = outreach_tracking.utc_iso()
     counts = dict(demo.get("event_counts") or {})
-    counts[event] = int(counts.get(event) or 0) + 1
+    if not staff:
+        counts[event] = int(counts.get(event) or 0) + 1
     row: Dict[str, Any] = {"event": event, "at": now}
+    if staff:
+        row["staff"] = True
     if session_id:
         row["session_id"] = session_id[:80]
     if details:
@@ -191,7 +215,10 @@ def _append_event(
     events.append(row)
     demo["event_counts"] = counts
     demo["events"] = events[-_MAX_EVENTS:]
-    demo[f"last_{event}_at"] = now
+    if not staff:
+        # Retention reads these. A staff visit refreshing one would keep a
+        # store alive on the strength of its owner looking at it.
+        demo[f"last_{event}_at"] = now
     state["prospect_demo"] = demo
     return row
 
@@ -204,6 +231,7 @@ def record_event(
     session_id: str = "",
     details: Dict[str, Any] | None = None,
     require_unclaimed: bool = True,
+    staff: bool = False,
 ) -> Dict[str, Any]:
     normalized = _normalize_handle(handle)
     if not normalized:
@@ -221,6 +249,7 @@ def record_event(
             event,
             session_id=str(session_id or ""),
             details=details,
+            staff=staff,
         )
         outreach_tracking.upsert(core, normalized, state)
         return row
@@ -294,6 +323,7 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 str((body or {}).get("event") or ""),
                 session_id=str((body or {}).get("session_id") or ""),
                 details=(body or {}).get("details") if isinstance((body or {}).get("details"), dict) else None,
+                staff=is_staff_request(request),
             )
             return {"ok": True, "event": row}
         except ValueError as exc:
@@ -319,6 +349,8 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
         if not normalized or not _SAFE_MODEL.fullmatch(model) or not request_id or not job_id:
             return JSONResponse({"error": "handle, model, request_id, and job_id are required"}, status_code=400)
 
+        staff = is_staff_request(request)
+
         with _store_lock(normalized):
             state = outreach_tracking.read(core, normalized)
             if not state:
@@ -327,6 +359,11 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 return JSONResponse({"error": "Store is not an unclaimed prospect"}, status_code=409)
             demo = _demo(state)
             status = str(demo.get("product_status") or "available")
+            # Testing the builder must not spend the prospect's one free
+            # product. Finding it already used, by someone they never met, is
+            # a worse first impression than the demo is a good one.
+            if staff and status in {"reserved", "building", "completed"}:
+                status = "available"
             if status in {"reserved", "building", "completed"}:
                 if status != "completed" and demo.get("request_id") == request_id:
                     return {
@@ -356,12 +393,14 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 "product_handle": None,
                 "completed_at": None,
             })
-            state["prospect_demo"] = demo
+            if not staff:
+                state["prospect_demo"] = demo
             _append_event(
                 state,
                 "demo_product_publish_clicked",
                 session_id=request_id,
                 details={"model": model, "job_id": job_id},
+                staff=staff,
             )
             outreach_tracking.upsert(core, normalized, state)
             return {"ok": True, "status": "reserved", "reservation_id": reservation_id}

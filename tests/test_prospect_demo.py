@@ -230,3 +230,46 @@ def test_an_unclaimed_store_is_unaffected_by_the_owner_check(monkeypatch):
     state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
     assert state.json()["enabled"] is True
     assert states["example-club"]["claim_status"] == "unclaimed"
+
+
+# ---- the founder checking his own work is not traction --------------------
+
+
+class _StaffRequest:
+    def __init__(self, staff: bool):
+        self.headers = {"X-SS-Staff": "1"} if staff else {}
+
+
+def test_a_staff_event_is_kept_but_never_counted():
+    """Checking your own work must not read as interest: the funnel would
+    report traction nobody had, and retention would keep a store alive because
+    its author was the one poking at it."""
+    import prospect_demo
+
+    state = {}
+    prospect_demo._append_event(state, "admin_demo_opened", staff=True)
+    demo = state["prospect_demo"]
+
+    assert demo["event_counts"] == {}
+    assert demo["events"][-1]["staff"] is True
+    assert "last_admin_demo_opened_at" not in demo
+
+
+def test_a_prospect_event_still_counts():
+    import prospect_demo
+
+    state = {}
+    prospect_demo._append_event(state, "admin_demo_opened")
+    demo = state["prospect_demo"]
+
+    assert demo["event_counts"]["admin_demo_opened"] == 1
+    assert "staff" not in demo["events"][-1]
+    assert demo["last_admin_demo_opened_at"]
+
+
+def test_the_staff_marker_only_comes_from_the_relay():
+    import prospect_demo
+
+    assert prospect_demo.is_staff_request(_StaffRequest(True)) is True
+    assert prospect_demo.is_staff_request(_StaffRequest(False)) is False
+    assert prospect_demo.is_staff_request(object()) is False

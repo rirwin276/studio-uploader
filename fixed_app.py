@@ -241,6 +241,16 @@ except Exception:
     log.exception("Could not install outreach review routes")
 
 
+# Retention keeps the promise the outreach email makes. Only a store nobody
+# touched is removed, and only once OUTREACH_RETENTION_ENABLED is set.
+try:
+    from outreach_retention import install_outreach_retention_scheduler
+
+    install_outreach_retention_scheduler(core)
+except Exception:
+    log.exception("Could not install outreach retention scheduler")
+
+
 # Follow-ups are isolated from intake/build behavior and remain inert unless
 # SMTP is configured and a store has explicitly been marked as sent.
 try:
