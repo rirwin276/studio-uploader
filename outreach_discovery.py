@@ -26,6 +26,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
+import outreach_logo
 import outreach_tracking
 from outreach_auth import require_outreach_secret
 
@@ -409,6 +410,14 @@ def _clean(
     host = _domain(urls["organization_url"])
     if host and host in (known_domains or set()):
         return None, f"{host} is already in the system"
+
+    origin, origin_problem = outreach_logo.logo_origin(
+        urls["logo_source_url"], urls["organization_url"]
+    )
+    if origin == "foreign":
+        # Cheaper to lose the candidate than to build a store wearing somebody
+        # else's badge and email a stranger about it.
+        return None, origin_problem
 
     return {
         "provider_request_id": f"discovery-{time.strftime('%Y%m%d')}-{handle}"[:120],

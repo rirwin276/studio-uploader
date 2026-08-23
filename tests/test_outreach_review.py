@@ -363,3 +363,51 @@ def test_retrying_something_that_does_not_exist_says_so(monkeypatch):
     core = _failed_core(monkeypatch, {})
     with pytest.raises(LookupError):
         outreach_review.retry(core, "nobody")
+
+
+# ---- removing a store outright --------------------------------------------
+
+
+def test_a_wrong_store_can_be_deleted_at_any_stage(monkeypatch):
+    """Decline is the reviewer's "no" on a store still waiting. This is the
+    other thing: a store that should not exist, whatever stage it reached."""
+    stores = {"cologne": _store("cologne", status="outreach_sent",
+                                sent_at="2026-08-23T09:00:00+00:00")}
+    core = _failed_core(monkeypatch, stores)
+
+    result = outreach_review.remove(core, "cologne", reason="wrong club's logo")
+
+    assert result["status"] == "declined"
+    assert core.deprovisioned == [(result["job_id"], "cologne")]
+    assert stores["cologne"]["review_decision"] == "removed"
+    assert stores["cologne"]["review_note"] == "wrong club's logo"
+    # It must never look due for a follow-up or a scheduled deletion again.
+    assert stores["cologne"]["followup_due_at"] is None
+    assert stores["cologne"]["delete_due_at"] is None
+
+
+def test_a_failed_store_can_be_deleted_too(monkeypatch):
+    stores = {"oranco": _store("oranco", status="intake_failed")}
+    core = _failed_core(monkeypatch, stores)
+    outreach_review.remove(core, "oranco")
+    assert core.deprovisioned
+
+
+def test_a_claimed_store_is_never_deleted_from_here(monkeypatch):
+    """It belongs to somebody now. Deleting it would take a real customer's
+    storefront out from under them."""
+    stores = {"westside": _store("westside", claim_status="claimed",
+                                 claimed_at="2026-08-21T09:00:00+00:00")}
+    core = _failed_core(monkeypatch, stores)
+
+    with pytest.raises(PermissionError, match="claimed"):
+        outreach_review.remove(core, "westside")
+    assert core.deprovisioned == []
+
+
+def test_a_website_store_is_not_deletable_from_the_outreach_page(monkeypatch):
+    stores = {"customer": _store("customer", source="website_request_form")}
+    core = _failed_core(monkeypatch, stores)
+    with pytest.raises(PermissionError):
+        outreach_review.remove(core, "customer")
+    assert core.deprovisioned == []

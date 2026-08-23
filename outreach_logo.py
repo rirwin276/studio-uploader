@@ -45,9 +45,17 @@ GOOD_ARTWORK_WIDTH = 900
 SALVAGE_ARTWORK_WIDTH = 256
 
 _IMAGE_API = "https://api.openai.com/v1/images/edits"
-_IMAGE_MODEL = "gpt-image-1"
+# Environment-driven for the same reason the discovery model is: names change
+# on the provider's schedule, not ours, and a better one should be a variable
+# edit rather than a deploy.
+DEFAULT_IMAGE_MODEL = "gpt-image-1"
 _IMAGE_SIZE = "1024x1024"
-_IMAGE_TIMEOUT = (15, 180)
+_IMAGE_TIMEOUT = (15, 240)
+
+# The lever that matters for a logo. Faithfulness, not creativity, is the whole
+# job here — a beautiful redraw of the wrong mark is a failure. Sent only when
+# the endpoint accepts it; see recreate().
+_FIDELITY = "high"
 
 # Says redraw, not reinterpret. The failure this guards against is a model
 # producing a nice logo that is not theirs.
@@ -59,6 +67,71 @@ _REDRAW_PROMPT = (
     "gradients, backgrounds or decoration. Do not crop or rearrange the design. "
     "Output only the logo artwork itself."
 )
+
+
+def _domain(url: Any) -> str:
+    """The lowercased host of a URL, without www."""
+    text = str(url or "").strip().lower()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    host = text.split("/", 1)[0].split("?", 1)[0].split("@")[-1].split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def _registrable(host: str) -> str:
+    """The part of a host that identifies who owns it.
+
+    Deliberately a heuristic. assets.westside-rowing.org and westside-rowing.org
+    are the same people; westside-rowing.org and koelner-scheibengolf.de are not,
+    and that is the only distinction being made here.
+    """
+    labels = [part for part in str(host or "").split(".") if part]
+    if len(labels) < 2:
+        return host or ""
+    # co.uk, org.au, org.uk and friends need one more label to say anything.
+    if len(labels) >= 3 and labels[-2] in {"co", "com", "org", "net", "gov", "ac", "edu"} and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+# Hosting a logo on a site builder's CDN is normal for a small club, and the
+# CDN host says nothing about who owns the image. These are allowed through and
+# marked, rather than trusted or rejected outright.
+_BUILDER_CDNS = (
+    "squarespace.com", "squarespace-cdn.com", "wixstatic.com", "wix.com",
+    "shopify.com", "googleusercontent.com", "cloudfront.net", "amazonaws.com",
+    "weebly.com", "wordpress.com", "wp.com", "sportsengine.com", "teamsnap.com",
+    "leagueapps.com", "sitewrench.com", "godaddysites.com", "img1.wsimg.com",
+    "cloudinary.com", "imgix.net", "netlify.app", "github.io",
+)
+
+
+def _logo_origin(logo_url: str, organization_url: str) -> Tuple[str, str]:
+    """Whether this logo plausibly belongs to this organization.
+
+    The brief already tells the model to take the logo from the organization's
+    own site. That is not the same as it being true, and the failure is silent
+    and expensive: a store gets built and emailed wearing a different club's
+    badge, which reads as a scrape rather than as effort. A logo from an
+    unrelated domain is almost always the model having found a similarly-named
+    organization.
+    """
+    logo_host = _domain(logo_url)
+    org_host = _domain(organization_url)
+    if not logo_host or not org_host:
+        return "unknown", "logo or organization URL has no host"
+
+    logo_site = _registrable(logo_host)
+    if logo_site == _registrable(org_host):
+        return "own_domain", ""
+    if any(logo_site == cdn or logo_host.endswith("." + cdn) for cdn in _BUILDER_CDNS):
+        return "cdn", ""
+    return "foreign", f"logo is hosted on {logo_host}, which is not {org_host} or a site-builder CDN"
+
+
+def logo_origin(logo_url: str, organization_url: str) -> Tuple[str, str]:
+    """Public name for the origin check. See _logo_origin."""
+    return _logo_origin(logo_url, organization_url)
 
 
 def recreation_available() -> bool:
@@ -157,19 +230,33 @@ def recreate(image: Image.Image, *, organization: str = "") -> Image.Image:
     if organization:
         prompt += f" The logo belongs to {organization}."
 
-    response = requests.post(
-        _IMAGE_API,
-        headers={"Authorization": f"Bearer {key}"},
-        files={"image": ("logo.png", buffer.getvalue(), "image/png")},
-        data={
-            "model": _IMAGE_MODEL,
-            "prompt": prompt,
-            "size": _IMAGE_SIZE,
-            "background": "transparent",
-            "n": "1",
-        },
-        timeout=_IMAGE_TIMEOUT,
-    )
+    model = os.getenv("OUTREACH_LOGO_MODEL", DEFAULT_IMAGE_MODEL).strip() or DEFAULT_IMAGE_MODEL
+    fields = {
+        "model": model,
+        "prompt": prompt,
+        "size": _IMAGE_SIZE,
+        "background": "transparent",
+        "n": "1",
+        "input_fidelity": _FIDELITY,
+    }
+
+    def send(data):
+        return requests.post(
+            _IMAGE_API,
+            headers={"Authorization": f"Bearer {key}"},
+            files={"image": ("logo.png", buffer.getvalue(), "image/png")},
+            data=data,
+            timeout=_IMAGE_TIMEOUT,
+        )
+
+    response = send(fields)
+    if response.status_code >= 300 and "input_fidelity" in (response.text or ""):
+        # Not every model or API version takes this parameter. Losing fidelity
+        # is worth a redraw; losing the redraw over one rejected field is not.
+        print("[outreach-logo] input_fidelity not accepted, retrying without it")
+        fields.pop("input_fidelity", None)
+        response = send(fields)
+
     if response.status_code >= 300:
         raise RuntimeError(
             f"image model returned HTTP {response.status_code}: {response.text[:300]}"

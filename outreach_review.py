@@ -160,6 +160,53 @@ def retry(core: Any, handle: str) -> Dict[str, Any]:
     }
 
 
+def remove(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
+    """Delete an outreach store at any stage. The nuke, from the outreach page.
+
+    Decline is the reviewer's "no" and only applies to a store still waiting
+    for a decision. This is the other thing: a store that is simply wrong —
+    built from the wrong organization's logo, say — and should not exist,
+    whether it was already emailed or never left the queue.
+
+    A claimed store is refused. That one belongs to somebody now, and deleting
+    it would take a real customer's storefront out from under them.
+    """
+    state = outreach_tracking.read(core, handle)
+    if not state:
+        raise LookupError("Outreach tracking not found")
+    if not outreach_tracking.is_outreach_source(state.get("source")):
+        raise PermissionError("Not an outreach store")
+    if str(state.get("claim_status") or "unclaimed").lower() == "claimed":
+        raise PermissionError("Store has been claimed — it belongs to its admin now")
+
+    removed_at = outreach_tracking.utc_iso()
+    outreach_tracking.update(
+        core,
+        handle,
+        {
+            "status": "declined",
+            "declined_at": removed_at,
+            "reviewed_at": removed_at,
+            "review_decision": "removed",
+            "review_note": str(reason or "removed from the outreach page")[:300],
+            "email_authorized": False,
+            "followup_due_at": None,
+            "delete_due_at": None,
+            "needs_human_reply": False,
+        },
+    )
+
+    job_id = str(uuid.uuid4())
+    core._job_set(job_id, status="queued", handle=handle, created_at=time.time())
+    threading.Thread(
+        target=core._run_shopify_deprovision_job,
+        args=(job_id, handle),
+        name=f"outreach-remove-{handle}",
+        daemon=True,
+    ).start()
+    return {"ok": True, "handle": handle, "status": "declined", "job_id": job_id}
+
+
 def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
     """Delete the store and the artwork. Nobody is emailed.
 
@@ -416,6 +463,25 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
                 {"error": f"Could not send the email: {exc}"},
                 status_code=502,
             )
+
+    @app.post("/api/outreach/review/{handle}/remove")
+    async def review_remove(handle: str, request: Request):
+        denied = require_outreach_secret(core, request)
+        if denied is not None:
+            return denied
+        normalized = _handle(handle)
+        if not normalized:
+            return JSONResponse({"error": "invalid store handle"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        try:
+            return remove(core, normalized, str((body or {}).get("reason") or ""))
+        except LookupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
 
     @app.post("/api/outreach/review/{handle}/retry")
     def review_retry(handle: str, request: Request):
