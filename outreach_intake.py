@@ -14,7 +14,7 @@ import socket
 import threading
 import time
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 from urllib.parse import urljoin, urlparse
 
 import numpy as np
@@ -30,6 +30,7 @@ from outreach_assets import (
 )
 from outreach_auth import require_outreach_secret
 from outreach_direct import DEFAULT_PLACEMENT_PROFILE, _run_direct_job, _store_urls
+import outreach_logo
 import outreach_tracking
 
 
@@ -45,7 +46,6 @@ _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_HANDLES: set[str] = set()
 
 MAX_REDIRECTS = 3
-MIN_SOURCE_LOGO_WIDTH = 256
 RECOVERY_AFTER_SECONDS = 30 * 60
 QUEUE_STATES = {"intake_queued", "intake_processing"}
 
@@ -234,7 +234,9 @@ def _download_public_image(url: str, maximum_bytes: int) -> bytes:
         session.close()
 
 
-def _prepare_remote_logo(core: Any, raw: bytes) -> Image.Image:
+def _prepare_remote_logo(
+    core: Any, raw: bytes, organization: str = ""
+) -> Tuple[Image.Image, Dict[str, Any]]:
     try:
         is_svg = bool(getattr(core, "_is_svg_data", lambda _raw: False)(raw))
         image = (
@@ -263,27 +265,25 @@ def _prepare_remote_logo(core: Any, raw: bytes) -> Image.Image:
     if bbox is None:
         raise OutreachIntakeError("logo background removal left no visible artwork")
     image = image.crop(bbox)
-    if image.width < MIN_SOURCE_LOGO_WIDTH and not is_svg:
-        raise OutreachIntakeError(
-            f"logo source must be at least {MIN_SOURCE_LOGO_WIDTH}px wide before upscaling"
-        )
 
-    target_width = MIN_REVIEWED_LOGO_WIDTH
-    target_height = max(1, round(image.height * target_width / image.width))
+    # An SVG is resolution-independent, so it is already at the standard by
+    # definition and never needs the ladder.
     maximum_pixels = int(getattr(core, "MAX_IMAGE_PIXELS", 40_000_000))
-    if target_width * target_height > maximum_pixels:
-        raise OutreachIntakeError("prepared logo aspect ratio exceeds the image limit")
-    if image.size != (target_width, target_height):
-        image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    try:
+        prepared, report = outreach_logo.prepare(
+            core, image, organization=organization, is_vector=is_svg
+        )
+    except ValueError as exc:
+        raise OutreachIntakeError(str(exc)) from exc
 
-    rgba = np.asarray(image.convert("RGBA")).copy()
-    rgba[rgba[:, :, 3] == 0, :3] = 0
-    prepared = Image.fromarray(rgba, "RGBA")
+    if prepared.width * prepared.height > maximum_pixels:
+        raise OutreachIntakeError("prepared logo aspect ratio exceeds the image limit")
+
     try:
         return validate_reviewed_logo(
             prepared,
             max_pixels=maximum_pixels,
-        )
+        ), report
     except ValueError as exc:
         raise OutreachIntakeError(str(exc)) from exc
 
@@ -331,7 +331,9 @@ def _process_intake_state(core: Any, handle: str, state: Dict[str, Any]) -> None
         str(state.get("logo_source_url") or ""),
         int(getattr(core, "MAX_UPLOAD_BYTES", 12 * 1024 * 1024)),
     )
-    prepared = _prepare_remote_logo(core, raw)
+    prepared, logo_report = _prepare_remote_logo(
+        core, raw, str(state.get("storefront_name") or handle)
+    )
     session_id = save_reviewed_logo_session(core, prepared, handle)
     job_id = str(uuid.uuid4())
     outreach_tracking.update(
@@ -342,6 +344,12 @@ def _process_intake_state(core: Any, handle: str, state: Dict[str, Any]) -> None
             "job_id": job_id,
             "main_session_id": session_id,
             "build_started_at": outreach_tracking.utc_iso(),
+            # The email has to disclose a redrawn logo, and by the time it is
+            # sent the image itself is long gone from this process.
+            "logo_quality": logo_report.get("verdict"),
+            "logo_quality_reason": logo_report.get("reason"),
+            "logo_recreated": bool(logo_report.get("recreated")),
+            "logo_source_width": logo_report.get("artwork_width"),
         },
     )
     core._job_set(
