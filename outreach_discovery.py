@@ -286,7 +286,11 @@ Hard rules:
 - primary_color: one common color name from their branding (Navy, Red, Royal Blue, Forest Green, Maroon, Black, Charcoal, Purple, Orange, Gold).
 - why_it_qualifies: one sentence, including where you checked for an existing store and what you found.
 
-Quality over quantity. Returning three solid candidates is better than {limit} shaky ones. Return an empty list rather than anything you are unsure about.{focus_line}{avoid_line}"""
+Aim to return all {limit} candidates. Do not stop after the first two or three
+that look promising: continue through the focus categories until you have
+reached the target, unless every remaining organization fails one of the hard
+rules. Never fill the list by guessing a contact, logo, or store status.
+{focus_line}{avoid_line}"""
 
 
 def configured() -> bool:
