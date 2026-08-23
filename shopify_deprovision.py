@@ -408,17 +408,34 @@ def delete_files(file_gids: List[str]) -> None:
 # -----------------------------
 # Main deprovision flow
 # -----------------------------
-def deprovision(handle: str, log: List[str]) -> None:
+class DeprovisionIncomplete(RuntimeError):
+    """Some part of the nuke did not happen. The store is still partly there."""
+
+
+def deprovision(handle: str, log: List[str]) -> List[str]:
     """
     Nuke a store — make it look like it never existed.
+
+    Every step is individually non-fatal so one failure cannot strand the
+    rest, but the failures are collected and returned. A caller that treats
+    "it ran" as "it worked" would record a store as deleted while it is still
+    live — and nothing would ever revisit it, because the record says gone.
 
     Args:
         handle: The store handle (e.g. "my-store")
         log:    A mutable list to append log messages to (also printed to stdout)
+
+    Returns:
+        The list of failures. Empty means the store is really gone.
     """
+    failures: List[str] = []
+
     def _log(msg: str) -> None:
         log.append(msg)
         print(msg)
+
+    def _failed(step: str, detail: Any) -> None:
+        failures.append(f"{step}: {detail}")
 
     _log(f"💣 Starting deprovision for handle: {handle!r}")
 
@@ -468,10 +485,12 @@ def deprovision(handle: str, log: List[str]) -> None:
                     _log(f"   ✅ Product deleted: {pid}")
                 except Exception as e:
                     _log(f"   ⚠️  Failed to delete product {pid}: {e}")
+                    _failed("product", f"{pid} {e}")
             else:
                 _log(f"   ℹ️  Product {pid} does not have tag {handle!r} — skipping (safety)")
     except Exception as e:
         _log(f"⚠️  Step 3 error (non-fatal): {e}")
+        _failed("products", e)
 
     # ------------------------------------------------------------------
     # Step 4: Delete the collection
@@ -483,6 +502,7 @@ def deprovision(handle: str, log: List[str]) -> None:
             _log(f"✅ Collection deleted: {collection_gid}")
         except Exception as e:
             _log(f"⚠️  Step 4 error (non-fatal): {e}")
+            _failed("collection", e)
     else:
         _log("ℹ️  Step 4: No collection_gid — skipping collection deletion")
 
@@ -503,6 +523,7 @@ def deprovision(handle: str, log: List[str]) -> None:
                 tagged_customers[c["id"]] = c
         except Exception as e:
             _log(f"⚠️  Step 5 tag search error ({search_tag!r}): {e}")
+            _failed("customer-tag-search", f"{search_tag} {e}")
 
     _log(f"   Total unique customers to untag: {len(tagged_customers)}")
     for cid, cust in tagged_customers.items():
@@ -511,6 +532,7 @@ def deprovision(handle: str, log: List[str]) -> None:
             _log(f"   ✅ Untagged customer {cid}")
         except Exception as e:
             _log(f"⚠️  Step 5 untag error for {cid}: {e}")
+            _failed("customer-untag", f"{cid} {e}")
 
     # ------------------------------------------------------------------
     # Step 6: Delete the metaobject
@@ -522,6 +544,7 @@ def deprovision(handle: str, log: List[str]) -> None:
             _log(f"✅ Metaobject deleted: {metaobject_id}")
         except Exception as e:
             _log(f"⚠️  Step 6 error (non-fatal): {e}")
+            _failed("metaobject", e)
     else:
         _log("ℹ️  Step 6: No metaobject_id — skipping")
 
@@ -536,10 +559,17 @@ def deprovision(handle: str, log: List[str]) -> None:
             _log(f"✅ Logo files deleted")
         except Exception as e:
             _log(f"⚠️  Step 7 error (non-fatal): {e}")
+            _failed("logo-files", e)
     else:
         _log("ℹ️  Step 7: No logo files to delete")
 
-    _log(f"🎉 Deprovision complete for handle: {handle!r}")
+    if failures:
+        _log(f"❌ Deprovision INCOMPLETE for {handle!r} — {len(failures)} step(s) failed:")
+        for failure in failures:
+            _log(f"   • {failure}")
+    else:
+        _log(f"🎉 Deprovision complete for handle: {handle!r}")
+    return failures
 
 
 # -----------------------------
@@ -555,11 +585,17 @@ def main() -> None:
         raise SystemExit("--handle is required and cannot be empty")
 
     log: List[str] = []
-    deprovision(handle, log)
+    failures = deprovision(handle, log)
 
     print("\n========== DEPROVISION LOG ==========")
     for line in log:
         print(line)
+
+    # The caller decides what a store is by our exit code. Reporting success
+    # after a partial nuke is how a live store gets recorded as deleted and
+    # never looked at again.
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

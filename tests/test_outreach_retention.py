@@ -8,15 +8,24 @@ import outreach_retention
 
 
 class FakeCore:
-    def __init__(self):
+    """Mirrors app._run_shopify_deprovision_job, which reports through the job
+    record rather than by raising."""
+
+    def __init__(self, outcome="done", error=""):
         self.jobs = {}
         self.deprovisioned = []
+        self.outcome = outcome
+        self.error = error
 
     def _job_set(self, job_id, **fields):
         self.jobs.setdefault(job_id, {}).update(fields)
 
+    def _job_get(self, job_id):
+        return self.jobs.get(job_id, {})
+
     def _run_shopify_deprovision_job(self, job_id, handle):
         self.deprovisioned.append(handle)
+        self._job_set(job_id, status=self.outcome, error=self.error)
 
 
 def _iso(days):
@@ -154,3 +163,68 @@ def test_it_stays_switched_off_until_it_is_switched_on(monkeypatch):
     assert outreach_retention.enabled() is False
     monkeypatch.setenv("OUTREACH_RETENTION_ENABLED", "true")
     assert outreach_retention.enabled() is True
+
+
+# ---- a deletion that did not happen must not be recorded as one ------------
+
+
+def test_a_failed_nuke_leaves_the_record_alone(monkeypatch):
+    """The deprovisioner treats every step as non-fatal, so a nuke where
+    nothing succeeded still finishes. Recording that as deleted would leave a
+    live store that nothing ever revisits — discovery avoids the domain
+    because the record says it is gone."""
+    stores = {"stubborn": _store("stubborn")}
+    monkeypatch.setattr(outreach_retention.outreach_tracking, "list_all", lambda _c: dict(stores))
+
+    def update(_core, handle, patch):
+        stores[handle] = {**stores.get(handle, {}), **patch}
+        return dict(stores[handle])
+
+    monkeypatch.setattr(outreach_retention.outreach_tracking, "update", update)
+    core = FakeCore(outcome="error", error="Deprovision failed (exit 1)")
+
+    result = outreach_retention.process_due(core)
+
+    assert result["deleted"] == []
+    assert stores["stubborn"]["status"] == "outreach_sent"
+    assert stores["stubborn"]["delete_due_at"] is not None
+
+
+def test_the_next_pass_tries_a_failed_deletion_again(monkeypatch):
+    """Deleting is idempotent, so leaving the row untouched is what makes the
+    retry safe."""
+    stores = {"stubborn": _store("stubborn")}
+    monkeypatch.setattr(outreach_retention.outreach_tracking, "list_all", lambda _c: dict(stores))
+    monkeypatch.setattr(
+        outreach_retention.outreach_tracking, "update",
+        lambda _c, h, patch: stores.__setitem__(h, {**stores[h], **patch}) or dict(stores[h]),
+    )
+
+    failing = FakeCore(outcome="error")
+    outreach_retention.process_due(failing)
+    assert failing.deprovisioned == ["stubborn"]
+
+    succeeding = FakeCore(outcome="done")
+    result = outreach_retention.process_due(succeeding)
+    assert result["deleted"] == ["stubborn"]
+    assert stores["stubborn"]["status"] == "declined"
+
+
+def test_the_store_is_gone_before_the_record_says_so(monkeypatch):
+    """Order matters: marking first is what allowed the record to outrun
+    reality."""
+    stores = {"quiet": _store("quiet")}
+    order = []
+    monkeypatch.setattr(outreach_retention.outreach_tracking, "list_all", lambda _c: dict(stores))
+    monkeypatch.setattr(
+        outreach_retention.outreach_tracking, "update",
+        lambda _c, h, patch: (order.append("recorded"), stores.__setitem__(h, {**stores[h], **patch}))[1],
+    )
+
+    class Ordered(FakeCore):
+        def _run_shopify_deprovision_job(self, job_id, handle):
+            order.append("deleted")
+            super()._run_shopify_deprovision_job(job_id, handle)
+
+    outreach_retention.process_due(Ordered())
+    assert order == ["deleted", "recorded"]

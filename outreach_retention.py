@@ -111,6 +111,41 @@ def due_now(core: Any) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def _delete(core: Any, handle: str, engagement_seen: List[str]) -> bool:
+    """Delete the store, then record it — in that order, and only if it worked.
+
+    Marking the ledger first and firing the job into a thread was the original
+    shape, and it can lie: the deprovisioner treats every step as non-fatal, so
+    a nuke where nothing succeeded still finishes. The row would say declined,
+    the store would still be live, and discovery would avoid that domain
+    forever because the record says it is gone.
+
+    Run in the foreground instead — this is already a background worker with
+    nowhere to be — and let a failure leave the row untouched so the next pass
+    tries again. Deleting is idempotent, so a retry is safe.
+    """
+    job_id = str(uuid.uuid4())
+    try:
+        core._job_set(job_id, status="queued", handle=handle, created_at=time.time())
+        core._run_shopify_deprovision_job(job_id, handle)
+    except Exception as exc:
+        print(f"[outreach-retention] deprovision raised for {handle}: {exc}")
+        return False
+
+    job = {}
+    try:
+        job = core._job_get(job_id) or {}
+    except Exception as exc:
+        print(f"[outreach-retention] could not read the deprovision job for {handle}: {exc}")
+        return False
+
+    status = str(job.get("status") or "").lower()
+    if status not in {"done", "succeeded"}:
+        print(
+            f"[outreach-retention] {handle} not deleted ({status or 'unknown'}): "
+            f"{str(job.get('error') or '')[:200]} — leaving the record alone to retry"
+        )
+        return False
+
     try:
         outreach_tracking.update(core, handle, {
             "status": "declined",
@@ -121,18 +156,12 @@ def _delete(core: Any, handle: str, engagement_seen: List[str]) -> bool:
             "followup_due_at": None,
             "delete_due_at": None,
         })
-        job_id = str(uuid.uuid4())
-        core._job_set(job_id, status="queued", handle=handle, created_at=time.time())
-        threading.Thread(
-            target=core._run_shopify_deprovision_job,
-            args=(job_id, handle),
-            name=f"outreach-expire-{handle}",
-            daemon=True,
-        ).start()
-        return True
     except Exception as exc:
-        print(f"[outreach-retention] could not delete {handle}: {exc}")
-        return False
+        # The store is gone; only the bookkeeping failed. Say so loudly — the
+        # next pass will find no store and can settle the record then.
+        print(f"[outreach-retention] {handle} deleted but the record was not updated: {exc}")
+        return True
+    return True
 
 
 def process_due(core: Any, *, dry_run: bool = False) -> Dict[str, Any]:
