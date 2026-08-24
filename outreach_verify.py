@@ -27,6 +27,7 @@ _TIMEOUT = (5, 12)
 _MAX_HTML = 400_000
 _UA = "Stella-Sage-Outreach-Verify/1.0"
 _MAX_LOGO_CANDIDATES = 24
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I)
 
 # Words that carry no identifying weight, so matching on them would let any
 # page pass for any organization.
@@ -65,6 +66,89 @@ def _html_attributes(tag: str) -> Dict[str, str]:
             (part for part in match.groups()[1:] if part is not None), ""
         )
     return values
+
+
+def _emails_from_html(html: str) -> List[str]:
+    """Emails visibly published in a page's markup, in document order."""
+    # Script/json payloads frequently contain tracking addresses and are not
+    # something a visitor can reasonably be said to have been shown.
+    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    seen = set()
+    values: List[str] = []
+    for match in _EMAIL_RE.finditer(text):
+        email = match.group(0).strip().lower().rstrip(".,;:)")
+        if email not in seen:
+            seen.add(email)
+            values.append(email)
+    return values
+
+
+def _contact_page_links(html: str, page_url: str) -> List[str]:
+    """A small bounded list of likely first-party contact pages."""
+    values: List[str] = []
+    seen = set()
+    for tag in re.findall(r"<a\b[^>]*>.*?</a>", html, flags=re.S | re.I):
+        attrs = _html_attributes(tag)
+        raw = attrs.get("href", "")
+        label = re.sub(r"<[^>]+>", " ", tag).lower()
+        marker = (raw + " " + label).lower()
+        if not raw or not any(word in marker for word in ("contact", "about", "staff", "team")):
+            continue
+        absolute = urljoin(page_url, raw)
+        if not absolute.lower().startswith("https://") or absolute in seen:
+            continue
+        seen.add(absolute)
+        values.append(absolute)
+        if len(values) >= 3:
+            break
+    return values
+
+
+def _read_html_page(url: str) -> Tuple[str, str, str]:
+    """Fetch one public page for lightweight evidence extraction."""
+    try:
+        response = requests.get(
+            url,
+            timeout=_TIMEOUT,
+            headers={"User-Agent": _UA},
+            allow_redirects=True,
+            stream=True,
+        )
+    except Exception as exc:
+        return "", url, f"could not be read ({type(exc).__name__})"
+    try:
+        if response.status_code >= 400:
+            return "", str(response.url or url), f"returned HTTP {response.status_code}"
+        html = response.raw.read(_MAX_HTML, decode_content=True).decode(
+            response.encoding or "utf-8", errors="replace"
+        )
+        return html, str(response.url or url), ""
+    except Exception:
+        return "", str(response.url or url), "could not be read"
+    finally:
+        response.close()
+
+
+def published_contact_emails(organization_url: str) -> Tuple[List[Tuple[str, str]], str]:
+    """Find a real, visible contact email on the official site.
+
+    The candidate model is excellent at finding an organization but not a
+    reliable source of record for its email. This keeps it from guessing while
+    rescuing a prospect whose published address lives on `/contact` instead of
+    the home page.
+    """
+    html, page_url, issue = _read_html_page(organization_url)
+    if not html:
+        return [], f"organization page {issue}".strip()
+    found = [(email, page_url) for email in _emails_from_html(html)]
+    if found:
+        return found, ""
+    for contact_url in _contact_page_links(html, page_url):
+        contact_html, resolved_url, _contact_issue = _read_html_page(contact_url)
+        emails = _emails_from_html(contact_html) if contact_html else []
+        if emails:
+            return [(email, resolved_url) for email in emails], ""
+    return [], "no usable contact email published on the official site"
 
 
 def _logo_candidates_from_html(html: str, page_url: str) -> List[str]:

@@ -62,6 +62,11 @@ def wired(monkeypatch):
         "logo_sources_on_organization_site",
         lambda _url: ([], "organization page did not expose a usable logo image"),
     )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "published_contact_emails",
+        lambda _url: ([("info@westside.org", "https://westside.org/contact")], ""),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     return FakeCore(), ledger, submitted
 
@@ -105,16 +110,40 @@ def test_the_models_work_is_rechecked_before_anything_is_created(wired, monkeypa
     core, _ledger, submitted = wired
     _answer(monkeypatch, [
         _candidate("st. mary's"),                                  # unusable handle
-        _candidate("no-email", contact_email="see contact form"),  # not an address
+        _candidate("no-email", contact_email="see contact form", organization_url="https://no-email.org/"),
         _candidate("http-logo", logo_source_url="http://x.org/a.png"),  # not https
         _candidate("good-club"),
     ])
 
+    original = outreach_discovery.outreach_verify.published_contact_emails
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "published_contact_emails",
+        lambda url: ([], "no usable contact email") if "no-email.org" in url else original(url),
+    )
     run = outreach_discovery.run_discovery(core, limit=10)
 
     assert [row["handle"] for row in run["candidates"]] == ["good-club"]
     assert len(run["rejected"]) == 3
     assert len(submitted) == 1
+
+
+def test_a_published_email_repairs_a_missing_model_email(wired, monkeypatch):
+    """A prospect should not be lost merely because the model found the right
+    site but omitted the email that is visibly published on it."""
+    core, _ledger, submitted = wired
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "published_contact_emails",
+        lambda _url: ([("hello@westside.org", "https://westside.org/contact")], ""),
+    )
+    _answer(monkeypatch, [_candidate("site-email", contact_email="")])
+
+    run = outreach_discovery.run_discovery(core, limit=1)
+
+    assert run["accepted"] == 1
+    assert submitted[0]["contact_email"] == "hello@westside.org"
+    assert submitted[0]["contact_source_url"] == "https://westside.org/contact"
 
 
 def test_a_store_we_already_know_is_never_offered_twice(wired, monkeypatch):

@@ -156,20 +156,16 @@ MAX_RESEARCH_CANDIDATES = 12
 # Each run is pointed at a slice of this list instead, so variety comes from
 # the schedule rather than from hoping.
 CATEGORY_ROTATION = [
-    "youth sports clubs — baseball, softball, soccer, basketball, lacrosse",
-    "rowing, crew, sailing, canoe and kayak clubs",
-    "swim and dive teams and masters swim clubs",
-    "wrestling, martial arts, judo and boxing clubs",
-    "volunteer fire departments, EMS and search-and-rescue squads",
-    "school booster clubs, PTOs and band parent associations",
-    "church youth groups, summer camps and scout troops",
-    "dog rescues, animal shelters and equine rescues",
-    "community theater, choir, orchestra and marching band groups",
-    "veteran organizations, VFW and American Legion posts",
-    "cycling, running, trail and triathlon clubs",
-    "robotics teams, esports clubs and academic competition teams",
-    "disc golf, archery, fencing, climbing and orienteering clubs",
-    "food banks, community gardens and volunteer trail crews",
+    "independent youth soccer, baseball, softball, basketball and lacrosse clubs",
+    "rowing, crew, sailing, canoe, kayak and dragon-boat clubs",
+    "independent swim, dive, water-polo and masters swim clubs",
+    "martial arts, judo, wrestling, boxing and fencing clubs",
+    "archery, disc-golf, climbing and orienteering clubs",
+    "local cycling, running, trail-running and triathlon clubs",
+    "dance studios, competitive cheer clubs and gymnastics clubs",
+    "small volunteer fire departments, EMS and search-and-rescue squads",
+    "small animal, dog and equine rescues with local volunteers",
+    "community theater groups, local choirs and small orchestras",
 ]
 _CATEGORIES_PER_RUN = 3
 _RECENT_CATEGORY_RUNS = 3
@@ -264,7 +260,7 @@ def _brief(
     return f"""Find up to {limit} organizations that would plausibly want team apparel and do not currently sell it online.
 
 Who qualifies:
-- Small or mid-size organizations: youth sports clubs, school teams, booster clubs, rowing/swim/wrestling clubs, volunteer fire departments, church youth groups, small nonprofits, community theater groups, dog rescues, veteran organizations.
+- A small, independent local group with its own identity and roughly 20–500 members: youth sports clubs, rowing/sailing/paddling clubs, swim teams, martial arts/fencing/archery clubs, dance/gymnastics clubs, local run/cycle clubs, volunteer rescue groups, small animal rescues, or community arts groups.
 - They have a public website with a visible logo.
 - They have a contact email address published on their own website.
 - They do NOT already sell apparel online. Check for a Store, Shop, Merch, Spirit Wear or Gear page. If they have one, skip them.
@@ -272,7 +268,8 @@ Who qualifies:
 
 Skip immediately:
 - Anything with an existing online store, even a bad one.
-- Large national brands, franchises, universities, pro teams.
+- Schools, school districts, PTOs, booster clubs tied to a school, churches, Scout troops, military posts, municipal/county departments, universities, large nonprofits, franchises, national brands and pro teams.
+- Organizations that are a program inside a larger institution rather than an independent local group with its own identity.
 - Anyone whose only contact is a web form with no email address.
 - Anyone whose logo you cannot find as a direct image file on their own site.
 - Anyone you are not confident is a real, currently active organization.
@@ -554,16 +551,27 @@ def _clean(
     if handle in known:
         return None, "already known"
 
-    email = str(candidate.get("contact_email") or "").strip()
-    if "@" not in email or " " in email:
-        return None, "no usable contact email"
-
     urls = {}
     for field in ("organization_url", "contact_source_url", "logo_source_url"):
         value = str(candidate.get(field) or "").strip()
         if not value.lower().startswith("https://"):
             return None, f"{field} is not a public https URL"
         urls[field] = value
+
+    # An address is only usable if we can see it on the organization's own
+    # site. Prefer the model's address when it matches that evidence; otherwise
+    # use the first published address and retain the real page as its source.
+    published_emails, email_problem = outreach_verify.published_contact_emails(
+        urls["organization_url"]
+    )
+    if not published_emails:
+        return None, email_problem or "no usable contact email"
+    proposed_email = str(candidate.get("contact_email") or "").strip().lower()
+    email, contact_source = next(
+        ((address, source) for address, source in published_emails if address == proposed_email),
+        published_emails[0],
+    )
+    urls["contact_source_url"] = contact_source
 
     # Same organization, different handle. The website is the stable identity;
     # the name it gets called is not.

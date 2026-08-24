@@ -129,6 +129,28 @@ def test_relative_and_lazy_header_logo_urls_are_found():
     assert urls == ["https://club.org/images/logo.png"]
 
 
+# ---- finding a published contact email ------------------------------------
+
+
+def test_homepage_email_is_used_as_public_contact_evidence(site):
+    site["https://club.org/"] = '<a href="mailto:team@club.org">Email us</a>'
+
+    addresses, why = outreach_verify.published_contact_emails("https://club.org/")
+
+    assert why == ""
+    assert addresses == [("team@club.org", "https://club.org/")]
+
+
+def test_contact_page_email_is_found_when_homepage_has_none(site):
+    site["https://club.org/"] = '<a href="/contact">Contact the club</a>'
+    site["https://club.org/contact"] = '<p>Info@club.org</p>'
+
+    addresses, why = outreach_verify.published_contact_emails("https://club.org/")
+
+    assert why == ""
+    assert addresses == [("info@club.org", "https://club.org/contact")]
+
+
 # ---- can the address receive mail? ----------------------------------------
 
 
