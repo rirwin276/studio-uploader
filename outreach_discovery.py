@@ -426,6 +426,17 @@ def _timeouts() -> Tuple[float, float]:
     )
 
 
+def _max_output_tokens() -> int:
+    """Keep structured candidate responses large enough without an unlimited bill."""
+    try:
+        value = int(os.getenv(
+            "OUTREACH_DISCOVERY_MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS)
+        ))
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_OUTPUT_TOKENS
+    return max(1024, min(MAX_OUTPUT_TOKENS, value))
+
+
 def _ledger(core: Any) -> Dict[str, Dict[str, Any]]:
     try:
         rows = outreach_tracking.list_all(core)
@@ -537,6 +548,11 @@ _MAX_ATTEMPTS = 2
 _MAX_RETRY_WAIT = 30.0
 _CONNECT_TIMEOUT_SECONDS = 15
 _READ_TIMEOUT_SECONDS = 120
+# Discovery asks for detailed, source-backed candidates. Leaving the Responses
+# API at its small implicit output ceiling can cut a valid JSON-schema response
+# in half. This is only a ceiling: the model is charged for emitted tokens.
+DEFAULT_MAX_OUTPUT_TOKENS = 6000
+MAX_OUTPUT_TOKENS = 12000
 
 
 def _retry_after(response: Any, attempt: int) -> float:
@@ -558,6 +574,50 @@ def _retry_after(response: Any, attempt: int) -> float:
     return min(_MAX_RETRY_WAIT, 5.0 * (2 ** attempt))
 
 
+def _retry_smaller_candidate_batch(
+    *,
+    reason: str,
+    limit: int,
+    avoid: List[str],
+    focus: List[str] | None,
+    avoid_domains: List[str] | None,
+    avoid_categories: List[str] | None,
+    reviewer_feedback: List[str] | None,
+    model: str,
+    already_retried: bool,
+    initial_attempts: int,
+    initial_usage: Dict[str, Any] | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Retry one cut-off structured response with fewer requested results."""
+    if already_retried or limit <= 1:
+        raise RuntimeError(
+            "OpenAI returned incomplete candidate JSON after the recovery attempt: "
+            f"{reason[:240]}"
+        )
+    retry_limit = max(1, (int(limit) + 1) // 2)
+    candidates, telemetry = _ask_for_candidates(
+        retry_limit,
+        avoid,
+        focus=focus,
+        avoid_domains=avoid_domains,
+        avoid_categories=avoid_categories,
+        reviewer_feedback=reviewer_feedback,
+        model=model,
+        _output_recovery=True,
+    )
+    telemetry = dict(telemetry)
+    telemetry["attempts"] = int(telemetry.get("attempts") or 0) + initial_attempts
+    telemetry["output_recovery"] = reason[:240]
+    telemetry["initial_research_limit"] = int(limit)
+    usage = initial_usage or {}
+    for key in ("input_tokens", "output_tokens"):
+        before = usage.get(key)
+        after = telemetry.get(key)
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            telemetry[key] = int(before) + int(after)
+    return candidates, telemetry
+
+
 def _ask_for_candidates(
     limit: int,
     avoid: List[str],
@@ -567,6 +627,7 @@ def _ask_for_candidates(
     avoid_categories: List[str] | None = None,
     reviewer_feedback: List[str] | None = None,
     model: str = "",
+    _output_recovery: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """One call out to the model. Returns (candidates, telemetry)."""
     key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -588,6 +649,7 @@ def _ask_for_candidates(
             reviewer_feedback=reviewer_feedback,
         ),
         "tools": [{"type": tool}],
+        "max_output_tokens": _max_output_tokens(),
         "text": {
             "format": {
                 "type": "json_schema",
@@ -633,7 +695,29 @@ def _ask_for_candidates(
         raise RuntimeError(
             f"OpenAI did not return a response: {last_request_error or 'unknown request failure'}"
         )
-    body = response.json()
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError("OpenAI returned invalid API JSON") from exc
+    if not isinstance(body, dict):
+        raise RuntimeError("OpenAI returned an unexpected API response shape")
+    usage = body.get("usage") or {}
+    if str(body.get("status") or "").lower() == "incomplete":
+        details = body.get("incomplete_details") or {}
+        reason = str(details.get("reason") or "response ended before completion")
+        return _retry_smaller_candidate_batch(
+            reason=reason,
+            limit=limit,
+            avoid=avoid,
+            focus=focus,
+            avoid_domains=avoid_domains,
+            avoid_categories=avoid_categories,
+            reviewer_feedback=reviewer_feedback,
+            model=model,
+            already_retried=_output_recovery,
+            initial_attempts=attempts,
+            initial_usage=usage,
+        )
 
     text = ""
     for item in body.get("output") or []:
@@ -645,12 +729,26 @@ def _ask_for_candidates(
     if not text.strip():
         raise RuntimeError("The model returned no candidate text")
 
-    parsed = json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return _retry_smaller_candidate_batch(
+            reason=f"malformed output at character {exc.pos}: {exc.msg}",
+            limit=limit,
+            avoid=avoid,
+            focus=focus,
+            avoid_domains=avoid_domains,
+            avoid_categories=avoid_categories,
+            reviewer_feedback=reviewer_feedback,
+            model=model,
+            already_retried=_output_recovery,
+            initial_attempts=attempts,
+            initial_usage=usage,
+        )
     candidates = parsed.get("candidates")
     if not isinstance(candidates, list):
         raise RuntimeError("The model did not return a candidate list")
 
-    usage = body.get("usage") or {}
     telemetry = {
         "attempts": attempts,
         "focus": list(focus or []),
@@ -658,6 +756,7 @@ def _ask_for_candidates(
         "search_tool": tool,
         "connect_timeout_seconds": connect_timeout,
         "read_timeout_seconds": read_timeout,
+        "max_output_tokens": payload["max_output_tokens"],
         "seconds": round(time.time() - started, 1),
         "input_tokens": usage.get("input_tokens"),
         "output_tokens": usage.get("output_tokens"),
