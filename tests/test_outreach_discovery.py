@@ -514,6 +514,61 @@ def test_a_temporary_openai_read_timeout_retries(monkeypatch):
     assert telemetry["attempts"] == 2
 
 
+def test_an_incomplete_structured_response_retries_with_a_smaller_batch(monkeypatch):
+    """A cut-off candidate list should refill later, not kill the whole run."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    requests_seen = []
+    incomplete = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "usage": {"input_tokens": 10, "output_tokens": 100},
+    }
+
+    def post(*_args, **kwargs):
+        requests_seen.append(kwargs["json"])
+        if len(requests_seen) == 1:
+            return FakeResponse(200, payload=incomplete)
+        return FakeResponse(200, payload=_OK_BODY)
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+
+    candidates, telemetry = outreach_discovery._ask_for_candidates(10, [])
+
+    assert candidates == []
+    assert len(requests_seen) == 2
+    assert "Find 10 fully qualified" in requests_seen[0]["input"]
+    assert "Find 5 fully qualified" in requests_seen[1]["input"]
+    assert all(
+        payload["max_output_tokens"] == outreach_discovery.DEFAULT_MAX_OUTPUT_TOKENS
+        for payload in requests_seen
+    )
+    assert telemetry["output_recovery"] == "max_output_tokens"
+    assert telemetry["initial_research_limit"] == 10
+
+
+def test_malformed_candidate_json_retries_with_a_smaller_batch(monkeypatch):
+    """Some provider responses are cut off without an incomplete status."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls = []
+    malformed = {
+        "output": [{"content": [{"type": "output_text", "text": '{"candidates": ['}]}],
+        "usage": {"input_tokens": 10, "output_tokens": 100},
+    }
+
+    def post(*_args, **_kwargs):
+        calls.append(1)
+        return FakeResponse(200, payload=malformed if len(calls) == 1 else _OK_BODY)
+
+    monkeypatch.setattr(outreach_discovery.requests, "post", post)
+
+    candidates, telemetry = outreach_discovery._ask_for_candidates(6, [])
+
+    assert candidates == []
+    assert len(calls) == 2
+    assert telemetry["initial_research_limit"] == 6
+    assert "malformed output" in telemetry["output_recovery"]
+
+
 def test_a_bad_model_fails_immediately_without_retrying(monkeypatch):
     """A rename does not fix itself. Retrying it just spends the wait twice and
     delays the message that says what to change."""
