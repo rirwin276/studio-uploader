@@ -152,7 +152,7 @@ MAX_LIMIT = 10
 # Returning exactly five candidates to fill five slots made one normal miss
 # look like the model "couldn't find anyone".
 MAX_RESEARCH_CANDIDATES = 12
-DEFAULT_MAX_SEARCH_ROUNDS = 6
+DEFAULT_MAX_SEARCH_ROUNDS = 10
 MAX_SEARCH_ROUNDS = 10
 
 # Left to its own devices the model finds one easy vein and stays in it — two
@@ -1006,26 +1006,13 @@ def run_discovery(
                         (candidate or {}).get("why_it_qualifies") or ""
                     )[:300],
                 }
-                if dry_run:
-                    row["queued"] = False
-                    # Kept so the candidates just read on screen can be built as
-                    # they are. Searching again to build them would cost another
-                    # search and could return a different set.
-                    row["payload"] = payload
-                else:
-                    ok, status = _submit(core, payload)
-                    if not ok:
-                        rejected.append({
-                            "handle": payload["storefront_handle"],
-                            "reason": f"intake submission failed: {status}",
-                        })
-                        known.add(payload["storefront_handle"])
-                        host = _domain(payload["organization_url"])
-                        if host:
-                            known_domains.add(host)
-                        continue
-                    row["queued"] = True
-                    row["status"] = status
+                row["queued"] = False
+                # Hold every qualified payload until the entire requested batch
+                # has passed. This prevents a five-store request from creating
+                # only the one or two easy candidates when the remaining slots
+                # cannot be filled. Dry runs keep the same payloads so the exact
+                # prospects reviewed on screen can be built later.
+                row["payload"] = payload
 
                 accepted.append(row)
                 used_categories.add(payload["category"])
@@ -1046,6 +1033,27 @@ def run_discovery(
             })
             if len(accepted) >= requested:
                 break
+
+        qualification_complete = len(accepted) == requested
+        if qualification_complete and not dry_run:
+            queued_rows: List[Dict[str, Any]] = []
+            for row in accepted:
+                payload = dict(row.get("payload") or {})
+                ok, status = _submit(core, payload)
+                row.pop("payload", None)
+                if not ok:
+                    rejected.append({
+                        "handle": row["handle"],
+                        "reason": f"intake submission failed: {status}",
+                    })
+                    continue
+                row["queued"] = True
+                row["status"] = status
+                queued_rows.append(row)
+            accepted = queued_rows
+        elif not dry_run:
+            for row in accepted:
+                row["status"] = "held_incomplete_batch"
 
         input_tokens = sum(int(item.get("input_tokens") or 0) for item in rounds)
         output_tokens = sum(int(item.get("output_tokens") or 0) for item in rounds)

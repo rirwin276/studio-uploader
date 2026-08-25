@@ -114,7 +114,7 @@ def test_a_real_run_queues_each_candidate(wired, monkeypatch):
     core, _ledger, submitted = wired
     _answer(monkeypatch, [_candidate()])
 
-    run = outreach_discovery.run_discovery(core, limit=3)
+    run = outreach_discovery.run_discovery(core, limit=1)
 
     assert run["queued"] == 1
     assert len(submitted) == 1
@@ -145,7 +145,9 @@ def test_the_models_work_is_rechecked_before_anything_is_created(wired, monkeypa
 
     assert [row["handle"] for row in run["candidates"]] == ["good-club"]
     assert len(run["rejected"]) == 3
-    assert len(submitted) == 1
+    assert submitted == []
+    assert run["complete"] is False
+    assert run["candidates"][0]["status"] == "held_incomplete_batch"
 
 
 def test_a_published_email_repairs_a_missing_model_email(wired, monkeypatch):
@@ -185,7 +187,21 @@ def test_duplicates_inside_one_batch_are_caught(wired, monkeypatch):
     run = outreach_discovery.run_discovery(core, limit=5)
 
     assert run["accepted"] == 1
-    assert len(submitted) == 1
+    assert submitted == []
+
+
+def test_an_incomplete_real_batch_builds_nothing(wired, monkeypatch):
+    """A five-store request must never quietly create a partial batch."""
+    core, _ledger, submitted = wired
+    _answer(monkeypatch, [_candidate()])
+
+    run = outreach_discovery.run_discovery(core, limit=5)
+
+    assert run["complete"] is False
+    assert run["accepted"] == 1
+    assert run["queued"] == 0
+    assert run["shortfall"] == 4
+    assert submitted == []
 
 
 def test_discovery_asks_for_a_small_reserve_and_uses_it_after_rejections(wired, monkeypatch):
