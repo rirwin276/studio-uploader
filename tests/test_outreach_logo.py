@@ -157,6 +157,17 @@ def test_a_tiny_logo_comes_back_at_print_quality(drawn):
     assert report["recreated"] is True
 
 
+def test_cold_outreach_never_redraws_somebody_elses_tiny_logo(drawn):
+    with pytest.raises(ValueError, match="never AI-redrawn"):
+        outreach_logo.prepare(
+            FakeCore(),
+            _logo(90),
+            organization="Oranco Bowmen",
+            allow_recreation=False,
+        )
+    assert drawn == []
+
+
 def test_their_own_artwork_is_what_gets_redrawn(drawn):
     """Asking a model to invent "a logo for an archery club" produces a logo
     for an archery club, which is precisely the wrong thing. The original goes

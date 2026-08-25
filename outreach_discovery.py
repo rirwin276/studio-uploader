@@ -84,13 +84,15 @@ def _run_snapshot() -> Dict[str, Any]:
     with _RUN_STATE_LOCK:
         started = _RUN_STARTED_AT
         age = max(0.0, now - started) if started is not None else 0.0
+        stale_age = max(0.0, now - (_RUN_UPDATED_AT or started or now))
         return {
             "running": started is not None,
             "age_seconds": round(age, 1) if started is not None else None,
             "phase": _RUN_PHASE or None,
             "updated_at_epoch": _RUN_UPDATED_AT,
             "stale_after_seconds": _STALE_RUN_SECONDS,
-            "can_clear": started is not None and age >= _STALE_RUN_SECONDS,
+            "stale_for_seconds": round(stale_age, 1) if started is not None else None,
+            "can_clear": started is not None and stale_age >= _STALE_RUN_SECONDS,
         }
 
 
@@ -102,11 +104,12 @@ def _begin_run() -> Tuple[bool, float]:
         started = _RUN_STARTED_AT
         if started is not None:
             age = now - started
-            if age < _STALE_RUN_SECONDS:
+            stale_age = now - (_RUN_UPDATED_AT or started)
+            if stale_age < _STALE_RUN_SECONDS:
                 return False, age
             print(
-                f"[outreach-discovery] taking over from a run started {age / 60:.0f} "
-                "minutes ago — treating it as dead"
+                f"[outreach-discovery] taking over from a run with no progress for "
+                f"{stale_age / 60:.0f} minutes — treating it as dead"
             )
         _RUN_STARTED_AT = now
         _RUN_TOKEN = uuid.uuid4().hex
@@ -149,25 +152,49 @@ MAX_LIMIT = 10
 # Returning exactly five candidates to fill five slots made one normal miss
 # look like the model "couldn't find anyone".
 MAX_RESEARCH_CANDIDATES = 12
+DEFAULT_MAX_SEARCH_ROUNDS = 6
+MAX_SEARCH_ROUNDS = 10
 
 # Left to its own devices the model finds one easy vein and stays in it — two
 # runs in a row of nothing but volunteer fire departments. The brief listing
 # every category is not enough, because listing is not the same as steering.
 # Each run is pointed at a slice of this list instead, so variety comes from
 # the schedule rather than from hoping.
-CATEGORY_ROTATION = [
-    "independent youth soccer, baseball, softball, basketball and lacrosse clubs",
-    "rowing, crew, sailing, canoe, kayak and dragon-boat clubs",
-    "independent swim, dive, water-polo and masters swim clubs",
-    "martial arts, judo, wrestling, boxing and fencing clubs",
-    "archery, disc-golf, climbing and orienteering clubs",
-    "local cycling, running, trail-running and triathlon clubs",
-    "dance studios, competitive cheer clubs and gymnastics clubs",
-    "small volunteer fire departments, EMS and search-and-rescue squads",
-    "small animal, dog and equine rescues with local volunteers",
-    "community theater groups, local choirs and small orchestras",
-]
-_CATEGORIES_PER_RUN = 3
+CATEGORY_DEFINITIONS = {
+    "youth_team_sports": (
+        "one independent youth soccer, baseball, softball, basketball, flag-football "
+        "or lacrosse team/club — not a league, school or multi-team academy"
+    ),
+    "rowing_and_paddling": (
+        "small rowing, crew, sailing, canoe, kayak or dragon-boat clubs"
+    ),
+    "aquatics": (
+        "small independent swim, dive, water-polo or masters-swim clubs"
+    ),
+    "combat_sports": (
+        "small independent martial-arts, judo, wrestling, boxing or fencing clubs"
+    ),
+    "outdoor_competition": (
+        "small archery, disc-golf, climbing or orienteering clubs"
+    ),
+    "endurance_sports": (
+        "small local cycling, running, trail-running or triathlon clubs"
+    ),
+    "adult_amateur_team_sports": (
+        "small adult amateur soccer, rugby, softball, hockey or roller-derby clubs"
+    ),
+    "racquet_sports": (
+        "small local pickleball, tennis, badminton or table-tennis clubs"
+    ),
+    "equestrian_and_rodeo": (
+        "small independent equestrian, rodeo or riding competition clubs"
+    ),
+    "precision_and_league_sports": (
+        "small local bowling, darts, cornhole or amateur-golf competition clubs"
+    ),
+}
+CATEGORY_ROTATION = list(CATEGORY_DEFINITIONS)
+_CATEGORIES_PER_RUN = 5
 _RECENT_CATEGORY_RUNS = 3
 
 _API_URL = "https://api.openai.com/v1/responses"
@@ -194,6 +221,7 @@ CANDIDATE_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
+                    "category",
                     "storefront_name",
                     "storefront_handle",
                     "type_of_store",
@@ -202,9 +230,20 @@ CANDIDATE_SCHEMA = {
                     "organization_url",
                     "contact_source_url",
                     "logo_source_url",
+                    "estimated_members",
+                    "fit_evidence",
+                    "independent_local_group",
+                    "active_team_or_club",
+                    "commercial_business",
+                    "existing_merchandise",
+                    "merchandise_check",
                     "why_it_qualifies",
                 ],
                 "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": list(CATEGORY_DEFINITIONS),
+                    },
                     "storefront_name": {"type": "string"},
                     "storefront_handle": {"type": "string"},
                     "type_of_store": {"type": "string"},
@@ -213,6 +252,13 @@ CANDIDATE_SCHEMA = {
                     "organization_url": {"type": "string"},
                     "contact_source_url": {"type": "string"},
                     "logo_source_url": {"type": "string"},
+                    "estimated_members": {"type": "integer"},
+                    "fit_evidence": {"type": "string"},
+                    "independent_local_group": {"type": "boolean"},
+                    "active_team_or_club": {"type": "boolean"},
+                    "commercial_business": {"type": "boolean"},
+                    "existing_merchandise": {"type": "boolean"},
+                    "merchandise_check": {"type": "string"},
                     "why_it_qualifies": {"type": "string"},
                 },
             },
@@ -228,6 +274,7 @@ def _brief(
     focus: List[str] | None = None,
     avoid_domains: List[str] | None = None,
     avoid_categories: List[str] | None = None,
+    reviewer_feedback: List[str] | None = None,
 ) -> str:
     avoid_line = ""
     if avoid:
@@ -250,44 +297,59 @@ def _brief(
         )
     focus_line = ""
     if focus:
-        shown = "\n".join("- " + item for item in focus)
+        shown = "\n".join(
+            f"- {item}: {CATEGORY_DEFINITIONS.get(item, item)}" for item in focus
+        )
         focus_line = (
             "\n\nFocus this run on these kinds of organization:\n" + shown +
-            "\n\nReturn at most one organization per kind, and vary the state or "
-            "region between them. If one kind has nothing good, return fewer rather "
-            "than filling the list from whichever kind was easiest to search."
+            "\n\nReturn at most one organization per category in this response, and "
+            "vary the state or region between them."
         )
-    return f"""Find up to {limit} organizations that would plausibly want team apparel and do not currently sell it online.
+    feedback_line = ""
+    if reviewer_feedback:
+        shown = "\n".join("- " + item for item in reviewer_feedback[:8])
+        feedback_line = (
+            "\n\nRecent reviewer rejections. Treat these as recurring failure patterns, "
+            "not merely as organizations to avoid:\n" + shown
+        )
+    return f"""Find {limit} fully qualified micro teams or clubs that would plausibly want spirit wear and do not currently sell it online.
 
 Who qualifies:
-- A small, independent local group with its own identity and roughly 20–500 members: youth sports clubs, rowing/sailing/paddling clubs, swim teams, martial arts/fencing/archery clubs, dance/gymnastics clubs, local run/cycle clubs, volunteer rescue groups, small animal rescues, or community arts groups.
+- A genuinely small, independent local team or competition club with its own identity and approximately 10–150 active members. Smaller is better.
+- It has recurring practices, games, races, meets, tournaments or competitions. It is not merely a broad social-interest organization.
+- It is normally volunteer-run, coach-led or managed by a very small local staff, and likely lacks the time or budget to set up a merchandise program.
 - They have a public website with a visible logo.
 - They have a contact email address published on their own website.
-- They do NOT already sell apparel online. Check for a Store, Shop, Merch, Spirit Wear or Gear page. If they have one, skip them.
+- They do NOT already sell apparel online. Inspect the home page, navigation and linked pages for Store, Shop, Merch, Apparel, Spirit Wear, Team Store or Gear. Follow obvious external shop links too. If any merchandise exists, skip them.
 - Prefer United States organizations.
 
 Skip immediately:
 - Anything with an existing online store, even a bad one.
-- Schools, school districts, PTOs, booster clubs tied to a school, churches, Scout troops, military posts, municipal/county departments, universities, large nonprofits, franchises, national brands and pro teams.
+- Commercial dance studios, dance academies and multi-location gymnastics/cheer businesses.
+- Leagues, multi-team academies, multi-location businesses, established programs, schools, school districts, PTOs, booster clubs tied to a school, churches, Scout troops, military posts, municipal/county departments, universities, large nonprofits, franchises, national brands and pro teams.
 - Organizations that are a program inside a larger institution rather than an independent local group with its own identity.
+- Organizations that appear to have more than 150 active members. Do not return 150 as a placeholder when the size is unknown.
 - Anyone whose only contact is a web form with no email address.
 - Anyone whose logo you cannot find as a direct image file on their own site.
 - Anyone you are not confident is a real, currently active organization.
 
 Hard rules:
 - Only use information publicly visible on the organization's own website.
+- category must be one of the supplied category IDs and must accurately describe the group.
+- estimated_members must be a good-faith estimate supported by fit_evidence from the official site. If there is no reasonable evidence that the group is under 150, skip it.
+- independent_local_group and active_team_or_club must both be true. commercial_business and existing_merchandise must both be false.
+- merchandise_check must say which official navigation/page and external links you checked. Never claim "no store" from search-result text alone.
 - Never guess an email address or construct one from a pattern. If you cannot see a real published address, skip the organization.
-- logo_source_url should be the exact direct image URL copied from the official site's HTML or image link. Never invent a conventional path such as /logo.png, /images/logo.png, or /assets/logo.svg. The system will also extract and verify the official site's header logo when needed.
+- logo_source_url should be the exact direct image URL copied from the official site's HTML or image link. Prefer an SVG or the largest official image available. Never invent a conventional path such as /logo.png, /images/logo.png, or /assets/logo.svg. Logos are never AI-redrawn, so skip the group if only a tiny or unclear copy exists.
 - storefront_handle: lowercase letters, numbers and hyphens only. "St. Mary's Rowing" becomes st-marys-rowing.
 - storefront_name: the organization name followed by " Team Store".
 - primary_color: one common color name from their branding (Navy, Red, Royal Blue, Forest Green, Maroon, Black, Charcoal, Purple, Orange, Gold).
 - why_it_qualifies: one sentence, including where you checked for an existing store and what you found.
 
-Aim to return all {limit} candidates. Do not stop after the first two or three
-that look promising: continue through the focus categories until you have
-reached the target, unless every remaining organization fails one of the hard
-rules. Never fill the list by guessing a contact, logo, or store status.
-{focus_line}{avoid_line}"""
+Return all {limit} candidates. Do not stop after the first two or three that
+look promising. Never fill the list by guessing a contact, size, logo or store
+status; the caller will run another search round for any unfilled slots.
+{focus_line}{avoid_line}{feedback_line}"""
 
 
 def configured() -> bool:
@@ -319,6 +381,23 @@ def _research_limit(requested: int) -> int:
     better brief, and an overnight run should have a predictable ceiling.
     """
     return min(MAX_RESEARCH_CANDIDATES, max(requested + 2, requested * 2))
+
+
+def max_search_rounds() -> int:
+    """A high but finite emergency ceiling for a single discovery job.
+
+    Discovery keeps refilling rejected slots. The ceiling exists only to stop
+    a broken provider or an impossibly narrow public-web night from spending
+    forever; a shortfall is reported explicitly rather than disguised as a
+    successful smaller batch.
+    """
+    try:
+        value = int(os.getenv(
+            "OUTREACH_DISCOVERY_MAX_ROUNDS", str(DEFAULT_MAX_SEARCH_ROUNDS)
+        ))
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_SEARCH_ROUNDS
+    return max(2, min(MAX_SEARCH_ROUNDS, value))
 
 
 def _timeouts() -> Tuple[float, float]:
@@ -376,14 +455,59 @@ def _known_domains(core: Any) -> set[str]:
     return domains
 
 
-def _rotation_for_run(core: Any) -> Tuple[List[str], List[str]]:
+_FEEDBACK_LABELS = {
+    "existing_merch": "already sold merchandise",
+    "too_large": "was too large or established",
+    "bad_logo": "had an unusable, inaccurate or redrawn logo",
+    "not_team": "was not a real active team or competition club",
+    "wrong_contact": "did not have the right published decision-maker contact",
+    "duplicate": "was a duplicate",
+    "other": "did not fit for another reason",
+}
+
+
+def _legacy_feedback_code(note: Any) -> str:
+    """Give old free-form notes the same value as the new reason buttons."""
+    text = str(note or "").strip().lower()
+    if any(word in text for word in ("merch", "shop", "store already", "already sell")):
+        return "existing_merch"
+    if any(word in text for word in ("too big", "too large", "established", "large program")):
+        return "too_large"
+    if any(word in text for word in ("logo", "artwork", "redraw", "image")):
+        return "bad_logo"
+    if any(word in text for word in ("not a team", "not a club", "wrong audience")):
+        return "not_team"
+    if any(word in text for word in ("email", "contact")):
+        return "wrong_contact"
+    if "duplicate" in text:
+        return "duplicate"
+    return "other"
+
+
+def _reviewer_feedback(core: Any) -> List[str]:
+    """Turn review decisions into compact patterns the next search can use."""
+    counts: Dict[str, int] = {}
+    for state in _ledger(core).values():
+        if str(state.get("review_decision") or "").lower() not in {"declined", "removed"}:
+            continue
+        code = str(state.get("review_reason_code") or "").strip().lower()
+        if code not in _FEEDBACK_LABELS:
+            code = _legacy_feedback_code(state.get("review_note"))
+        counts[code] = counts.get(code, 0) + 1
+    return [
+        f"{count} recent candidate{'s' if count != 1 else ''} {_FEEDBACK_LABELS[code]}."
+        for code, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _rotation_for_run(core: Any, *, offset: int = 0) -> Tuple[List[str], List[str]]:
     """Which categories to chase this run, and which to stay off.
 
     Stepping through the list by run count means variety is a property of the
     schedule rather than something the model has to be talked into.
     """
     history = recent_runs(core)
-    cursor = len(history) * _CATEGORIES_PER_RUN
+    cursor = len(history) * _CATEGORIES_PER_RUN + max(0, int(offset))
     focus = [
         CATEGORY_ROTATION[(cursor + offset) % len(CATEGORY_ROTATION)]
         for offset in range(min(_CATEGORIES_PER_RUN, len(CATEGORY_ROTATION)))
@@ -391,7 +515,7 @@ def _rotation_for_run(core: Any) -> Tuple[List[str], List[str]]:
     recent: List[str] = []
     for run in history[:_RECENT_CATEGORY_RUNS]:
         for row in run.get("candidates") or []:
-            kind = str(row.get("type_of_store") or "").strip()
+            kind = str(row.get("category") or row.get("type_of_store") or "").strip()
             if kind and kind.lower() not in {r.lower() for r in recent}:
                 recent.append(kind)
     return focus, recent[:12]
@@ -434,6 +558,7 @@ def _ask_for_candidates(
     focus: List[str] | None = None,
     avoid_domains: List[str] | None = None,
     avoid_categories: List[str] | None = None,
+    reviewer_feedback: List[str] | None = None,
     model: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """One call out to the model. Returns (candidates, telemetry)."""
@@ -453,6 +578,7 @@ def _ask_for_candidates(
             focus=focus,
             avoid_domains=avoid_domains,
             avoid_categories=avoid_categories,
+            reviewer_feedback=reviewer_feedback,
         ),
         "tools": [{"type": tool}],
         "text": {
@@ -536,6 +662,7 @@ def _clean(
     candidate: Dict[str, Any],
     known: set[str],
     known_domains: set[str] | None = None,
+    used_categories: set[str] | None = None,
 ) -> Tuple[Dict[str, Any] | None, str]:
     """Re-check the model's work before it can create anything.
 
@@ -545,6 +672,37 @@ def _clean(
     """
     if not isinstance(candidate, dict):
         return None, "not an object"
+    category = str(candidate.get("category") or "").strip().lower()
+    if category not in CATEGORY_DEFINITIONS:
+        return None, f"unknown or missing category {category!r}"
+    if category in (used_categories or set()):
+        return None, f"category {category} is already represented in this batch"
+    identity = " ".join(
+        str(candidate.get(field) or "").lower()
+        for field in ("storefront_name", "type_of_store")
+    )
+    if any(term in identity for term in ("dance studio", "dance academy", "dance school")):
+        return None, "commercial dance studios are outside the target audience"
+    if candidate.get("independent_local_group") is not True:
+        return None, "not confirmed as an independent local group"
+    if candidate.get("active_team_or_club") is not True:
+        return None, "not confirmed as an active team or competition club"
+    if candidate.get("commercial_business") is not False:
+        return None, "appears to be a commercial or established business"
+    if candidate.get("existing_merchandise") is not False:
+        return None, "model found existing merchandise"
+    try:
+        estimated_members = int(candidate.get("estimated_members"))
+    except (TypeError, ValueError):
+        return None, "member estimate is missing"
+    if estimated_members < 10 or estimated_members > 150:
+        return None, f"estimated size {estimated_members} is outside the 10–150 member target"
+    fit_evidence = str(candidate.get("fit_evidence") or "").strip()
+    merchandise_check = str(candidate.get("merchandise_check") or "").strip()
+    if len(fit_evidence) < 12:
+        return None, "no usable evidence that this is a small independent group"
+    if len(merchandise_check) < 12:
+        return None, "no usable evidence that the official site was checked for merchandise"
     handle = str(candidate.get("storefront_handle") or "").strip().lower()
     if not _SAFE_HANDLE.fullmatch(handle):
         return None, f"unusable handle {handle!r}"
@@ -579,6 +737,31 @@ def _clean(
     if host and host in (known_domains or set()):
         return None, f"{host} is already in the system"
 
+    # The model is a researcher, not the final gate. Independently inspect the
+    # official site's navigation for a shop and for clear evidence that this is
+    # a large or multi-location program before spending anything on a build.
+    has_merch, merch_problem = outreach_verify.existing_merchandise(
+        urls["organization_url"]
+    )
+    if has_merch:
+        return None, merch_problem or "official site links to an existing merchandise store"
+    small_enough, size_problem = outreach_verify.small_group_fit(
+        urls["organization_url"]
+    )
+    if not small_enough:
+        return None, size_problem
+
+    # Go and look. Everything above this line is the model's word, and a model
+    # that invents an organization invents its website to match.
+    verified, problem = outreach_verify.check_candidate({
+        "contact_email": email,
+        "organization_url": urls["organization_url"],
+        "storefront_name": candidate.get("storefront_name"),
+        "storefront_handle": handle,
+    })
+    if not verified:
+        return None, problem
+
     # A model often gets the right organization but invents a plausible
     # `/logo.png`. Start with its proposed URL, then fall back to direct image
     # URLs actually embedded by the official homepage. This keeps the strict
@@ -607,28 +790,21 @@ def _clean(
         return None, logo_problem
     urls["logo_source_url"] = chosen_logo
 
-    # Go and look. Everything above this line is the model's word, and a model
-    # that invents an organization invents its website to match.
-    verified, problem = outreach_verify.check_candidate({
-        "contact_email": email,
-        "organization_url": urls["organization_url"],
-        "storefront_name": candidate.get("storefront_name"),
-        "storefront_handle": handle,
-    })
-    if not verified:
-        return None, problem
-
     return {
         "provider_request_id": f"discovery-{time.strftime('%Y%m%d')}-{handle}"[:120],
         "source_agent": "openai",
         "contact_email": email,
         "storefront_name": str(candidate.get("storefront_name") or "").strip()[:300],
         "storefront_handle": handle,
+        "category": category,
         "type_of_store": str(candidate.get("type_of_store") or "").strip()[:120],
         "primary_color": str(candidate.get("primary_color") or "").strip()[:60],
         "screening_confirmed": True,
         "logo_source_reviewed": True,
         "email_authorized": False,
+        "estimated_members": estimated_members,
+        "fit_evidence": fit_evidence[:400],
+        "merchandise_check": merchandise_check[:400],
         **urls,
     }, ""
 
@@ -698,89 +874,210 @@ def run_discovery(
         token = _current_run_token()
     try:
         requested = max(1, min(MAX_LIMIT, int(limit or nightly_limit())))
-        research_limit = _research_limit(requested)
         started_at = outreach_tracking.utc_iso()
         run: Dict[str, Any] = {
             "started_at": started_at,
             "trigger": trigger,
             "dry_run": bool(dry_run),
             "requested": requested,
-            "research_requested": research_limit,
         }
         known = set(_known_handles(core))
         known_domains = _known_domains(core)
-        focus, avoid_categories = _rotation_for_run(core)
-        run["focus"] = focus
-        try:
-            _set_run_phase(token, f"Searching public sources for up to {research_limit} candidates")
-            candidates, telemetry = _ask_for_candidates(
-                research_limit,
-                sorted(known),
-                focus=focus,
-                avoid_domains=sorted(known_domains),
-                avoid_categories=avoid_categories,
-                model=model,
-            )
-            run.update(telemetry)
-        except Exception as exc:
-            run["finished_at"] = outreach_tracking.utc_iso()
-            run["error"] = str(exc)[:400]
-            run["returned"] = 0
-            _record_run(core, run)
-            raise
-
-        if not _owns_run(token):
-            raise RuntimeError("This discovery run lost its lease before candidate checks completed")
-
         accepted: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
-        candidate_total = len(candidates)
-        for index, candidate in enumerate(candidates[:MAX_RESEARCH_CANDIDATES], start=1):
+        seen_candidate_handles: set[str] = set()
+        used_categories: set[str] = set()
+        reviewer_feedback = _reviewer_feedback(core)
+        rounds: List[Dict[str, Any]] = []
+        all_focus: List[str] = []
+        total_research_requested = 0
+        total_returned = 0
+        search_error = ""
+
+        for round_number in range(1, max_search_rounds() + 1):
+            missing = requested - len(accepted)
+            if missing <= 0:
+                break
+            research_limit = _research_limit(missing)
+            total_research_requested += research_limit
+            focus, recent_categories = _rotation_for_run(
+                core,
+                offset=(round_number - 1) * _CATEGORIES_PER_RUN,
+            )
+            focus = [category for category in focus if category not in used_categories]
+            if not focus:
+                focus, _unused = _rotation_for_run(core, offset=round_number)
+            for category in focus:
+                if category not in all_focus:
+                    all_focus.append(category)
+            blocked_categories = list(dict.fromkeys(
+                list(recent_categories) + sorted(used_categories)
+            ))
+            try:
+                _set_run_phase(
+                    token,
+                    f"Search round {round_number}: filling {missing} remaining candidate"
+                    f"{'s' if missing != 1 else ''}",
+                )
+                candidates, telemetry = _ask_for_candidates(
+                    research_limit,
+                    sorted(known),
+                    focus=focus,
+                    avoid_domains=sorted(known_domains),
+                    avoid_categories=blocked_categories,
+                    reviewer_feedback=reviewer_feedback,
+                    model=model,
+                )
+            except Exception as exc:
+                search_error = str(exc)[:400]
+                if not accepted:
+                    run.update({
+                        "finished_at": outreach_tracking.utc_iso(),
+                        "error": search_error,
+                        "returned": total_returned,
+                        "rounds": rounds,
+                    })
+                    _record_run(core, run)
+                    raise
+                break
+
+            if not _owns_run(token):
+                raise RuntimeError(
+                    "This discovery run lost its lease before candidate checks completed"
+                )
+
+            candidate_total = len(candidates)
+            total_returned += candidate_total
+            accepted_before = len(accepted)
+            round_rejected_before = len(rejected)
+            for index, candidate in enumerate(
+                candidates[:MAX_RESEARCH_CANDIDATES], start=1
+            ):
+                if len(accepted) >= requested:
+                    break
+                if not _owns_run(token):
+                    raise RuntimeError(
+                        "This discovery run lost its lease during candidate checks"
+                    )
+                _set_run_phase(
+                    token,
+                    f"Round {round_number}: checking candidate {index} of {candidate_total}; "
+                    f"{requested - len(accepted)} slot(s) still open",
+                )
+                raw_handle = str(
+                    (candidate or {}).get("storefront_handle") or ""
+                ).strip().lower()
+                raw_host = _domain((candidate or {}).get("organization_url"))
+                if raw_handle and raw_handle in seen_candidate_handles:
+                    continue
+                if raw_handle:
+                    seen_candidate_handles.add(raw_handle)
+                payload, reason = _clean(
+                    candidate,
+                    known,
+                    known_domains,
+                    used_categories,
+                )
+                if payload is None:
+                    rejected.append({
+                        "handle": raw_handle[:80],
+                        "reason": reason,
+                    })
+                    # Do not pay to research the same failed prospect again in
+                    # a refill round, whatever wording the model gives it.
+                    if _SAFE_HANDLE.fullmatch(raw_handle):
+                        known.add(raw_handle)
+                    if raw_host:
+                        known_domains.add(raw_host)
+                    continue
+
+                row = {
+                    "handle": payload["storefront_handle"],
+                    "storefront_name": payload["storefront_name"],
+                    "contact_email": payload["contact_email"],
+                    "organization_url": payload["organization_url"],
+                    "logo_source_url": payload["logo_source_url"],
+                    "category": payload["category"],
+                    "type_of_store": payload["type_of_store"],
+                    "estimated_members": payload["estimated_members"],
+                    "fit_evidence": payload["fit_evidence"],
+                    "merchandise_check": payload["merchandise_check"],
+                    "why_it_qualifies": str(
+                        (candidate or {}).get("why_it_qualifies") or ""
+                    )[:300],
+                }
+                if dry_run:
+                    row["queued"] = False
+                    # Kept so the candidates just read on screen can be built as
+                    # they are. Searching again to build them would cost another
+                    # search and could return a different set.
+                    row["payload"] = payload
+                else:
+                    ok, status = _submit(core, payload)
+                    if not ok:
+                        rejected.append({
+                            "handle": payload["storefront_handle"],
+                            "reason": f"intake submission failed: {status}",
+                        })
+                        known.add(payload["storefront_handle"])
+                        host = _domain(payload["organization_url"])
+                        if host:
+                            known_domains.add(host)
+                        continue
+                    row["queued"] = True
+                    row["status"] = status
+
+                accepted.append(row)
+                used_categories.add(payload["category"])
+                known.add(payload["storefront_handle"])
+                host = _domain(payload["organization_url"])
+                if host:
+                    known_domains.add(host)
+
+            gained = len(accepted) - accepted_before
+            rounds.append({
+                **telemetry,
+                "round": round_number,
+                "requested": research_limit,
+                "returned": candidate_total,
+                "accepted": gained,
+                "rejected": len(rejected) - round_rejected_before,
+                "remaining": max(0, requested - len(accepted)),
+            })
             if len(accepted) >= requested:
                 break
-            if not _owns_run(token):
-                raise RuntimeError("This discovery run lost its lease during candidate checks")
-            _set_run_phase(token, f"Checking candidate {index} of {candidate_total}")
-            payload, reason = _clean(candidate, known, known_domains)
-            if payload is None:
-                rejected.append({
-                    "handle": str((candidate or {}).get("storefront_handle") or "")[:80],
-                    "reason": reason,
-                })
-                continue
-            known.add(payload["storefront_handle"])
-            host = _domain(payload["organization_url"])
-            if host:
-                known_domains.add(host)
-            row = {
-                "handle": payload["storefront_handle"],
-                "storefront_name": payload["storefront_name"],
-                "contact_email": payload["contact_email"],
-                "organization_url": payload["organization_url"],
-                "logo_source_url": payload["logo_source_url"],
-                "type_of_store": payload["type_of_store"],
-                "why_it_qualifies": str((candidate or {}).get("why_it_qualifies") or "")[:300],
-            }
-            if dry_run:
-                row["queued"] = False
-                # Kept so the candidates just read on screen can be built as
-                # they are. Searching again to build them would cost another
-                # search and could return a different set — the reviewed ones
-                # should be the ones that get made.
-                row["payload"] = payload
-            else:
-                ok, status = _submit(core, payload)
-                row["queued"] = ok
-                row["status"] = status
-            accepted.append(row)
+
+        input_tokens = sum(int(item.get("input_tokens") or 0) for item in rounds)
+        output_tokens = sum(int(item.get("output_tokens") or 0) for item in rounds)
+        elapsed = round(sum(float(item.get("seconds") or 0) for item in rounds), 1)
+        complete = len(accepted) == requested
 
         run.update({
             "finished_at": outreach_tracking.utc_iso(),
-            "returned": len(candidates),
+            "focus": all_focus,
+            "reviewer_feedback": reviewer_feedback,
+            "research_requested": total_research_requested,
+            "search_rounds": len(rounds),
+            "rounds": rounds,
+            "returned": total_returned,
             "accepted": len(accepted),
             "queued": sum(1 for row in accepted if row.get("queued")),
             "rejected": rejected,
             "candidates": accepted,
+            "complete": complete,
+            "shortfall": max(0, requested - len(accepted)),
+            "shortfall_reason": (
+                "" if complete else (
+                    search_error
+                    or f"The public-web search could not fill every slot after {len(rounds)} refill rounds."
+                )
+            ),
+            "attempts": sum(int(item.get("attempts") or 0) for item in rounds),
+            "model": next((item.get("model") for item in rounds if item.get("model")), model),
+            "search_tool": next((item.get("search_tool") for item in rounds if item.get("search_tool")), ""),
+            "seconds": elapsed,
+            "input_tokens": input_tokens or None,
+            "output_tokens": output_tokens or None,
         })
         _record_run(core, run)
         return run

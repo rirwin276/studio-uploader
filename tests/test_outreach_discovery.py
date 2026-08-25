@@ -13,6 +13,7 @@ class FakeCore:
 
 def _candidate(handle="westside-rowing", **overrides):
     row = {
+        "category": "rowing_and_paddling",
         "storefront_name": "Westside Rowing Team Store",
         "storefront_handle": handle,
         "type_of_store": "rowing club",
@@ -21,6 +22,13 @@ def _candidate(handle="westside-rowing", **overrides):
         "organization_url": "https://westside.org/",
         "contact_source_url": "https://westside.org/contact",
         "logo_source_url": "https://westside.org/logo.png",
+        "estimated_members": 45,
+        "fit_evidence": "The official site lists one local masters and junior rowing squad.",
+        "independent_local_group": True,
+        "active_team_or_club": True,
+        "commercial_business": False,
+        "existing_merchandise": False,
+        "merchandise_check": "Checked the official homepage navigation and linked pages; no shop was found.",
         "why_it_qualifies": "No shop page under /store or /merch.",
     }
     row.update(overrides)
@@ -67,6 +75,16 @@ def wired(monkeypatch):
         "published_contact_emails",
         lambda _url: ([("info@westside.org", "https://westside.org/contact")], ""),
     )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "existing_merchandise",
+        lambda _url: (False, ""),
+    )
+    monkeypatch.setattr(
+        outreach_discovery.outreach_verify,
+        "small_group_fit",
+        lambda _url: (True, ""),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     return FakeCore(), ledger, submitted
 
@@ -109,9 +127,11 @@ def test_the_models_work_is_rechecked_before_anything_is_created(wired, monkeypa
     true, and a bad handle is cheaper to reject here than in Shopify."""
     core, _ledger, submitted = wired
     _answer(monkeypatch, [
-        _candidate("st. mary's"),                                  # unusable handle
+        _candidate("st. mary's", organization_url="https://bad-handle.org/",
+                   logo_source_url="https://bad-handle.org/logo.png"),  # unusable handle
         _candidate("no-email", contact_email="see contact form", organization_url="https://no-email.org/"),
-        _candidate("http-logo", logo_source_url="http://x.org/a.png"),  # not https
+        _candidate("http-logo", organization_url="https://http-logo.org/",
+                   logo_source_url="http://x.org/a.png"),  # not https
         _candidate("good-club"),
     ])
 
@@ -177,7 +197,8 @@ def test_discovery_asks_for_a_small_reserve_and_uses_it_after_rejections(wired, 
     def ask(limit, avoid, **_kwargs):
         seen["limit"] = limit
         return [
-            _candidate("not a valid handle!"),
+            _candidate("not a valid handle!", organization_url="https://bad-handle.org/",
+                       logo_source_url="https://bad-handle.org/logo.png"),
             _candidate("good-club"),
         ], {"model": "test-model", "seconds": 0.1}
 
@@ -187,6 +208,45 @@ def test_discovery_asks_for_a_small_reserve_and_uses_it_after_rejections(wired, 
     assert seen["limit"] > 1
     assert run["accepted"] == 1
     assert submitted[0]["storefront_handle"] == "good-club"
+
+
+def test_discovery_refills_rejected_slots_until_the_requested_count(wired, monkeypatch):
+    """Five means five usable candidates, not five model suggestions."""
+    core, _ledger, submitted = wired
+    calls = []
+
+    first = [
+        _candidate("bad-1", existing_merchandise=True,
+                   organization_url="https://bad1.org/", logo_source_url="https://bad1.org/logo.png"),
+        _candidate("bad-2", estimated_members=800,
+                   organization_url="https://bad2.org/", logo_source_url="https://bad2.org/logo.png"),
+        _candidate("good-1", category="rowing_and_paddling"),
+    ]
+    second = [
+        _candidate("good-2", category="youth_team_sports",
+                   organization_url="https://good2.org/", logo_source_url="https://good2.org/logo.png"),
+        _candidate("good-3", category="combat_sports",
+                   organization_url="https://good3.org/", logo_source_url="https://good3.org/logo.png"),
+        _candidate("good-4", category="endurance_sports",
+                   organization_url="https://good4.org/", logo_source_url="https://good4.org/logo.png"),
+        _candidate("good-5", category="racquet_sports",
+                   organization_url="https://good5.org/", logo_source_url="https://good5.org/logo.png"),
+    ]
+
+    def ask(_limit, _avoid, **_kwargs):
+        calls.append(1)
+        return (first if len(calls) == 1 else second), {
+            "model": "test-model", "seconds": 0.1,
+        }
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    run = outreach_discovery.run_discovery(core, limit=5)
+
+    assert len(calls) == 2
+    assert run["complete"] is True
+    assert run["accepted"] == 5
+    assert run["shortfall"] == 0
+    assert len(submitted) == 5
 
 
 def test_a_failed_run_is_recorded_rather_than_lost(wired, monkeypatch):
@@ -240,6 +300,28 @@ def test_the_brief_tells_the_model_what_not_to_return(wired, monkeypatch):
     assert "already-built" in seen["avoid"]
 
 
+def test_review_reasons_are_fed_into_the_next_search(wired, monkeypatch):
+    core, ledger, _submitted = wired
+    ledger["old-studio"] = {
+        "handle": "old-studio",
+        "status": "declined",
+        "review_decision": "declined",
+        "review_reason_code": "too_large",
+        "review_note": "regional commercial studio",
+    }
+    seen = {}
+
+    def ask(_limit, _avoid, **kwargs):
+        seen.update(kwargs)
+        return [], {}
+
+    monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    outreach_discovery.run_discovery(core, limit=1, dry_run=True)
+
+    feedback = seen.get("reviewer_feedback") or []
+    assert any("too large" in item for item in feedback)
+
+
 def test_the_same_organization_under_a_new_handle_is_caught(wired, monkeypatch):
     """A handle is a weak identity for an organization.
 
@@ -272,13 +354,15 @@ def test_each_run_chases_a_different_slice_of_the_rotation(wired, monkeypatch):
         return [], {}
 
     monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
+    first_focus = []
     for _ in range(3):
+        before = len(seen)
         outreach_discovery.run_discovery(core, limit=2, dry_run=True)
+        first_focus.append(seen[before])
 
     assert all(len(focus) == outreach_discovery._CATEGORIES_PER_RUN for focus in seen)
-    # No category repeats while the rotation still has unused entries.
-    flat = [item for focus in seen for item in focus]
-    assert len(set(flat)) == len(flat)
+    assert all(len(set(focus)) == len(focus) for focus in seen)
+    assert first_focus[0] != first_focus[1]
 
 
 def test_the_rotation_wraps_instead_of_running_out(wired, monkeypatch):
@@ -311,7 +395,7 @@ def test_recent_categories_are_fed_back_as_things_to_skip(wired, monkeypatch):
     monkeypatch.setattr(outreach_discovery, "_ask_for_candidates", ask)
     outreach_discovery.run_discovery(core, limit=2, dry_run=True)
 
-    assert "rowing club" in (seen.get("avoid_categories") or [])
+    assert "rowing_and_paddling" in (seen.get("avoid_categories") or [])
 
 
 def test_a_run_can_override_the_model_without_a_redeploy(wired, monkeypatch):
@@ -479,6 +563,7 @@ def test_the_candidates_you_just_reviewed_are_the_ones_that_get_built(wired, mon
     a different set. The reviewed ones should be the ones that get made."""
     core, _ledger, submitted = wired
     _answer(monkeypatch, [_candidate("first-club"), _candidate("second-club",
+                                                               category="endurance_sports",
                                                                organization_url="https://second.org/",
                                                                contact_source_url="https://second.org/c",
                                                                logo_source_url="https://second.org/l.png")])

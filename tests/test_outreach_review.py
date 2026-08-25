@@ -107,10 +107,23 @@ def test_decline_deletes_the_store_and_emails_nobody(wired):
     assert result["status"] == "declined"
     assert core.deprovisioned == [(result["job_id"], "westside-rowing")]
     assert states["westside-rowing"]["review_note"] == "already has a shop"
+    assert states["westside-rowing"]["review_reason_code"] == "existing_merch"
     # A declined store must never later look due for a follow-up or a deletion.
     assert states["westside-rowing"]["followup_due_at"] is None
     assert states["westside-rowing"]["delete_due_at"] is None
     assert outreach_review.pending_queue(core) == []
+
+
+def test_a_structured_decline_reason_is_saved_for_future_discovery(wired):
+    core, states, _sent = wired
+    outreach_review.decline(
+        core,
+        "westside-rowing",
+        reason="clearly a regional program",
+        reason_code="too_large",
+    )
+    assert states["westside-rowing"]["review_reason_code"] == "too_large"
+    assert states["westside-rowing"]["review_note"] == "clearly a regional program"
 
 
 def test_a_decided_store_cannot_be_decided_twice(wired):

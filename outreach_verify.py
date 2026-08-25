@@ -15,12 +15,14 @@ gone, a domain that accepts no mail at all — rejects a candidate.
 
 from __future__ import annotations
 
+import io
 import re
 import socket
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
+from PIL import Image
 
 
 _TIMEOUT = (5, 12)
@@ -28,6 +30,28 @@ _MAX_HTML = 400_000
 _UA = "Stella-Sage-Outreach-Verify/1.0"
 _MAX_LOGO_CANDIDATES = 24
 _EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I)
+_MERCH_WORDS = re.compile(
+    r"\b(?:shop|store|merch|merchandise|apparel|spirit\s*wear|team\s*store|fan\s*gear)\b",
+    re.I,
+)
+_MERCH_PATH = re.compile(
+    r"/(?:shop|store|merch|merchandise|apparel|spirit[-_]?wear|team[-_]?store|fan[-_]?gear)(?:[/?.#_-]|$)",
+    re.I,
+)
+_MERCH_VENDORS = (
+    "squadlocker.com", "bonfire.com", "customink.com", "inksoft.com",
+    "spreadshirt.com", "teepublic.com", "redbubble.com", "spring.com",
+    "square.site", "squareup.com", "myshopify.com", "shopify.com",
+    "ordermygear.com", "bsnteamsports.com", "sideline.bsnsports.com",
+)
+_LARGE_GROUP_PATTERNS = (
+    re.compile(r"\b(?:more than|over|serving)\s+([2-9]\d{2,}|[1-9]\d{3,})\s+(?:members|athletes|players|students)\b", re.I),
+    re.compile(r"\b([2-9]\d{2,}|[1-9]\d{3,})\+?\s+(?:active\s+)?(?:members|athletes|players|students)\b", re.I),
+)
+_ESTABLISHED_SCALE = re.compile(
+    r"\b(?:multiple|many|over\s+[3-9]|[4-9]\+?)\s+(?:locations|branches|facilities|campuses)\b|\bfranchis(?:e|ed|ing)\b",
+    re.I,
+)
 
 # Words that carry no identifying weight, so matching on them would let any
 # page pass for any organization.
@@ -102,6 +126,61 @@ def _contact_page_links(html: str, page_url: str) -> List[str]:
         if len(values) >= 3:
             break
     return values
+
+
+def _host(url: str) -> str:
+    host = (urlparse(str(url or "")).hostname or "").lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def existing_merchandise(organization_url: str) -> Tuple[bool, str]:
+    """Find clear first-party evidence of an existing apparel/shop link.
+
+    This is intentionally conservative: a navigation label, a shop-like path,
+    or a link to a known merchandise host is evidence; a stray sentence using
+    the word "store" is not. The model is still asked to research more deeply,
+    while this free check catches the expensive obvious misses.
+    """
+    html, page_url, issue = _read_html_page(organization_url)
+    if not html:
+        return False, f"merchandise check unavailable because the organization page {issue}"
+    organization_host = _host(page_url)
+    for tag in re.findall(r"<a\b[^>]*>.*?</a>", html, flags=re.S | re.I):
+        attrs = _html_attributes(tag)
+        raw = str(attrs.get("href") or "").strip()
+        if not raw:
+            continue
+        absolute = urljoin(page_url, raw)
+        label = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", tag)).strip()
+        linked_host = _host(absolute)
+        vendor = any(
+            linked_host == domain or linked_host.endswith("." + domain)
+            for domain in _MERCH_VENDORS
+        )
+        marked = bool(_MERCH_WORDS.search(label) or _MERCH_PATH.search(absolute))
+        # A generic Shopify CDN asset is not a shop. A clickable external
+        # storefront, or an explicitly labelled first-party page, is.
+        if vendor or marked:
+            destination = absolute if linked_host != organization_host else raw
+            return True, f"official site links to existing merchandise: {label or destination} ({destination})"
+    return False, ""
+
+
+def small_group_fit(organization_url: str) -> Tuple[bool, str]:
+    """Reject only clear public evidence that a prospect is not a micro group."""
+    html, _page_url, issue = _read_html_page(organization_url)
+    if not html:
+        # The contact and identity checks will handle a dead site. A temporary
+        # timeout is not proof that a genuinely small club is large.
+        return True, f"size check unavailable because the organization page {issue}"
+    text = _text_of(html)
+    if _ESTABLISHED_SCALE.search(text):
+        return False, "official site describes a multi-location or franchised organization"
+    for pattern in _LARGE_GROUP_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return False, f"official site reports {match.group(1)} members/athletes, above the 150-member target"
+    return True, ""
 
 
 def _read_html_page(url: str) -> Tuple[str, str, str]:
@@ -186,12 +265,28 @@ def _logo_candidates_from_html(html: str, page_url: str) -> List[str]:
     for tag in re.findall(r"<(?:img|source)\b[^>]*>", html, flags=re.I):
         attrs = _html_attributes(tag)
         context = " ".join(attrs.values())
-        # Lazy-loading builders use any of these. srcset is deliberately not
-        # used: selecting one of several responsive sources needs browser
-        # rules, while their normal src/data-src is the stable original.
         for field in ("src", "data-src", "data-original", "data-lazy-src"):
             if attrs.get(field):
                 add(attrs[field], context, 40)
+        # Header logos are commonly served as a tiny `src` plus a much larger
+        # official `srcset`. Prefer the largest declared candidate so discovery
+        # does not send a 120px thumbnail to the logo pipeline and ask an image
+        # model to invent the missing detail.
+        for field in ("srcset", "data-srcset"):
+            entries = []
+            for item in str(attrs.get(field) or "").split(","):
+                parts = item.strip().split()
+                if not parts:
+                    continue
+                score = 0
+                if len(parts) > 1:
+                    match = re.match(r"([0-9.]+)(w|x)$", parts[-1], re.I)
+                    if match:
+                        amount = float(match.group(1))
+                        score = int(amount if match.group(2).lower() == "w" else amount * 1000)
+                entries.append((score, parts[0]))
+            for descriptor, raw_url in sorted(entries, reverse=True):
+                add(raw_url, context, 45 + min(80, descriptor // 100))
 
     for tag in re.findall(r"<(?:meta|link)\b[^>]*>", html, flags=re.I):
         attrs = _html_attributes(tag)
@@ -365,11 +460,29 @@ def logo_source_is_live(url: str) -> Tuple[bool, str]:
     try:
         from outreach_intake import OutreachIntakeError, _download_public_image
 
-        _download_public_image(str(url or ""), 12 * 1024 * 1024)
+        raw = _download_public_image(str(url or ""), 12 * 1024 * 1024)
     except OutreachIntakeError as exc:
         return False, str(exc)
     except Exception as exc:
         # Do not allow an unexpected fetch failure to turn into a prospective
         # store with an unknown asset. The reason is retained in the run log.
         return False, f"logo source could not be verified ({type(exc).__name__})"
+    # Vector artwork is faithful at any rasterization size. Raster artwork
+    # below the salvage floor would trigger an AI recreation later, which is
+    # unacceptable for a cold email using somebody else's identity.
+    sample = raw.lstrip()[:500].lower()
+    if b"<svg" in sample:
+        return True, ""
+    try:
+        import outreach_logo
+
+        with Image.open(io.BytesIO(raw)) as image:
+            report = outreach_logo.assess(image.convert("RGBA"))
+    except Exception:
+        return False, "logo_source_url could not be decoded as a usable image"
+    if report.get("verdict") == "recreated":
+        return False, (
+            f"official logo artwork is only {report.get('artwork_width')}px wide; "
+            "outreach logos are never AI-redrawn"
+        )
     return True, ""

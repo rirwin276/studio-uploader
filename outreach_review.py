@@ -35,6 +35,39 @@ _INSTALLED_APP_IDS: set[int] = set()
 # left the queue.
 PENDING_STATUSES = {"provisioned"}
 
+REVIEW_REASON_LABELS = {
+    "existing_merch": "Already sells merchandise",
+    "too_large": "Organization is too large or established",
+    "bad_logo": "Logo or artwork is unusable/inaccurate",
+    "not_team": "Not a small active team or competition club",
+    "wrong_contact": "Wrong or unusable contact",
+    "duplicate": "Duplicate organization",
+    "other": "Other",
+}
+
+
+def _review_reason(code: str = "", note: str = "") -> tuple[str, str]:
+    """Normalize a button choice while preserving old free-form clients."""
+    normalized = str(code or "").strip().lower()
+    text = str(note or "").strip()[:300]
+    if normalized not in REVIEW_REASON_LABELS:
+        lower = text.lower()
+        if any(word in lower for word in ("merch", "shop", "store already", "already sell")):
+            normalized = "existing_merch"
+        elif any(word in lower for word in ("too big", "too large", "established", "large program")):
+            normalized = "too_large"
+        elif any(word in lower for word in ("logo", "artwork", "redraw", "image")):
+            normalized = "bad_logo"
+        elif any(word in lower for word in ("not a team", "not a club", "wrong audience")):
+            normalized = "not_team"
+        elif any(word in lower for word in ("email", "contact")):
+            normalized = "wrong_contact"
+        elif "duplicate" in lower:
+            normalized = "duplicate"
+        else:
+            normalized = "other"
+    return normalized, text or REVIEW_REASON_LABELS[normalized]
+
 
 def _pending(state: Dict[str, Any]) -> bool:
     if str(state.get("status") or "").strip().lower() not in PENDING_STATUSES:
@@ -160,7 +193,12 @@ def retry(core: Any, handle: str) -> Dict[str, Any]:
     }
 
 
-def remove(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
+def remove(
+    core: Any,
+    handle: str,
+    reason: str = "",
+    reason_code: str = "",
+) -> Dict[str, Any]:
     """Delete an outreach store at any stage. The nuke, from the outreach page.
 
     Decline is the reviewer's "no" and only applies to a store still waiting
@@ -180,6 +218,7 @@ def remove(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
         raise PermissionError("Store has been claimed — it belongs to its admin now")
 
     removed_at = outreach_tracking.utc_iso()
+    normalized_code, normalized_note = _review_reason(reason_code, reason)
     outreach_tracking.update(
         core,
         handle,
@@ -188,7 +227,8 @@ def remove(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
             "declined_at": removed_at,
             "reviewed_at": removed_at,
             "review_decision": "removed",
-            "review_note": str(reason or "removed from the outreach page")[:300],
+            "review_reason_code": normalized_code,
+            "review_note": normalized_note,
             "email_authorized": False,
             "followup_due_at": None,
             "delete_due_at": None,
@@ -207,7 +247,12 @@ def remove(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
     return {"ok": True, "handle": handle, "status": "declined", "job_id": job_id}
 
 
-def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
+def decline(
+    core: Any,
+    handle: str,
+    reason: str = "",
+    reason_code: str = "",
+) -> Dict[str, Any]:
     """Delete the store and the artwork. Nobody is emailed.
 
     Recorded before the deletion starts, because a nuke that half-finishes must
@@ -220,6 +265,7 @@ def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
         raise PermissionError("Store is not waiting for a decision")
 
     declined_at = outreach_tracking.utc_iso()
+    normalized_code, normalized_note = _review_reason(reason_code, reason)
     outreach_tracking.update(
         core,
         handle,
@@ -227,7 +273,8 @@ def decline(core: Any, handle: str, reason: str = "") -> Dict[str, Any]:
             "declined_at": declined_at,
             "reviewed_at": declined_at,
             "review_decision": "declined",
-            "review_note": str(reason or "")[:300],
+            "review_reason_code": normalized_code,
+            "review_note": normalized_note,
             "status": "declined",
             "email_authorized": False,
             "followup_due_at": None,
@@ -424,6 +471,7 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
             "ok": True,
             "email_configured": outreach_mail.configured(),
             "from": outreach_mail.display_from(),
+            "decline_reasons": REVIEW_REASON_LABELS,
             "pending": pending_queue(core),
         }
 
@@ -436,6 +484,7 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
             "ok": True,
             "email_configured": outreach_mail.configured(),
             "from": outreach_mail.display_from(),
+            "decline_reasons": REVIEW_REASON_LABELS,
             **pipeline(core),
         }
 
@@ -477,7 +526,12 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
         except Exception:
             body = {}
         try:
-            return remove(core, normalized, str((body or {}).get("reason") or ""))
+            return remove(
+                core,
+                normalized,
+                str((body or {}).get("reason") or ""),
+                str((body or {}).get("reason_code") or ""),
+            )
         except LookupError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except PermissionError as exc:
@@ -511,7 +565,12 @@ def install_outreach_review_routes(app: Any, core: Any) -> bool:
         except Exception:
             body = {}
         try:
-            return decline(core, normalized, str((body or {}).get("reason") or ""))
+            return decline(
+                core,
+                normalized,
+                str((body or {}).get("reason") or ""),
+                str((body or {}).get("reason_code") or ""),
+            )
         except LookupError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except PermissionError as exc:

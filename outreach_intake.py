@@ -118,6 +118,10 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
         "storefront_name",
         "storefront_handle",
         "type_of_store",
+        "category",
+        "estimated_members",
+        "fit_evidence",
+        "merchandise_check",
         "primary_color",
         "organization_url",
         "contact_source_url",
@@ -160,7 +164,7 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
     if logo_origin == "foreign":
         raise OutreachIntakeError(logo_problem)
 
-    return {
+    normalized = {
         "provider_request_id": request_id,
         "source_agent": source_agent,
         "contact_email": email,
@@ -190,6 +194,19 @@ def _normalize_payload(payload: Any) -> Dict[str, Any]:
         "email_authorized": False,
         "logo_origin": logo_origin,
     }
+    category = str(payload.get("category") or "").strip()
+    if category:
+        normalized["category"] = category[:80]
+    if payload.get("estimated_members") is not None:
+        try:
+            normalized["estimated_members"] = int(payload.get("estimated_members"))
+        except (TypeError, ValueError) as exc:
+            raise OutreachIntakeError("estimated_members must be an integer") from exc
+    for field in ("fit_evidence", "merchandise_check"):
+        value = str(payload.get(field) or "").strip()
+        if value:
+            normalized[field] = value[:400]
+    return normalized
 
 
 def _download_public_image(url: str, maximum_bytes: int) -> bytes:
@@ -299,7 +316,11 @@ def _prepare_remote_logo(
     maximum_pixels = int(getattr(core, "MAX_IMAGE_PIXELS", 40_000_000))
     try:
         prepared, report = outreach_logo.prepare(
-            core, image, organization=organization, is_vector=is_svg
+            core,
+            image,
+            organization=organization,
+            is_vector=is_svg,
+            allow_recreation=False,
         )
     except ValueError as exc:
         raise OutreachIntakeError(str(exc)) from exc

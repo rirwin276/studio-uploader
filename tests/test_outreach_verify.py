@@ -129,6 +129,56 @@ def test_relative_and_lazy_header_logo_urls_are_found():
     assert urls == ["https://club.org/images/logo.png"]
 
 
+def test_largest_official_srcset_logo_is_preferred():
+    html = '''
+        <img class="site-header logo" src="/logo-120.png"
+             srcset="/logo-240.png 240w, /logo-1200.png 1200w">
+    '''
+    urls = outreach_verify._logo_candidates_from_html(html, "https://club.org/")
+    assert urls[0] == "https://club.org/logo-1200.png"
+
+
+# ---- existing merchandise and obvious scale -------------------------------
+
+
+def test_an_official_merch_link_disqualifies_the_candidate(site):
+    site["https://club.org/"] = '<nav><a href="/team-store">Team Store</a></nav>'
+    found, why = outreach_verify.existing_merchandise("https://club.org/")
+    assert found
+    assert "merchandise" in why
+
+
+def test_an_external_merch_vendor_link_disqualifies_the_candidate(site):
+    site["https://club.org/"] = (
+        '<a href="https://club.squadlocker.com/">Order uniforms and shirts</a>'
+    )
+    found, _why = outreach_verify.existing_merchandise("https://club.org/")
+    assert found
+
+
+def test_normal_contact_and_registration_links_are_not_mistaken_for_merch(site):
+    site["https://club.org/"] = (
+        '<a href="/contact">Contact</a><a href="/registration">Registration</a>'
+    )
+    found, why = outreach_verify.existing_merchandise("https://club.org/")
+    assert not found
+    assert why == ""
+
+
+def test_a_site_advertising_hundreds_of_members_is_too_large(site):
+    site["https://club.org/"] = '<p>Serving over 850 athletes across the region.</p>'
+    fits, why = outreach_verify.small_group_fit("https://club.org/")
+    assert not fits
+    assert "850" in why
+
+
+def test_a_plain_small_club_site_passes_the_scale_gate(site):
+    site["https://club.org/"] = '<p>Our local rowing club practices twice weekly.</p>'
+    fits, why = outreach_verify.small_group_fit("https://club.org/")
+    assert fits
+    assert why == ""
+
+
 # ---- finding a published contact email ------------------------------------
 
 

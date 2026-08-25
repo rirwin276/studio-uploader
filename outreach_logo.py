@@ -438,6 +438,7 @@ def prepare(
     *,
     organization: str = "",
     is_vector: bool = False,
+    allow_recreation: bool = True,
 ) -> Tuple[Image.Image, Dict[str, Any]]:
     """Take a cleaned logo up to the print standard, however that has to happen.
 
@@ -466,6 +467,12 @@ def prepare(
 
     if report["verdict"] in {"original", "upscaled"}:
         return _flatten_invisible(_to_target(core, cropped)), report
+
+    if not allow_recreation:
+        raise ValueError(
+            f"{report['reason']}; outreach logos are never AI-redrawn, so a larger "
+            "official PNG or SVG is required"
+        )
 
     if not recreation_available():
         raise ValueError(
