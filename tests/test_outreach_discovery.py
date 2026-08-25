@@ -397,6 +397,18 @@ def test_the_rotation_wraps_instead_of_running_out(wired, monkeypatch):
     assert seen[-1]  # still producing a focus after wrapping
 
 
+def test_veteran_community_groups_are_an_occasional_qualified_category():
+    """They are eligible, but listed last so they do not displace core clubs."""
+    category = "veteran_community_groups"
+
+    assert category in outreach_discovery.CATEGORY_DEFINITIONS
+    assert outreach_discovery.CATEGORY_ROTATION[-1] == category
+
+    brief = outreach_discovery._brief(5, [])
+    assert "small local veteran community chapter may qualify" in brief
+    assert "active-duty units, bases, DoD offices" in brief
+
+
 def test_recent_categories_are_fed_back_as_things_to_skip(wired, monkeypatch):
     core, _ledger, _submitted = wired
     _answer(monkeypatch, [_candidate()])

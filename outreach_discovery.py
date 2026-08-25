@@ -192,6 +192,12 @@ CATEGORY_DEFINITIONS = {
     "precision_and_league_sports": (
         "small local bowling, darts, cornhole or amateur-golf competition clubs"
     ),
+    # Intentionally last: veteran groups are a worthwhile adjacent fit, but
+    # they should rotate in rather than displace the core small-club search.
+    "veteran_community_groups": (
+        "small local veteran peer-support, volunteer, riding, activity or social chapters "
+        "with recurring local events — not active-duty units, bases or national headquarters"
+    ),
 }
 CATEGORY_ROTATION = list(CATEGORY_DEFINITIONS)
 _CATEGORIES_PER_RUN = 5
@@ -318,6 +324,7 @@ Who qualifies:
 - A genuinely small, independent local team or competition club with its own identity and approximately 10–150 active members. Smaller is better.
 - It has recurring practices, games, races, meets, tournaments or competitions. It is not merely a broad social-interest organization.
 - It is normally volunteer-run, coach-led or managed by a very small local staff, and likely lacks the time or budget to set up a merchandise program.
+- A small local veteran community chapter may qualify only when it has recurring local events or meetings, a clearly active member community, its own local contact and identity, and meets every other rule here. It is an occasional fit, not a reason to return a large national veteran organization.
 - They have a public website with a visible logo.
 - They have a contact email address published on their own website.
 - They do NOT already sell apparel online. Inspect the home page, navigation and linked pages for Store, Shop, Merch, Apparel, Spirit Wear, Team Store or Gear. Follow obvious external shop links too. If any merchandise exists, skip them.
@@ -326,7 +333,7 @@ Who qualifies:
 Skip immediately:
 - Anything with an existing online store, even a bad one.
 - Commercial dance studios, dance academies and multi-location gymnastics/cheer businesses.
-- Leagues, multi-team academies, multi-location businesses, established programs, schools, school districts, PTOs, booster clubs tied to a school, churches, Scout troops, military posts, municipal/county departments, universities, large nonprofits, franchises, national brands and pro teams.
+- Leagues, multi-team academies, multi-location businesses, established programs, schools, school districts, PTOs, booster clubs tied to a school, churches, Scout troops, active-duty units, bases, DoD offices, municipal/county departments, universities, large nonprofits, franchises, national brands and pro teams.
 - Organizations that are a program inside a larger institution rather than an independent local group with its own identity.
 - Organizations that appear to have more than 150 active members. Do not return 150 as a placeholder when the size is unknown.
 - Anyone whose only contact is a web form with no email address.
