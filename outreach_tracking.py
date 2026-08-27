@@ -24,9 +24,45 @@ OUTREACH_SOURCES = frozenset({
     "vendor_neutral_outreach_intake",
 })
 
+# Website visitors who deliberately choose "try before signing up" use the
+# same one-product demo machinery as outreach prospects, but they are not an
+# outreach lead.  Keep the source and store state exact so retention, reporting
+# and the ordinary account-first request form cannot bleed into one another.
+ANONYMOUS_DEMO_SOURCE = "anonymous_demo"
+ANONYMOUS_DEMO_STORE_STATUS = "anonymous_demo_unclaimed"
+
 
 def is_outreach_source(value: Any) -> bool:
     return str(value or "").strip().lower() in OUTREACH_SOURCES
+
+
+def is_anonymous_demo_source(value: Any) -> bool:
+    return str(value or "").strip().lower() == ANONYMOUS_DEMO_SOURCE
+
+
+def is_demo_source(value: Any) -> bool:
+    return is_outreach_source(value) or is_anonymous_demo_source(value)
+
+
+def is_unclaimed_demo_state(state: Dict[str, Any]) -> bool:
+    """Return true only for one of the two explicitly supported demo states.
+
+    A website request with a missing owner must never become a demo merely
+    because it happens to be unclaimed.  The source/state pair is the boundary.
+    """
+    if not isinstance(state, dict):
+        return False
+    source = str(state.get("source") or "").strip().lower()
+    store_status = str(state.get("store_status") or "").strip().lower()
+    claim_status = str(state.get("claim_status") or "unclaimed").strip().lower()
+    if claim_status != "unclaimed":
+        return False
+    if source in OUTREACH_SOURCES:
+        return store_status == "prospect_unclaimed"
+    return (
+        source == ANONYMOUS_DEMO_SOURCE
+        and store_status == ANONYMOUS_DEMO_STORE_STATUS
+    )
 
 
 def utc_iso(value: Optional[float] = None) -> str:
