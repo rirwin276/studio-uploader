@@ -189,6 +189,26 @@ def test_a_website_store_is_never_treated_as_a_prospect(monkeypatch):
     assert state.json()["enabled"] is False
 
 
+def test_anonymous_demo_uses_same_one_product_controls_but_separate_state(monkeypatch):
+    client, states = _client(monkeypatch, source="anonymous_demo")
+    states["example-club"]["store_status"] = "anonymous_demo_unclaimed"
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is True
+
+    prospect_demo.mark_claimed(FakeCore(), "example-club", "101")
+    assert states["example-club"]["claim_status"] == "claimed"
+    assert states["example-club"]["expires_at"] is None
+
+
+def test_anonymous_source_with_outreach_state_is_rejected(monkeypatch):
+    client, _states = _client(monkeypatch, source="anonymous_demo")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+
+
 def test_a_claimed_store_offers_no_demo_even_if_the_ledger_missed_the_claim(monkeypatch):
     """The join route grants the claim in Shopify, then calls mark_claimed inside
     a try/except so demo bookkeeping can never fail a claim that already

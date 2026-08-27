@@ -210,6 +210,17 @@ except Exception:
     log.exception("Could not install prospect demo routes")
 
 
+# Public try-before-signup demos reuse the same provisioner and one-product
+# controls, but live behind their own off-by-default feature flag and exact
+# source/state pair. Disabling the entry route does not alter existing flows.
+try:
+    from anonymous_demo import install_anonymous_demo_routes
+
+    install_anonymous_demo_routes(app, core)
+except Exception:
+    log.exception("Could not install anonymous demo routes")
+
+
 # Prospect discovery. Inert without OPENAI_API_KEY, and the nightly run stays
 # off until OUTREACH_DISCOVERY_ENABLED is set — on-demand runs still work, so
 # the brief can be tried out before it is allowed to fire by itself.
@@ -249,6 +260,16 @@ try:
     install_outreach_retention_scheduler(core)
 except Exception:
     log.exception("Could not install outreach retention scheduler")
+
+
+# Anonymous website demos have a strict 48-hour lifetime after readiness.
+# This worker is separate from outreach retention and independently gated.
+try:
+    from anonymous_demo_retention import install_anonymous_demo_retention_scheduler
+
+    install_anonymous_demo_retention_scheduler(core)
+except Exception:
+    log.exception("Could not install anonymous demo retention scheduler")
 
 
 # Follow-ups are isolated from intake/build behavior and remain inert unless
