@@ -5787,6 +5787,79 @@ async def admin_store_delete_product(handle: str, product_id: str, request: Requ
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+@app.post("/admin/store/{handle}/products/{product_id:path}/pin")
+async def admin_store_pin_product(handle: str, product_id: str, request: Request):
+    """
+    Admin-only. Pin or unpin a product so it shows first on the storefront.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"pinned": true|false}
+    Returns: {"ok": true, "id": "...", "pinned": true|false, "tag": "pinned--<handle>"}
+
+    The pin is stored as a TAG, not a new field. Tags already carry every other
+    per-product fact this system depends on — collection membership, editor
+    routing, pricing keys — so this needs no schema change and no new store.
+
+    It has to live outside Shopify's own ordering because each store's
+    collection is a SMART collection (auto-populated by the store-handle tag),
+    and Shopify smart collections cannot hold a manual product order at all.
+    The storefront applies the order instead.
+
+    tagsAdd / tagsRemove are used rather than productUpdate(tags: [...]) on
+    purpose: they are additive, so they cannot clobber the build tags that
+    editor routing and pricing rely on. A full tags array would require a
+    read-modify-write and would lose any tag written concurrently by a builder.
+    """
+    from urllib.parse import unquote
+
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    product_gid = unquote(product_id).strip()
+    if not product_gid:
+        return JSONResponse({"error": "product_id is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    pinned = body.get("pinned")
+    if pinned is None:
+        return JSONResponse({"error": "pinned field is required"}, status_code=400)
+    pinned = bool(pinned)
+
+    tag = f"pinned--{handle}"
+
+    mutation = """
+    mutation pin($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
+    }
+    """ if pinned else """
+    mutation unpin($id: ID!, $tags: [String!]!) {
+      tagsRemove(id: $id, tags: $tags) { userErrors { field message } }
+    }
+    """
+    field = "tagsAdd" if pinned else "tagsRemove"
+
+    try:
+        data = _shopify_graphql(mutation, {"id": product_gid, "tags": [tag]})
+        errs = ((data.get(field) or {}).get("userErrors")) or []
+        if errs:
+            raise RuntimeError(f"{field} userErrors: {json.dumps(errs)}")
+        return {"ok": True, "id": product_gid, "pinned": pinned, "tag": tag}
+    except RuntimeError as e:
+        log.exception("pin product failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        log.exception("pin product failed: %s", e)
+        return JSONResponse({"error": f"pin failed: {e}"}, status_code=500)
+
+
 @app.get("/store/{handle}/status")
 async def store_status(handle: str):
     """
