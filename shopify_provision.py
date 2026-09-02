@@ -355,6 +355,66 @@ def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Di
         time.sleep(2)
 
 
+# -----------------------------------------------------------------------------
+# The logo URL, as text
+# -----------------------------------------------------------------------------
+# Shopify resolves at most twenty metaobject FILE references per request. The
+# seller dashboard draws one card per store and each card that resolves its
+# `logo` reference spends one of those twenty, so a seller with more than twenty
+# stores gets logos on the first twenty and blank frames on the rest. Measured
+# on a real account: cards 1-20 drew a logo, 21-36 drew nothing.
+#
+# Reading a text field costs nothing against that budget, and the logo's CDN URL
+# is already in hand here — upload_png_to_shopify_files returns it and it was
+# being thrown away. Writing it as text means the dashboard never has to resolve
+# the reference at all.
+#
+# Which key to write is decided from the definition rather than assumed. An
+# unknown key fails the whole metaobjectUpsert, and this call is on the path
+# that creates a customer's store: getting a logo onto a dashboard is not worth
+# risking a provision over.
+_LOGO_URL_KEYS = ("logo_url", "logo_clean_url")
+
+_definition_field_keys_cache: Dict[str, set] = {}
+
+
+def metaobject_definition_field_keys(type_name: str) -> set:
+    """The field keys the metaobject definition actually declares."""
+    if type_name in _definition_field_keys_cache:
+        return _definition_field_keys_cache[type_name]
+
+    q = """
+    query DefFields($type: String!) {
+      metaobjectDefinitionByType(type: $type) {
+        fieldDefinitions { key }
+      }
+    }
+    """
+    keys: set = set()
+    try:
+        data = shopify_graphql(q, {"type": type_name})
+        definition = (data or {}).get("metaobjectDefinitionByType") or {}
+        for field in definition.get("fieldDefinitions") or []:
+            key = (field.get("key") or "").strip()
+            if key:
+                keys.add(key)
+    except Exception as exc:  # never block a provision over a nice-to-have
+        print(f"⚠️  Could not read {type_name} field definitions: {exc}")
+        return set()
+
+    _definition_field_keys_cache[type_name] = keys
+    return keys
+
+
+def logo_url_field(type_name: str = "") -> str:
+    """The definition's text field for the logo URL, or '' if it has none."""
+    declared = metaobject_definition_field_keys(type_name or METAOBJECT_TYPE)
+    for key in _LOGO_URL_KEYS:
+        if key in declared:
+            return key
+    return ""
+
+
 def upload_png_to_shopify_files(png_bytes: bytes, filename: str, alt: str) -> Tuple[str, str]:
     target = staged_upload_create(filename=filename, mime_type="image/png")
     resource_url = staged_upload_post(target, png_bytes, mime_type="image/png")
@@ -536,6 +596,7 @@ def metaobject_upsert_custom_shop(
     type_of_store: Optional[str],
     is_fully_ready: bool,
     primary_color: Optional[str],
+    logo_file_url: str = "",
 ) -> str:
     q = """
     mutation metaobjectUpsert($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
@@ -560,6 +621,22 @@ def metaobject_upsert_custom_shop(
         {"key": "status", "value": status_value},
         {"key": "primary_color", "value": primary_color_value},
     ]
+
+    # The logo's URL as text, so the dashboard never spends one of Shopify's
+    # twenty per-request file-reference resolutions on this store. Written only
+    # to a key the definition declares — an unknown key fails the whole upsert,
+    # and this is the call that creates the customer's store.
+    if logo_file_url:
+        url_key = logo_url_field()
+        if url_key:
+            fields.append({"key": url_key, "value": logo_file_url})
+        else:
+            print(
+                "⚠️  custom_shop declares no logo_url/logo_clean_url text field; "
+                "the dashboard will keep resolving logo references and will run "
+                "out after twenty stores. Add a single-line-text field named "
+                "'logo_url' to the definition."
+            )
 
     if secondary_logo_file_gid:
         fields.append({"key": "secondary_logo", "value": secondary_logo_file_gid})
@@ -789,6 +866,7 @@ def provision(
         handle=handle,
         name=storefront_name,
         logo_file_gid=main_file_gid,
+        logo_file_url=main_file_url or "",
         owner_customer_id_text=owner_customer_id_text,
         collection_gid=collection_gid,
         collection_handle=handle,
