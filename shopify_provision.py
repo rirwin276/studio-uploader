@@ -373,6 +373,20 @@ def file_wait_ready(file_id: str, max_wait_s: int = FILE_READY_MAX_WAIT_S) -> Di
 # unknown key fails the whole metaobjectUpsert, and this call is on the path
 # that creates a customer's store: getting a logo onto a dashboard is not worth
 # risking a provision over.
+def logo_url_for_text(url: str, width: int = 512) -> str:
+    """The logo URL as the dashboard wants to use it: sized.
+
+    The stored string goes straight into an <img src> at 92px, so a raw CDN
+    URL means every card downloads a full-resolution logo. Shopify sizes from
+    the query string, and 512 covers the largest frame at 3x — the same width
+    the theme asked image_url for when it still resolved the reference.
+    """
+    clean = (url or "").strip()
+    if not clean or "width=" in clean:
+        return clean
+    return clean + ("&" if "?" in clean else "?") + ("width=%d" % width)
+
+
 _LOGO_URL_KEYS = ("logo_url", "logo_clean_url")
 
 _definition_field_keys_cache: Dict[str, set] = {}
@@ -629,7 +643,7 @@ def metaobject_upsert_custom_shop(
     if logo_file_url:
         url_key = logo_url_field()
         if url_key:
-            fields.append({"key": url_key, "value": logo_file_url})
+            fields.append({"key": url_key, "value": logo_url_for_text(logo_file_url)})
         else:
             print(
                 "⚠️  custom_shop declares no logo_url/logo_clean_url text field; "

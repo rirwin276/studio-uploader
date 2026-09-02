@@ -81,7 +81,7 @@ def test_url_is_written_to_the_definitions_own_field(monkeypatch):
     sent = _capture(monkeypatch, ["name", "logo", "logo_url", "status"])
     _upsert()
     fields = _fields(sent)
-    assert fields["logo_url"] == "https://cdn.example/logo.png"
+    assert fields["logo_url"] == "https://cdn.example/logo.png?width=512"
     # The reference is still written: it is the source of truth, and the text
     # copy only exists so the dashboard does not have to resolve it.
     assert fields["logo"] == "gid://shopify/MediaImage/1"
@@ -90,14 +90,14 @@ def test_url_is_written_to_the_definitions_own_field(monkeypatch):
 def test_falls_back_to_the_older_clean_url_field(monkeypatch):
     sent = _capture(monkeypatch, ["name", "logo", "logo_clean_url"])
     _upsert()
-    assert _fields(sent)["logo_clean_url"] == "https://cdn.example/logo.png"
+    assert _fields(sent)["logo_clean_url"] == "https://cdn.example/logo.png?width=512"
 
 
 def test_prefers_logo_url_when_both_exist(monkeypatch):
     sent = _capture(monkeypatch, ["logo", "logo_url", "logo_clean_url"])
     _upsert()
     fields = _fields(sent)
-    assert fields.get("logo_url") == "https://cdn.example/logo.png"
+    assert fields.get("logo_url") == "https://cdn.example/logo.png?width=512"
     # logo_clean_url is the older background-removed copy and means something
     # different; writing the plain logo there when a proper field exists would
     # quietly redefine it.
@@ -128,3 +128,15 @@ def test_no_url_writes_no_text_field(monkeypatch):
     sent = _capture(monkeypatch, ["logo", "logo_url"])
     _upsert(url="")
     assert "logo_url" not in _fields(sent)
+
+
+def test_the_stored_url_is_sized_for_the_card(monkeypatch):
+    """A raw CDN URL goes straight into an <img> at 92px, so every card would
+    pull a full-resolution logo. 512 is what the theme asked for when it still
+    resolved the reference."""
+    assert sp.logo_url_for_text("https://cdn/x.png") == "https://cdn/x.png?width=512"
+    # Shopify's own URLs already carry a version parameter.
+    assert sp.logo_url_for_text("https://cdn/x.png?v=1") == "https://cdn/x.png?v=1&width=512"
+    # Never twice.
+    assert sp.logo_url_for_text("https://cdn/x.png?width=512") == "https://cdn/x.png?width=512"
+    assert sp.logo_url_for_text("") == ""

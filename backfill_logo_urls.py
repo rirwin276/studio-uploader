@@ -128,6 +128,8 @@ def main() -> int:
             skipped_no_logo += 1
             continue
 
+        url = sp.logo_url_for_text(url)
+
         if args.dry_run:
             print("  would fill %s -> %s" % (handle, url))
             filled += 1
