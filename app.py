@@ -210,7 +210,7 @@ def _sess_get(session_id: str) -> Dict[str, Any]:
 # ----------------------------
 # Shopify Admin API helpers
 # ----------------------------
-def _shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+def _shopify_graphql(query: str, variables: Dict[str, Any], *, timeout: int = 60) -> Dict[str, Any]:
     """Direct Shopify Admin GraphQL call (used by leave/nuke endpoints)."""
     if not _SHOPIFY_SHOP or not _SHOPIFY_ACCESS_TOKEN:
         raise RuntimeError("Shopify Admin API credentials not configured (SHOP / CLIENT_SECRET)")
@@ -219,7 +219,7 @@ def _shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": _SHOPIFY_ACCESS_TOKEN,
     }
-    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=60)
+    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=timeout)
     r.raise_for_status()
     payload = r.json()
     if payload.get("errors"):
@@ -5975,6 +5975,15 @@ async def store_status(handle: str):
         "slept_at": slept_at,
         "last_active": last_active,
     }
+
+
+from dashboard_state import dashboard_router
+
+app.include_router(dashboard_router(
+    lambda query, variables: _shopify_graphql(query, variables, timeout=12),
+    lambda: os.getenv("METAOBJECT_TYPE", "custom_shop").strip(),
+    lambda: _FR_METAOBJECT_TYPE,
+))
 
 
 @app.get("/store/{handle}/ready-status")
