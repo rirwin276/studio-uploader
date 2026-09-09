@@ -329,6 +329,16 @@ def _normalize_store_owner(customer_id: str) -> str:
     return owner_id
 
 
+def _is_platform_operator(tags: list) -> bool:
+    """Platform access is independent of a store's customer ownership.
+
+    Use the same Shopify-maintained tag as the storefront access gate. A
+    store-specific admin tag is deliberately NOT an operator designation.
+    Callers must supply tags read from Shopify, never form/body role flags.
+    """
+    return any(str(tag).strip().lower() == "super-admin" for tag in tags)
+
+
 def _get_custom_shop(handle: str) -> Optional[Dict[str, Any]]:
     """Return a custom_shop metaobject and its fields, or None when absent."""
     metaobject_type = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()
@@ -1434,6 +1444,31 @@ async def storefront_request(
         if not customer_id:
             return JSONResponse({"error": "customer_id is required"}, status_code=400)
         owner_customer_id = customer_id.split("/")[-1].strip()
+        # The usual form is also the founder's build-for-someone form. His
+        # global management access must not consume the first CUSTOMER claim.
+        # Resolve the creator's existing role on Shopify; do not accept a
+        # browser-supplied role or weaken the explicit claimable API above.
+        try:
+            creator_tags = _get_customer_tags(_ensure_gid_customer(owner_customer_id))
+            if creator_tags is None:
+                return JSONResponse({"error": "Customer not found"}, status_code=404)
+            if _is_platform_operator(creator_tags):
+                # Never turn an existing customer store into an unclaimed one
+                # when the operator submits a duplicate name/handle.
+                if _get_custom_shop(storefront_handle.strip()) is not None:
+                    return JSONResponse(
+                        {"error": "A store already uses this handle. Choose a different store name to build a new store."},
+                        status_code=409,
+                    )
+                owner_customer_id = ""
+                claimable = True
+        except Exception:
+            # Do not guess ownership when Shopify is unavailable. Retrying
+            # here is safe: no upload/provisioning job has been started yet.
+            return JSONResponse(
+                {"error": "Could not verify store ownership. Please try again."},
+                status_code=502,
+            )
     # type_of_store_direct is the pre-computed slug from the hidden field added by the Shopify form.
     # Use it when present; otherwise derive the slug from org_type + sub-field.
     if type_of_store_direct and type_of_store_direct.strip():
@@ -1780,6 +1815,21 @@ async def storefront_join(handle: str, request: Request):
 
         if custom_shop is None:
             return JSONResponse({"error": "Store not found"}, status_code=404)
+
+        if _is_platform_operator(tags):
+            # Opening his own invitation must not let the founder claim the
+            # customer slot, change an existing owner, or mark outreach claimed.
+            # The super-admin tag already supplies management access everywhere.
+            return {
+                "ok": True,
+                "role": "admin",
+                "claimed_admin": False,
+                "already_member": member_tag in tags,
+                "already_admin": True,
+                "member_tag": member_tag if member_tag in tags else None,
+                "admin_tag": admin_tag if admin_tag in tags else None,
+                "platform_operator": True,
+            }
 
         fields = custom_shop["fields"]
         owner_id = _normalize_store_owner(fields.get("owner_customer_id") or "")
