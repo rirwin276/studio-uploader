@@ -171,6 +171,10 @@ try:
     from command_center import install_command_center_routes
 
     install_command_center_routes(app, core)
+    from command_center_fast import install_fast_routes
+    from site_sessions import install_session_routes
+    install_fast_routes(app, core)
+    install_session_routes(app, core)
 except Exception:
     log.exception("Could not install Command Center routes")
 
