@@ -318,10 +318,19 @@ def test_anonymous_preview_can_build_again_but_not_concurrently(monkeypatch):
     state = client.get(path+'/demo-state',headers=_headers()).json()
     assert state['product_status'] == 'available'
     assert state['last_product_status'] == 'completed'
-    assert state['product_limit'] == 0
+    assert state['product_limit'] == 2
+    assert state['products_created'] == 1
+    assert state['products_remaining'] == 1
     # Replaying the same completed builder cannot create an extra product.
     assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'bc3413','request_id':'first','job_id':'repeat'}).status_code == 409
-    assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'m2580','request_id':'second','job_id':'two'}).status_code == 200
+    second = client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'m2580','request_id':'second','job_id':'two'})
+    assert second.status_code == 200
+    assert client.post(path+'/demo-product/complete',headers=_headers(),json={'reservation_id':second.json()['reservation_id'],'product_id':'gid://shopify/Product/456'}).status_code == 200
+    capped = client.get(path+'/demo-state',headers=_headers()).json()
+    assert capped['products_created'] == 2
+    assert capped['products_remaining'] == 0
+    assert capped['product_status'] == 'completed'
+    assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'nl6733','request_id':'third','job_id':'three'}).status_code == 409
 
 
 def test_anonymous_design_denied_when_shopify_owner_check_fails():

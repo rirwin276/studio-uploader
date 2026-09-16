@@ -149,6 +149,23 @@ def _demo(state: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+def _product_limit(state: Dict[str, Any], demo: Dict[str, Any]) -> int:
+    if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+        return 2
+    try:
+        return max(1, int(demo.get("product_limit") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _products_created(demo: Dict[str, Any]) -> int:
+    counts = demo.get("event_counts") or {}
+    try:
+        return max(0, int(counts.get("demo_product_successfully_created") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _public_state(
     handle: str,
     state: Dict[str, Any],
@@ -159,6 +176,10 @@ def _public_state(
     authoritative. Without it this falls back to the ledger, which can only be
     stale in the permissive direction."""
     demo = _demo(state)
+    product_limit = _product_limit(state, demo)
+    products_created = _products_created(demo)
+    stored_status = demo.get("product_status") or "available"
+    can_build_another = products_created < product_limit
     if unclaimed is None:
         unclaimed = _is_unclaimed_prospect(state)
     return {
@@ -168,11 +189,13 @@ def _public_state(
         "store_status": state.get("store_status") or "",
         "claim_status": state.get("claim_status") or "unclaimed",
         "enabled": unclaimed and bool(demo.get("enabled", True)),
-        "product_limit": 0 if outreach_tracking.is_anonymous_demo_source(state.get("source")) else 1,
-        "last_product_status": demo.get("product_status") or "available",
+        "product_limit": product_limit,
+        "products_created": products_created,
+        "products_remaining": max(0, product_limit - products_created),
+        "last_product_status": stored_status,
         "product_status": (
             "available" if outreach_tracking.is_anonymous_demo_source(state.get("source"))
-            and demo.get("product_status") == "completed" else demo.get("product_status") or "available"
+            and stored_status == "completed" and can_build_another else stored_status
         ),
         "product_model": demo.get("product_model"),
         "product_id": demo.get("product_id"),
@@ -380,11 +403,23 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 return JSONResponse({"error": "Store is not an unclaimed prospect"}, status_code=409)
             demo = _demo(state)
             status = str(demo.get("product_status") or "available")
-            # Testing the builder must not spend the prospect's one free
-            # product. Finding it already used, by someone they never met, is
+            product_limit = _product_limit(state, demo)
+            products_created = _products_created(demo)
+            # Staff testing must not spend either of the prospect's free
+            # products. Finding the preview used by someone they never met is
             # a worse first impression than the demo is a good one.
             if staff and status in {"reserved", "building", "completed"}:
                 status = "available"
+            if not staff and products_created >= product_limit:
+                return JSONResponse(
+                    {
+                        "error": f"You created both preview products. Claim your free store to build more.",
+                        "product_status": "completed",
+                        "product_limit": product_limit,
+                        "products_created": products_created,
+                    },
+                    status_code=409,
+                )
             if (status == "completed" and outreach_tracking.is_anonymous_demo_source(state.get("source"))
                     and demo.get("request_id") != request_id):
                 status = "available"

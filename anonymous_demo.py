@@ -544,7 +544,7 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             "resume_token_hash": _token_hash(token),
             "prospect_demo": {
                 "enabled": True,
-                "product_limit": 0,
+                "product_limit": 2,
                 "product_status": "available",
                 "event_counts": {"anonymous_demo_started": 1},
                 "events": [{"event": "anonymous_demo_started", "at": created_at}],

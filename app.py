@@ -304,6 +304,32 @@ def _customer_add_tag(customer_gid: str, tag: str) -> None:
         raise RuntimeError(f"customerUpdate userErrors: {json.dumps(errs)}")
 
 
+def _customer_add_tags(customer_gid: str, tags: list[str]) -> None:
+    """Atomically add access tags without a read/replace race.
+
+    Claiming used to call ``_customer_add_tag`` twice. Shopify customer-tag
+    reads can lag a just-finished write, so the member-tag call could read the
+    old list and overwrite the admin tag that had been added milliseconds
+    earlier. ``tagsAdd`` merges both tags in one mutation and cannot erase an
+    existing tag.
+    """
+    wanted = list(dict.fromkeys(str(tag).strip() for tag in tags if str(tag).strip()))
+    if not wanted:
+        return
+    q = """
+    mutation addCustomerStoreTags($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node { id }
+        userErrors { field message }
+      }
+    }
+    """
+    res = _shopify_graphql(q, {"id": customer_gid, "tags": wanted})
+    errs = (res.get("tagsAdd") or {}).get("userErrors") or []
+    if errs:
+        raise RuntimeError(f"tagsAdd userErrors: {json.dumps(errs)}")
+
+
 _STORE_CLAIM_NAMESPACE = "stella_sage"
 _STORE_CLAIM_KEY = "claim_owner_customer_id"
 _STORE_UNCLAIMED_OWNER = "unclaimed"
@@ -1806,6 +1832,8 @@ async def storefront_join(handle: str, request: Request):
         print(f"[join] customer not found gid={customer_gid!r}")
         return JSONResponse({"error": "Customer not found"}, status_code=404)
 
+    platform_operator = _is_platform_operator(tags)
+
     with _store_claim_lock(handle):
         try:
             custom_shop = _get_custom_shop(handle)
@@ -1815,21 +1843,6 @@ async def storefront_join(handle: str, request: Request):
 
         if custom_shop is None:
             return JSONResponse({"error": "Store not found"}, status_code=404)
-
-        if _is_platform_operator(tags):
-            # Opening his own invitation must not let the founder claim the
-            # customer slot, change an existing owner, or mark outreach claimed.
-            # The super-admin tag already supplies management access everywhere.
-            return {
-                "ok": True,
-                "role": "admin",
-                "claimed_admin": False,
-                "already_member": member_tag in tags,
-                "already_admin": True,
-                "member_tag": member_tag if member_tag in tags else None,
-                "admin_tag": admin_tag if admin_tag in tags else None,
-                "platform_operator": True,
-            }
 
         fields = custom_shop["fields"]
         owner_id = _normalize_store_owner(fields.get("owner_customer_id") or "")
@@ -1880,16 +1893,19 @@ async def storefront_join(handle: str, request: Request):
                 return JSONResponse({"error": f"Failed to claim store: {e}"}, status_code=502)
 
         try:
+            access_tags = [member_tag]
             if claimed_admin:
-                _customer_add_tag(customer_gid, admin_tag)
-            _customer_add_tag(customer_gid, member_tag)
+                access_tags.insert(0, admin_tag)
+            _customer_add_tags(customer_gid, access_tags)
         except Exception as e:
             role = "admin/member" if claimed_admin else "member"
             print(f"[join] FAILED to add {role} tags handle={handle!r} gid={customer_gid!r}: {e}")
             return JSONResponse({"error": f"Failed to grant store access: {e}"}, status_code=502)
 
-    already_member = member_tag in tags
-    already_admin = admin_tag in tags
+    # Report the access that now exists, not only the stale pre-mutation tag
+    # snapshot read at the start of the request.
+    already_member = True
+    already_admin = claimed_admin or admin_tag in tags
     role = "admin" if claimed_admin else "member"
     if claimed_admin:
         # Outreach/demo bookkeeping is additive and must never turn a
@@ -1909,6 +1925,7 @@ async def storefront_join(handle: str, request: Request):
         "already_admin": already_admin,
         "member_tag": member_tag,
         "admin_tag": admin_tag if claimed_admin else None,
+        "platform_operator": platform_operator,
     }
 
 
