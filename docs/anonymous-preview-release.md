@@ -30,7 +30,7 @@ The connected browser uses a platform administrator account. That role deliberat
 
 ## Deployment references
 
-- Theme start: https://stellasageco.com/pages/storefront?view=start-team-store&preview_theme_id=166579110138
+- Theme start: https://stellasageco.com/pages/request-storefront-form?view=start-team-store&preview_theme_id=166579110138
 - Preview API: https://anonymous-demo-preview-production.up.railway.app
 - Draft builder: https://anonymous-draft-builder-production.up.railway.app
 - Theme PR: https://github.com/rirwin276/Shopify-code/pull/201

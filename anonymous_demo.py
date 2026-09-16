@@ -157,7 +157,7 @@ def _store_urls(handle: str) -> Dict[str, str]:
     theme_id = os.getenv("ANONYMOUS_PREVIEW_THEME_ID", "").strip()
     suffix = f"&preview_theme_id={theme_id}" if theme_id.isdigit() else ""
     if os.getenv("ANONYMOUS_PREVIEW_BUILDER_URL", ""):
-        base = f"https://stellasageco.com/pages/storefront?view=anonymous-preview&shop={handle}"
+        base = f"https://stellasageco.com/pages/request-storefront-form?view=anonymous-preview&shop={handle}"
         return {"preview_url": base + suffix, "admin_url": base + "&tab=admin" + suffix,
                 "claim_url": base + "&tab=activate" + suffix}
     return {
@@ -186,7 +186,7 @@ def _send_ready_email(email: str, name: str, token: str) -> None:
         port = int(os.getenv("SMTP_PORT", "587"))
     except ValueError:
         port = 587
-    link = f"https://stellasageco.com/pages/start-team-store#resume={token}"
+    link = f"https://stellasageco.com/pages/request-storefront-form?view=start-team-store#resume={token}"
     message = MIMEText(
         f"Your temporary Stella & Sage store for {name} is ready.\n\n"
         f"Return to your demo: {link}\n\n"
