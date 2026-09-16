@@ -54,6 +54,8 @@ class FakeCore:
 
 
 def _setup(monkeypatch):
+    import anonymous_preview_api
+    monkeypatch.setattr(anonymous_preview_api, "builder_ready", lambda: True)
     monkeypatch.setenv("ANONYMOUS_DEMO_ENABLED", "true")
     monkeypatch.setenv("ANONYMOUS_DEMO_SECRET", "test-secret-that-is-at-least-thirty-two-bytes")
     monkeypatch.setattr(anonymous_demo, "_rate_allowed", lambda _request: True)

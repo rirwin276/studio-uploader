@@ -284,3 +284,8 @@ try:
     install_outreach_followup_scheduler(core)
 except Exception:
     log.exception("Could not install outreach follow-up scheduler")
+
+
+# Draft-only anonymous preview APIs.
+from anonymous_preview_api import install as install_anonymous_preview_api
+install_anonymous_preview_api(app, core)

@@ -154,6 +154,12 @@ def _slug(value: str) -> str:
 
 
 def _store_urls(handle: str) -> Dict[str, str]:
+    theme_id = os.getenv("ANONYMOUS_PREVIEW_THEME_ID", "").strip()
+    suffix = f"&preview_theme_id={theme_id}" if theme_id.isdigit() else ""
+    if os.getenv("ANONYMOUS_PREVIEW_BUILDER_URL", ""):
+        base = f"https://stellasageco.com/pages/storefront?view=anonymous-preview&shop={handle}"
+        return {"preview_url": base + suffix, "admin_url": base + "&tab=admin" + suffix,
+                "claim_url": base + "&tab=activate" + suffix}
     return {
         "preview_url": f"https://stellasageco.com/collections/{handle}?preview=1",
         "admin_url": f"https://stellasageco.com/pages/admin-powers?shop={handle}&prospect_demo=1",
@@ -281,7 +287,7 @@ def _tag_products(core: Any, product_ids: Iterable[str]) -> None:
         result = core._shopify_graphql(mutation, {"id": product_id, "tags": [_PRODUCT_TAG]})
         errors = ((result.get("tagsAdd") or {}).get("userErrors")) or []
         if errors:
-            raise RuntimeError("Unable to lock anonymous demo product checkout")
+            raise RuntimeError("Unable to mark anonymous demo product")
 
 
 def tag_product_if_anonymous(core: Any, state: Dict[str, Any], product_id: str) -> None:
@@ -420,6 +426,9 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
     ):
         if not enabled():
             return JSONResponse({"error": "Try-before-signup is not available"}, status_code=404)
+        from anonymous_preview_api import builder_ready
+        if not builder_ready():
+            return JSONResponse({"error": "The preview builder is temporarily unavailable. Please try again shortly."}, status_code=503)
         if not _secret():
             return JSONResponse({"error": "Try-before-signup is not configured"}, status_code=503)
         if not _origin_allowed(request):
