@@ -12,14 +12,14 @@ def test_unclaimed_or_deleting_products_never_activate(owner):
 
 def test_only_claimed_visible_products_activate(monkeypatch):
     calls = []
-    core = SimpleNamespace(_normalize_store_owner=lambda x:x)
+    core = SimpleNamespace(_normalize_store_owner=lambda x:x, _shopify_rest_put=lambda path,body:calls.append(("publish",body)))
     monkeypatch.setattr(api.outreach_tracking,"read",lambda *a:{})
     monkeypatch.setattr(api.outreach_tracking,"update",lambda *a:calls.append(("state",a[-1])))
-    monkeypatch.setattr(api,"products",lambda *a:[{"id":"visible","tags":[api.MARKER],"status":"DRAFT"},{"id":"hidden","tags":[api.MARKER,api.HIDDEN],"status":"DRAFT"}])
+    monkeypatch.setattr(api,"products",lambda *a:[{"id":"gid://shopify/Product/1","tags":[api.MARKER],"status":"DRAFT"},{"id":"hidden","tags":[api.MARKER,api.HIDDEN],"status":"DRAFT"}])
     monkeypatch.setattr(api,"mutate",lambda c,q,v,f:calls.append((f,v)))
     assert api.activate_claimed(core,"team-demo-abc123",{"fields":{"owner_customer_id":"123","is_fully_ready":"true"}})
-    updates=[v for kind,v in calls if kind=="productUpdate"]
-    assert updates == [{"input":{"id":"visible","status":"ACTIVE"}}]
+    updates=[v for kind,v in calls if kind=="publish"]
+    assert updates == [{"product":{"id":1,"status":"active","published":True}}]
 
 
 def test_product_search_results_require_exact_store_and_marker():

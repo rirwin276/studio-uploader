@@ -119,9 +119,10 @@ def activate_claimed(core, handle, shop=None):
     for product in products(core, handle):
         if HIDDEN in product.get("tags", []) or product.get("status") == "ACTIVE":
             continue
-        mutate(core, """mutation PreviewActivate($input: ProductInput!) {
-          productUpdate(input: $input) { product { id status } userErrors { message } }
-        }""", {"input": {"id": product["id"], "status": "ACTIVE"}}, "productUpdate")
+        product_id = str(product["id"]).rsplit("/", 1)[-1]
+        if not product_id.isdigit():
+            raise HTTPException(502, "Invalid product identifier")
+        core._shopify_rest_put(f"products/{product_id}.json", {"product": {"id": int(product_id), "status": "active", "published": True}})
     outreach_tracking.update(core, handle, {"claim_status": "claimed", "status": "claimed",
         "store_status": "claimed", "expires_at": None, "claimed_customer_id": owner})
     return True
