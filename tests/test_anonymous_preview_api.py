@@ -16,18 +16,19 @@ def test_only_claimed_visible_products_activate(monkeypatch):
     monkeypatch.setattr(api.outreach_tracking,"read",lambda *a:{})
     monkeypatch.setattr(api.outreach_tracking,"update",lambda *a:calls.append(("state",a[-1])))
     monkeypatch.setattr(api,"products",lambda *a:[{"id":"gid://shopify/Product/1","tags":[api.MARKER],"status":"DRAFT"},{"id":"hidden","tags":[api.MARKER,api.HIDDEN],"status":"DRAFT"}])
+    monkeypatch.setattr(api.demo,"_activate_store_products",lambda c,h:calls.append(("publish",{"product":{"id":1,"status":"active","published":True}})))
     monkeypatch.setattr(api,"mutate",lambda c,q,v,f:calls.append((f,v)))
     assert api.activate_claimed(core,"team-demo-abc123",{"fields":{"owner_customer_id":"123","is_fully_ready":"true"}})
     updates=[v for kind,v in calls if kind=="publish"]
     assert updates == [{"product":{"id":1,"status":"active","published":True}}]
 
 
-def test_product_search_results_require_exact_store_and_marker():
+def test_product_search_results_require_the_exact_store_handle():
     core=SimpleNamespace(_shopify_graphql=lambda *a:{"products":{"nodes":[
         {"id":"ours","tags":["team-demo-abc123",api.MARKER]},
         {"id":"another","tags":["other-demo-abc123",api.MARKER]},
         {"id":"not-preview","tags":["team-demo-abc123"]}],"pageInfo":{"hasNextPage":False}}})
-    assert [p["id"] for p in api.products(core,"team-demo-abc123")] == ["ours"]
+    assert [p["id"] for p in api.products(core,"team-demo-abc123")] == ["ours", "not-preview"]
 
 
 def test_bad_bearer_denied_before_shopify(monkeypatch):

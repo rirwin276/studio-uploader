@@ -89,7 +89,11 @@ def products(core, handle):
     while True:
         data = core._shopify_graphql(PRODUCT_QUERY, {"query": f"tag:{handle}", "after": after})["products"]
         for product in data.get("nodes") or []:
-            if handle in product.get("tags", []) and MARKER in product.get("tags", []):
+            # The unique store-handle tag is the collection's source of truth.
+            # Older/partial preview builds could miss MARKER, which previously
+            # made activation silently skip valid products and left a claimed
+            # store empty. Draft status still prevents checkout before claim.
+            if handle in product.get("tags", []):
                 result.append(product)
         page = data.get("pageInfo") or {}
         if not page.get("hasNextPage"):
@@ -117,13 +121,8 @@ def activate_claimed(core, handle, shop=None):
         return False
     if (state.get("prospect_demo") or {}).get("product_status") in {"reserved", "building"}:
         return False
-    for product in products(core, handle):
-        if HIDDEN in product.get("tags", []) or product.get("status") == "ACTIVE":
-            continue
-        product_id = str(product["id"]).rsplit("/", 1)[-1]
-        if not product_id.isdigit():
-            raise HTTPException(502, "Invalid product identifier")
-        core._shopify_rest_put(f"products/{product_id}.json", {"product": {"id": int(product_id), "status": "active", "published": True}})
+    store_products = products(core, handle)
+    demo._activate_store_products(core, handle)
     outreach_tracking.update(core, handle, {"claim_status": "claimed", "status": "claimed",
         "store_status": "claimed", "expires_at": None, "claimed_customer_id": owner})
     return True
@@ -134,8 +133,11 @@ def reconcile(core):
     for handle, state in outreach_tracking.list_all(core).items():
         if outreach_tracking.is_anonymous_demo_source(state.get("source")) and state.get("status") not in {"deleted", "deleting"}:
             try:
-                if not activate_claimed(core, handle) and state.get("status") in {"anonymous_building", "queued", "building", "provisioned"}:
-                    demo._refresh_readiness(core, handle)
+                if not activate_claimed(core, handle):
+                    if state.get("status") in {"anonymous_building", "queued", "building", "provisioned"}:
+                        demo._refresh_readiness(core, handle)
+                    elif state.get("status") == "ready":
+                        demo._activate_store_products(core, handle)
             except Exception:
                 # Leave state retryable; never mark a partially published store complete.
                 pass

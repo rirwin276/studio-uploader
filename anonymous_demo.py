@@ -153,13 +153,15 @@ def _slug(value: str) -> str:
     return (text or "team-store")[:72].rstrip("-")
 
 
-def _store_urls(handle: str) -> Dict[str, str]:
-    theme_id = os.getenv("ANONYMOUS_PREVIEW_THEME_ID", "").strip()
-    suffix = f"&preview_theme_id={theme_id}" if theme_id.isdigit() else ""
-    if os.getenv("ANONYMOUS_PREVIEW_BUILDER_URL", ""):
-        base = f"https://stellasageco.com/pages/request-storefront-form?view=anonymous-preview&shop={handle}"
-        return {"preview_url": base + suffix, "admin_url": base + "&tab=admin" + suffix,
-                "claim_url": base + "&tab=activate" + suffix}
+def _store_urls(handle: str, *, claimed: bool = False) -> Dict[str, str]:
+    if claimed:
+        store = f"https://stellasageco.com/collections/{handle}"
+        return {
+            "preview_url": store,
+            "store_url": store,
+            "admin_url": f"https://stellasageco.com/pages/admin-powers?shop={handle}",
+            "claim_url": store,
+        }
     return {
         "preview_url": f"https://stellasageco.com/collections/{handle}?preview=1",
         "admin_url": f"https://stellasageco.com/pages/admin-powers?shop={handle}&prospect_demo=1",
@@ -275,7 +277,7 @@ async def _save_logo_session(core: Any, upload: UploadFile, handle: str) -> str:
     return session_id
 
 
-def _tag_products(core: Any, product_ids: Iterable[str]) -> None:
+def _tag_products(core: Any, product_ids: Iterable[str], *extra_tags: str) -> None:
     mutation = """
     mutation TagAnonymousDemoProduct($id: ID!, $tags: [String!]!) {
       tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
@@ -284,7 +286,8 @@ def _tag_products(core: Any, product_ids: Iterable[str]) -> None:
     for product_id in product_ids:
         if not product_id:
             continue
-        result = core._shopify_graphql(mutation, {"id": product_id, "tags": [_PRODUCT_TAG]})
+        tags = list(dict.fromkeys([_PRODUCT_TAG, *[tag for tag in extra_tags if tag]]))
+        result = core._shopify_graphql(mutation, {"id": product_id, "tags": tags})
         errors = ((result.get("tagsAdd") or {}).get("userErrors")) or []
         if errors:
             raise RuntimeError("Unable to mark anonymous demo product")
@@ -292,7 +295,15 @@ def _tag_products(core: Any, product_ids: Iterable[str]) -> None:
 
 def tag_product_if_anonymous(core: Any, state: Dict[str, Any], product_id: str) -> None:
     if outreach_tracking.is_anonymous_demo_source(state.get("source")):
-        _tag_products(core, [product_id])
+        handle = str(state.get("handle") or state.get("storefront_handle") or "").strip()
+        _tag_products(core, [product_id], handle)
+        if handle and str(state.get("status") or "").lower() in {"ready", "claimed"}:
+            legacy_id = str(product_id).rsplit("/", 1)[-1]
+            if legacy_id.isdigit():
+                core._shopify_rest_put(
+                    f"products/{legacy_id}.json",
+                    {"product": {"id": int(legacy_id), "status": "active", "published": True}},
+                )
 
 
 def _tag_existing_store_products(core: Any, handle: str) -> None:
@@ -314,7 +325,54 @@ def _tag_existing_store_products(core: Any, handle: str) -> None:
         if not page.get("hasNextPage") or not page.get("endCursor"):
             break
         cursor = str(page["endCursor"])
-    _tag_products(core, product_ids)
+    # The smart collection is populated by the exact handle tag. Re-assert it
+    # alongside the anonymous marker so a delayed builder callback or partial
+    # tag write cannot leave a finished product outside its own collection.
+    _tag_products(core, product_ids, handle)
+
+
+def _activate_store_products(core: Any, handle: str) -> int:
+    """Make a finished anonymous build render through the normal storefront.
+
+    The isolated builder creates drafts while work is in progress. Once the
+    normal readiness flag is true, the existing preview/checkout guards are the
+    safety boundary, so the products must be active for Liquid to render the
+    real collection and product pages.
+    """
+    query = """
+    query AnonymousStoreProducts($query: String!, $after: String) {
+      products(first: 100, query: $query, after: $after) {
+        nodes { id status tags }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    products: list[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        result = core._shopify_graphql(query, {"query": f"tag:{handle}", "after": cursor})
+        connection = result.get("products") or {}
+        products.extend(connection.get("nodes") or [])
+        page = connection.get("pageInfo") or {}
+        if not page.get("hasNextPage") or not page.get("endCursor"):
+            break
+        cursor = str(page["endCursor"])
+    if not products:
+        raise RuntimeError("Finished anonymous store has no products tagged for its collection")
+    _tag_products(core, [str(product.get("id") or "") for product in products], handle)
+    for product in products:
+        if "ss-preview-hidden" in (product.get("tags") or []):
+            continue
+        if str(product.get("status") or "").upper() == "ACTIVE":
+            continue
+        legacy_id = str(product.get("id") or "").rsplit("/", 1)[-1]
+        if not legacy_id.isdigit():
+            raise RuntimeError("Invalid product identifier in anonymous store")
+        core._shopify_rest_put(
+            f"products/{legacy_id}.json",
+            {"product": {"id": int(legacy_id), "status": "active", "published": True}},
+        )
+    return len(products)
 
 
 def _run_build(
@@ -369,7 +427,7 @@ def _refresh_readiness(core: Any, handle: str) -> Dict[str, Any]:
         return state
     # Reuse the existing readiness contract: optional module failures don't
     # block a store that the normal builder has already marked usable.
-    _tag_existing_store_products(core, handle)
+    _activate_store_products(core, handle)
     ready = datetime.now(timezone.utc)
     expires = ready + timedelta(hours=48)
     return outreach_tracking.update(core, handle, {
@@ -405,7 +463,7 @@ def _public_status(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
         "error": state.get("build_error") if phase == "failed" else None,
     }
     if phase in {"ready", "claimed"}:
-        result.update(_store_urls(handle))
+        result.update(_store_urls(handle, claimed=phase == "claimed"))
     return result
 
 
@@ -553,6 +611,11 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
                 state = _refresh_readiness(core, handle)
             except Exception:
                 return JSONResponse({"error": "Unable to verify product readiness. Please retry."}, status_code=503)
+        elif str(state.get("status") or "") == "ready":
+            try:
+                _activate_store_products(core, handle)
+            except Exception:
+                return JSONResponse({"error": "Unable to prepare store products. Please retry."}, status_code=503)
         return JSONResponse(_public_status(handle, state), headers={"Cache-Control": "no-store"})
 
     return True

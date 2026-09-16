@@ -25,6 +25,7 @@ class FakeCore:
     def __init__(self):
         self.jobs = {}
         self.tagged = []
+        self.activated = []
         self.ready = True
 
     def _get_custom_shop(self, _handle):
@@ -40,10 +41,10 @@ class FakeCore:
         self._job_set(job_id, status="succeeded")
 
     def _shopify_graphql(self, query, variables):
-        if "AnonymousDemoProducts" in query:
+        if "AnonymousDemoProducts" in query or "AnonymousStoreProducts" in query:
             return {
                 "products": {
-                    "nodes": [{"id": "gid://shopify/Product/1"}],
+                    "nodes": [{"id": "gid://shopify/Product/1", "status": "DRAFT", "tags": ["raptors-demo-a1b2c3"]}],
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                 }
             }
@@ -51,6 +52,10 @@ class FakeCore:
             self.tagged.append(variables["id"])
             return {"tagsAdd": {"node": {"id": variables["id"]}, "userErrors": []}}
         raise AssertionError(query)
+
+    def _shopify_rest_put(self, path, body):
+        self.activated.append((path, body))
+        return body
 
 
 def _setup(monkeypatch):
@@ -130,6 +135,7 @@ def test_start_builds_ownerless_demo_and_returns_secure_resume_token(monkeypatch
     assert state["resume_token_hash"] == anonymous_demo._token_hash(token)
     assert outreach_tracking.parse_iso(state["expires_at"]).timestamp() - outreach_tracking.parse_iso(state["ready_at"]).timestamp() == 48 * 60 * 60
     assert core.tagged == ["gid://shopify/Product/1"]
+    assert core.activated[0][0] == "products/1.json"
 
     denied = client.get("/api/demo/status")
     assert denied.status_code == 401
@@ -210,7 +216,7 @@ def test_readiness_failure_does_not_expose_store(monkeypatch):
     core.ready = False
     response = client.post('/api/demo/storefront-request', data={'storefront_name':'Raptors'}, files={'storefront_logo_file':('logo.png',b'fake','image/png')})
     core.ready = True
-    monkeypatch.setattr(anonymous_demo, '_tag_existing_store_products', lambda *_: (_ for _ in ()).throw(RuntimeError('lock failed')))
+    monkeypatch.setattr(anonymous_demo, '_activate_store_products', lambda *_: (_ for _ in ()).throw(RuntimeError('activation failed')))
     response = client.get('/api/demo/status', headers={'Authorization':'Bearer '+response.json()['resume_token']})
     assert response.status_code == 503
     assert states['raptors-demo-a1b2c3']['status'] == 'anonymous_building'
