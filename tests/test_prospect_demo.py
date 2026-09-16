@@ -189,6 +189,26 @@ def test_a_website_store_is_never_treated_as_a_prospect(monkeypatch):
     assert state.json()["enabled"] is False
 
 
+def test_anonymous_demo_uses_same_one_product_controls_but_separate_state(monkeypatch):
+    client, states = _client(monkeypatch, source="anonymous_demo")
+    states["example-club"]["store_status"] = "anonymous_demo_unclaimed"
+
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is True
+
+    prospect_demo.mark_claimed(FakeCore(), "example-club", "101")
+    assert states["example-club"]["claim_status"] == "claimed"
+    assert states["example-club"]["expires_at"] is None
+
+
+def test_anonymous_source_with_outreach_state_is_rejected(monkeypatch):
+    client, _states = _client(monkeypatch, source="anonymous_demo")
+    state = client.get("/api/outreach/store/example-club/demo-state", headers=_headers())
+    assert state.status_code == 200
+    assert state.json()["enabled"] is False
+
+
 def test_a_claimed_store_offers_no_demo_even_if_the_ledger_missed_the_claim(monkeypatch):
     """The join route grants the claim in Shopify, then calls mark_claimed inside
     a try/except so demo bookkeeping can never fail a claim that already
@@ -273,3 +293,23 @@ def test_the_staff_marker_only_comes_from_the_relay():
     assert prospect_demo.is_staff_request(_StaffRequest(True)) is True
     assert prospect_demo.is_staff_request(_StaffRequest(False)) is False
     assert prospect_demo.is_staff_request(object()) is False
+
+
+def test_anonymous_preview_can_build_again_but_not_concurrently(monkeypatch):
+    import anonymous_demo
+    monkeypatch.setattr(anonymous_demo, 'tag_product_if_anonymous', lambda *_: None)
+    client, states = _client(monkeypatch, source='anonymous_demo')
+    states['example-club']['store_status'] = 'anonymous_demo_unclaimed'
+    path = '/api/outreach/store/example-club'
+    first = client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'bc3413','request_id':'first','job_id':'one'})
+    assert first.status_code == 200
+    assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'m2580','request_id':'second','job_id':'two'}).status_code == 409
+    done = client.post(path+'/demo-product/complete',headers=_headers(),json={'reservation_id':first.json()['reservation_id'],'product_id':'gid://shopify/Product/123'})
+    assert done.status_code == 200
+    state = client.get(path+'/demo-state',headers=_headers()).json()
+    assert state['product_status'] == 'available'
+    assert state['last_product_status'] == 'completed'
+    assert state['product_limit'] == 0
+    # Replaying the same completed builder cannot create an extra product.
+    assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'bc3413','request_id':'first','job_id':'repeat'}).status_code == 409
+    assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'m2580','request_id':'second','job_id':'two'}).status_code == 200
