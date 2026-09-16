@@ -95,3 +95,37 @@ checkout/order webhook handlers, Printful order submission, or fulfillment
 workers. Its installer is wrapped at the end of `fixed_app.py`; an import or
 route-registration failure is logged and the existing application keeps
 starting.
+
+
+## Fast directory and journey update
+
+New routes: `/admin/command-center/index`, `/store/{handle}`, `/report`,
+`/sessions`, `/sessions/{hash}`, all under `/admin/command-center`, and
+`POST /api/activity/session`. Admin views require the private relay secret AND
+verified super-admin header. No browser identity headers are trusted.
+
+The index returns the complete paginated store directory, cached for 60 seconds,
+with compact activity summaries. Full scans refresh in a single background worker;
+a stale snapshot stays available. Cold detail/report calls return pending until
+the first scan completes. Refresh failures are visible and retries are throttled.
+Details and activity arrays are omitted from the directory response.
+
+Site journeys are persisted as separate `ss_site_session` Shopify metaobjects.
+Only a SHA-256 hash of the browser session ID is retained. Records have up to 60
+pages; list/report scans cover the newest 1,000 records and label truncation.
+This is a reporting scan cap, not an automatic data-deletion policy. Older
+records remain persisted. Owner, suspected-bot, and unknown-role sessions are
+excluded from the visible sample. Owner exclusion is sticky across the whole
+journey. A timezone is not a visit location; location remains unavailable.
+
+New activity summaries use filtered journeys instead of unfiltered legacy
+`store_activity` records. Legacy data is preserved. Sales coverage and partial
+product/order reporting keep their prior definitions. Purchases now include
+attributed product titles. Session history starts at tracker deployment.
+
+Additional tests:
+`python -m pytest tests/test_command_center.py tests/test_command_center_journeys.py -q`
+
+Deploy this backend, then the signed relay in Printful_Automation, then the
+Shopify-code theme. Verify the new routes and owner access before releasing the
+theme. The companion theme documentation describes limitations and browser tests.

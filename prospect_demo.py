@@ -154,8 +154,12 @@ def _public_state(
         "store_status": state.get("store_status") or "",
         "claim_status": state.get("claim_status") or "unclaimed",
         "enabled": unclaimed and bool(demo.get("enabled", True)),
-        "product_limit": 1,
-        "product_status": demo.get("product_status") or "available",
+        "product_limit": 0 if outreach_tracking.is_anonymous_demo_source(state.get("source")) else 1,
+        "last_product_status": demo.get("product_status") or "available",
+        "product_status": (
+            "available" if outreach_tracking.is_anonymous_demo_source(state.get("source"))
+            and demo.get("product_status") == "completed" else demo.get("product_status") or "available"
+        ),
         "product_model": demo.get("product_model"),
         "product_id": demo.get("product_id"),
         "product_handle": demo.get("product_handle"),
@@ -366,6 +370,9 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
             # product. Finding it already used, by someone they never met, is
             # a worse first impression than the demo is a good one.
             if staff and status in {"reserved", "building", "completed"}:
+                status = "available"
+            if (status == "completed" and outreach_tracking.is_anonymous_demo_source(state.get("source"))
+                    and demo.get("request_id") != request_id):
                 status = "available"
             if status in {"reserved", "building", "completed"}:
                 if status != "completed" and demo.get("request_id") == request_id:

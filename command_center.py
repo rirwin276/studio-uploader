@@ -399,7 +399,7 @@ def _order_nodes(core) -> tuple[list[Dict[str, Any]], bool]:
           customer { displayName }
           lineItems(first: 10) {
             nodes {
-              quantity currentQuantity
+              title quantity currentQuantity
               originalTotalSet { shopMoney { amount currencyCode } }
               product { tags }
             }
@@ -577,6 +577,7 @@ def _aggregate_orders(
         if order.get("cancelledAt") or str(order.get("displayFinancialStatus") or "").upper() not in allowed_statuses:
             continue
         order_amounts: Dict[str, Decimal] = {}
+        order_products: Dict[str, list] = {}
         line_items = order.get("lineItems") or {}
         if (line_items.get("pageInfo") or {}).get("hasNextPage"):
             nested_truncated = True
@@ -592,6 +593,7 @@ def _aggregate_orders(
                 # and surface the tagging problem in data_quality.
                 ambiguous += 1
             handle = sorted(matching)[0]
+            order_products.setdefault(handle, []).append(str(line.get("title") or "Product"))
             money = (((line.get("originalTotalSet") or {}).get("shopMoney")) or {})
             amount = _decimal(money.get("amount"))
             currency = str(money.get("currencyCode") or "USD")
@@ -608,6 +610,7 @@ def _aggregate_orders(
                 "event_type": "purchase",
                 "store_handle": handle,
                 "order_name": str(order.get("name") or ""),
+                "product_titles": order_products.get(handle, []),
                 "created_at": order.get("createdAt"),
                 "at": order.get("createdAt"),
                 "customer_display_name": str((order.get("customer") or {}).get("displayName") or "Guest").strip(),
@@ -860,11 +863,39 @@ def _build_summary(core) -> Dict[str, Any]:
     if ambiguous_lines:
         data_quality["ambiguous_order_lines"] = ambiguous_lines
 
+    # New journeys replace the old unfiltered one-hit tracker in current metrics.
+    # Preserve the old data, but do not mix bot/founder traffic into clean counts.
     try:
-        activities = _activity_nodes(core)
-    except Exception as exc:
+        from site_sessions import recent, visible
+        journey_rows, journey_truncated = recent(core)
+        clean_rows = [r for r in journey_rows if visible(r)]
+        started = min((r.get("started_at") for r in journey_rows if r.get("started_at")), default=None)
         activities = {}
-        data_quality["sessions"] = "Not observable: " + str(exc)[:180]
+        for row in clean_rows:
+            for handle in row.get("visited_stores", []):
+                if handle not in handles:
+                    continue
+                pages = [p for p in row.get("pages", []) if p.get("store_handle") == handle]
+                if not pages:
+                    continue
+                last = max(pages, key=lambda p: p.get("at") or "")
+                at = last.get("last_at") or last.get("at")
+                event = {"at": at, "path": last.get("path"), "event_type": "session",
+                         "visitor_type": "customer" if row.get("signed_in") else "anonymous"}
+                state = activities.setdefault(handle, {"tracking_started_at": started, "total_sessions": 0,
+                    "non_super_admin_sessions": 0, "recent_activity": []})
+                state["total_sessions"] += 1
+                state["non_super_admin_sessions"] += 1
+                state["recent_activity"].append(event)
+                if at > str((state.get("last_non_super_admin_session") or {}).get("at") or ""):
+                    state["last_non_super_admin_session"] = event
+                if last.get("signed_in") and at > str((state.get("last_authenticated_customer_activity") or {}).get("at") or ""):
+                    state["last_authenticated_customer_activity"] = event
+        if journey_truncated:
+            data_quality["sessions"] = "Latest 1,000 recorded sessions only; totals are partial"
+    except Exception:
+        activities = {}
+        data_quality["sessions"] = "Journey tracking unavailable; legacy unfiltered visits are not included"
     total_gross = Decimal("0")
     total_sessions = 0
     non_super_sessions = 0

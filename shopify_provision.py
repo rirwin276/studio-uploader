@@ -40,7 +40,7 @@ API_VERSION = env_get("API_VERSION", required=True)  # e.g. 2026-01
 ACCESS_TOKEN = env_get("CLIENT_SECRET", required=True)  # Admin API access token
 
 # ✅ Printful Automation (hardcoded base; we will try /run then /trigger_automation)
-PRINTFUL_AUTOMATION_BASE = "https://printfulautomation-production.up.railway.app"
+PRINTFUL_AUTOMATION_BASE = os.getenv("PRINTFUL_AUTOMATION_URL", "https://printfulautomation-production.up.railway.app").strip().rstrip("/")
 PRINTFUL_AUTOMATION_TOKEN = os.getenv("PRINTFUL_AUTOMATION_TOKEN", "").strip()  # optional bearer token
 
 METAOBJECT_TYPE = os.getenv("METAOBJECT_TYPE", "custom_shop").strip()

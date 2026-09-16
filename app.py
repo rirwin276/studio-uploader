@@ -210,7 +210,7 @@ def _sess_get(session_id: str) -> Dict[str, Any]:
 # ----------------------------
 # Shopify Admin API helpers
 # ----------------------------
-def _shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+def _shopify_graphql(query: str, variables: Dict[str, Any], *, timeout: int = 60) -> Dict[str, Any]:
     """Direct Shopify Admin GraphQL call (used by leave/nuke endpoints)."""
     if not _SHOPIFY_SHOP or not _SHOPIFY_ACCESS_TOKEN:
         raise RuntimeError("Shopify Admin API credentials not configured (SHOP / CLIENT_SECRET)")
@@ -219,7 +219,7 @@ def _shopify_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": _SHOPIFY_ACCESS_TOKEN,
     }
-    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=60)
+    r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=timeout)
     r.raise_for_status()
     payload = r.json()
     if payload.get("errors"):
@@ -327,6 +327,16 @@ def _normalize_store_owner(customer_id: str) -> str:
     if owner_id.lower() == _STORE_UNCLAIMED_OWNER:
         return ""
     return owner_id
+
+
+def _is_platform_operator(tags: list) -> bool:
+    """Platform access is independent of a store's customer ownership.
+
+    Use the same Shopify-maintained tag as the storefront access gate. A
+    store-specific admin tag is deliberately NOT an operator designation.
+    Callers must supply tags read from Shopify, never form/body role flags.
+    """
+    return any(str(tag).strip().lower() == "super-admin" for tag in tags)
 
 
 def _get_custom_shop(handle: str) -> Optional[Dict[str, Any]]:
@@ -1434,6 +1444,31 @@ async def storefront_request(
         if not customer_id:
             return JSONResponse({"error": "customer_id is required"}, status_code=400)
         owner_customer_id = customer_id.split("/")[-1].strip()
+        # The usual form is also the founder's build-for-someone form. His
+        # global management access must not consume the first CUSTOMER claim.
+        # Resolve the creator's existing role on Shopify; do not accept a
+        # browser-supplied role or weaken the explicit claimable API above.
+        try:
+            creator_tags = _get_customer_tags(_ensure_gid_customer(owner_customer_id))
+            if creator_tags is None:
+                return JSONResponse({"error": "Customer not found"}, status_code=404)
+            if _is_platform_operator(creator_tags):
+                # Never turn an existing customer store into an unclaimed one
+                # when the operator submits a duplicate name/handle.
+                if _get_custom_shop(storefront_handle.strip()) is not None:
+                    return JSONResponse(
+                        {"error": "A store already uses this handle. Choose a different store name to build a new store."},
+                        status_code=409,
+                    )
+                owner_customer_id = ""
+                claimable = True
+        except Exception:
+            # Do not guess ownership when Shopify is unavailable. Retrying
+            # here is safe: no upload/provisioning job has been started yet.
+            return JSONResponse(
+                {"error": "Could not verify store ownership. Please try again."},
+                status_code=502,
+            )
     # type_of_store_direct is the pre-computed slug from the hidden field added by the Shopify form.
     # Use it when present; otherwise derive the slug from org_type + sub-field.
     if type_of_store_direct and type_of_store_direct.strip():
@@ -1781,6 +1816,21 @@ async def storefront_join(handle: str, request: Request):
         if custom_shop is None:
             return JSONResponse({"error": "Store not found"}, status_code=404)
 
+        if _is_platform_operator(tags):
+            # Opening his own invitation must not let the founder claim the
+            # customer slot, change an existing owner, or mark outreach claimed.
+            # The super-admin tag already supplies management access everywhere.
+            return {
+                "ok": True,
+                "role": "admin",
+                "claimed_admin": False,
+                "already_member": member_tag in tags,
+                "already_admin": True,
+                "member_tag": member_tag if member_tag in tags else None,
+                "admin_tag": admin_tag if admin_tag in tags else None,
+                "platform_operator": True,
+            }
+
         fields = custom_shop["fields"]
         owner_id = _normalize_store_owner(fields.get("owner_customer_id") or "")
         collection_gid = (fields.get("collection_gid") or "").strip()
@@ -1812,6 +1862,13 @@ async def storefront_join(handle: str, request: Request):
                     claim_owner_id = customer_id if won_claim else _get_collection_claim_owner(collection_gid)
                 if not claim_owner_id:
                     raise RuntimeError("Claim marker was not available after claim attempt")
+
+                from anonymous_lifecycle import is_deletion_claim
+                if is_deletion_claim(claim_owner_id):
+                    return JSONResponse(
+                        {"error": "This unclaimed preview has expired and is being removed. Please start a new store.", "code": "preview_expired"},
+                        status_code=410,
+                    )
 
                 claimed_admin = claim_owner_id == customer_id
                 # Keep the public custom_shop owner field in sync with the
@@ -5787,6 +5844,79 @@ async def admin_store_delete_product(handle: str, product_id: str, request: Requ
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+@app.post("/admin/store/{handle}/products/{product_id:path}/pin")
+async def admin_store_pin_product(handle: str, product_id: str, request: Request):
+    """
+    Admin-only. Pin or unpin a product so it shows first on the storefront.
+    Header: X-Admin-Secret: <ADMIN_SECRET>
+    Body JSON: {"pinned": true|false}
+    Returns: {"ok": true, "id": "...", "pinned": true|false, "tag": "pinned--<handle>"}
+
+    The pin is stored as a TAG, not a new field. Tags already carry every other
+    per-product fact this system depends on — collection membership, editor
+    routing, pricing keys — so this needs no schema change and no new store.
+
+    It has to live outside Shopify's own ordering because each store's
+    collection is a SMART collection (auto-populated by the store-handle tag),
+    and Shopify smart collections cannot hold a manual product order at all.
+    The storefront applies the order instead.
+
+    tagsAdd / tagsRemove are used rather than productUpdate(tags: [...]) on
+    purpose: they are additive, so they cannot clobber the build tags that
+    editor routing and pricing rely on. A full tags array would require a
+    read-modify-write and would lose any tag written concurrently by a builder.
+    """
+    from urllib.parse import unquote
+
+    denied = _require_admin_secret(request)
+    if denied is not None:
+        return denied
+
+    handle = handle.strip()
+    if not handle:
+        return JSONResponse({"error": "handle is required"}, status_code=400)
+
+    product_gid = unquote(product_id).strip()
+    if not product_gid:
+        return JSONResponse({"error": "product_id is required"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    pinned = body.get("pinned")
+    if pinned is None:
+        return JSONResponse({"error": "pinned field is required"}, status_code=400)
+    pinned = bool(pinned)
+
+    tag = f"pinned--{handle}"
+
+    mutation = """
+    mutation pin($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) { userErrors { field message } }
+    }
+    """ if pinned else """
+    mutation unpin($id: ID!, $tags: [String!]!) {
+      tagsRemove(id: $id, tags: $tags) { userErrors { field message } }
+    }
+    """
+    field = "tagsAdd" if pinned else "tagsRemove"
+
+    try:
+        data = _shopify_graphql(mutation, {"id": product_gid, "tags": [tag]})
+        errs = ((data.get(field) or {}).get("userErrors")) or []
+        if errs:
+            raise RuntimeError(f"{field} userErrors: {json.dumps(errs)}")
+        return {"ok": True, "id": product_gid, "pinned": pinned, "tag": tag}
+    except RuntimeError as e:
+        log.exception("pin product failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=502)
+    except Exception as e:
+        log.exception("pin product failed: %s", e)
+        return JSONResponse({"error": f"pin failed: {e}"}, status_code=500)
+
+
 @app.get("/store/{handle}/status")
 async def store_status(handle: str):
     """
@@ -5852,6 +5982,15 @@ async def store_status(handle: str):
         "slept_at": slept_at,
         "last_active": last_active,
     }
+
+
+from dashboard_state import dashboard_router
+
+app.include_router(dashboard_router(
+    lambda query, variables: _shopify_graphql(query, variables, timeout=12),
+    lambda: os.getenv("METAOBJECT_TYPE", "custom_shop").strip(),
+    lambda: _FR_METAOBJECT_TYPE,
+))
 
 
 @app.get("/store/{handle}/ready-status")

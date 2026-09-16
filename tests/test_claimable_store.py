@@ -46,6 +46,39 @@ class StoreClaimTests(unittest.TestCase):
     def _join(self, customer_id: str):
         return asyncio.run(app_module.storefront_join("test-store", _request(customer_id)))
 
+    def test_cleanup_winner_cannot_be_claimed_or_granted_membership(self):
+        from anonymous_lifecycle import DELETION_CLAIM
+        store = {"id":"gid://shopify/Metaobject/1", "fields":{
+            "owner_customer_id":"unclaimed", "collection_gid":"gid://shopify/Collection/1"}}
+        with (
+            patch.object(app_module, "_get_customer_tags", return_value=[]),
+            patch.object(app_module, "_get_custom_shop", return_value=store),
+            patch.object(app_module, "_get_collection_claim_owner", return_value=DELETION_CLAIM),
+            patch.object(app_module, "_set_custom_shop_owner") as set_owner,
+            patch.object(app_module, "_customer_add_tag") as add_tag,
+        ):
+            result = self._join("101")
+        self.assertEqual(result.status_code, 410)
+        set_owner.assert_not_called()
+        add_tag.assert_not_called()
+
+    def test_cleanup_winning_after_claim_read_is_also_rejected(self):
+        from anonymous_lifecycle import DELETION_CLAIM
+        store = {"id":"gid://shopify/Metaobject/1", "fields":{
+            "owner_customer_id":"unclaimed", "collection_gid":"gid://shopify/Collection/1"}}
+        with (
+            patch.object(app_module, "_get_customer_tags", return_value=[]),
+            patch.object(app_module, "_get_custom_shop", return_value=store),
+            patch.object(app_module, "_get_collection_claim_owner", side_effect=["",DELETION_CLAIM]),
+            patch.object(app_module, "_try_create_collection_claim", return_value=False),
+            patch.object(app_module, "_set_custom_shop_owner") as set_owner,
+            patch.object(app_module, "_customer_add_tag") as add_tag,
+        ):
+            result = self._join("101")
+        self.assertEqual(result.status_code, 410)
+        set_owner.assert_not_called()
+        add_tag.assert_not_called()
+
     def test_claimable_build_requires_admin_secret(self):
         result = asyncio.run(
             app_module.storefront_request(

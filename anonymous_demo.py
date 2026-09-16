@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 
 import outreach_appearance
 import outreach_tracking
+from anonymous_demo_retention import overnight_deadline
 
 
 SOURCE = outreach_tracking.ANONYMOUS_DEMO_SOURCE
@@ -153,6 +154,12 @@ def _slug(value: str) -> str:
 
 
 def _store_urls(handle: str) -> Dict[str, str]:
+    theme_id = os.getenv("ANONYMOUS_PREVIEW_THEME_ID", "").strip()
+    suffix = f"&preview_theme_id={theme_id}" if theme_id.isdigit() else ""
+    if os.getenv("ANONYMOUS_PREVIEW_BUILDER_URL", ""):
+        base = f"https://stellasageco.com/pages/storefront?view=anonymous-preview&shop={handle}"
+        return {"preview_url": base + suffix, "admin_url": base + "&tab=admin" + suffix,
+                "claim_url": base + "&tab=activate" + suffix}
     return {
         "preview_url": f"https://stellasageco.com/collections/{handle}?preview=1",
         "admin_url": f"https://stellasageco.com/pages/admin-powers?shop={handle}&prospect_demo=1",
@@ -217,8 +224,6 @@ def _active_count(core: Any) -> int:
         if str(state.get("status") or "").lower() in {"deleted", "expired", "failed"}:
             continue
         expiry = outreach_tracking.parse_iso(state.get("expires_at"))
-        if expiry and expiry <= now:
-            continue
         count += 1
     return count if count < maximum else maximum
 
@@ -282,7 +287,7 @@ def _tag_products(core: Any, product_ids: Iterable[str]) -> None:
         result = core._shopify_graphql(mutation, {"id": product_id, "tags": [_PRODUCT_TAG]})
         errors = ((result.get("tagsAdd") or {}).get("userErrors")) or []
         if errors:
-            raise RuntimeError("Unable to lock anonymous demo product checkout")
+            raise RuntimeError("Unable to mark anonymous demo product")
 
 
 def tag_product_if_anonymous(core: Any, state: Dict[str, Any], product_id: str) -> None:
@@ -348,31 +353,30 @@ def _run_build(
     except Exception as exc:
         print(f"[anonymous-demo] appearance update failed for {handle}: {exc}")
 
-    # Checkout protection is not cosmetic. If the products cannot be tagged,
-    # fail the demo closed instead of exposing an ownerless store for sale.
-    try:
-        _tag_existing_store_products(core, handle)
-    except Exception as exc:
-        print(f"[anonymous-demo] product checkout lock failed for {handle}: {exc}")
-        outreach_tracking.update(core, handle, {
-            "status": "failed",
-            "build_error": "The demo store built, but checkout protection could not be applied.",
-            "failed_at": outreach_tracking.utc_iso(),
-        })
-        return
+    # Provision success only acknowledges the downstream build. Product readiness
+    # is signaled later by Printful Automation on the custom_shop metaobject.
+    outreach_tracking.update(core, handle, {"build_stage": "products"})
+    _refresh_readiness(core, handle)
 
+
+def _refresh_readiness(core: Any, handle: str) -> Dict[str, Any]:
+    state = outreach_tracking.read(core, handle)
+    if str(state.get("status") or "") not in {"building", "queued"}:
+        return state
+    shop = core._get_custom_shop(handle)
+    fields = (shop or {}).get("fields") or {}
+    if str(fields.get("is_fully_ready") or "").lower() != "true":
+        return state
+    # Reuse the existing readiness contract: optional module failures don't
+    # block a store that the normal builder has already marked usable.
+    _tag_existing_store_products(core, handle)
     ready = datetime.now(timezone.utc)
     expires = ready + timedelta(hours=48)
-    outreach_tracking.update(core, handle, {
-        "status": "ready",
-        "built_at": ready.isoformat(),
-        "ready_at": ready.isoformat(),
-        "expires_at": expires.isoformat(),
-        "delete_due_at": expires.isoformat(),
-        "store_status": STORE_STATUS,
+    return outreach_tracking.update(core, handle, {
+        "status": "ready", "build_stage": "ready", "built_at": ready.isoformat(),
+        "ready_at": ready.isoformat(), "expires_at": expires.isoformat(),
+        "delete_due_at": overnight_deadline(expires).isoformat(), "store_status": STORE_STATUS,
     })
-    if contact_email and resume_token:
-        _send_ready_email(contact_email, name, resume_token)
 
 
 def _public_status(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -393,6 +397,8 @@ def _public_status(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
         "phase": phase,
         "storefront_name": state.get("storefront_name") or "Your team store",
         "storefront_handle": handle,
+        "build_stage": state.get("build_stage") or "store",
+        "delete_due_at": state.get("delete_due_at"),
         "ready_at": state.get("ready_at"),
         "expires_at": state.get("expires_at"),
         "error": state.get("build_error") if phase == "failed" else None,
@@ -420,6 +426,9 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
     ):
         if not enabled():
             return JSONResponse({"error": "Try-before-signup is not available"}, status_code=404)
+        from anonymous_preview_api import builder_ready
+        if not builder_ready():
+            return JSONResponse({"error": "The preview builder is temporarily unavailable. Please try again shortly."}, status_code=503)
         if not _secret():
             return JSONResponse({"error": "Try-before-signup is not configured"}, status_code=503)
         if not _origin_allowed(request):
@@ -469,15 +478,16 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             "created_at": created_at,
             "built_at": None,
             "ready_at": None,
-            "expires_at": None,
-            "delete_due_at": None,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat(),
+            "delete_due_at": overnight_deadline(datetime.now(timezone.utc) + timedelta(hours=48)).isoformat(),
+            "build_stage": "store",
             "status": "building",
             "store_status": STORE_STATUS,
             "claim_status": "unclaimed",
             "resume_token_hash": _token_hash(token),
             "prospect_demo": {
                 "enabled": True,
-                "product_limit": 1,
+                "product_limit": 0,
                 "product_status": "available",
                 "event_counts": {"anonymous_demo_started": 1},
                 "events": [{"event": "anonymous_demo_started", "at": created_at}],
@@ -537,6 +547,11 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             return JSONResponse({"error": "Demo not found"}, status_code=404)
         if not hmac.compare_digest(str(state.get("resume_token_hash") or ""), _token_hash(token)):
             return JSONResponse({"error": "invalid return link"}, status_code=401)
-        return _public_status(handle, state)
+        if str(state.get("status") or "") in {"building", "queued"}:
+            try:
+                state = _refresh_readiness(core, handle)
+            except Exception:
+                return JSONResponse({"error": "Unable to verify product readiness. Please retry."}, status_code=503)
+        return JSONResponse(_public_status(handle, state), headers={"Cache-Control": "no-store"})
 
     return True

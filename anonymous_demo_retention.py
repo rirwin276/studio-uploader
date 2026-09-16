@@ -1,8 +1,8 @@
-"""Strict 48-hour cleanup for unclaimed website demos.
+"""Overnight California cleanup for unclaimed website demos.
 
 This is intentionally separate from cold-outreach retention. Outreach keeps an
-engaged prospect for review; a website demo always expires 48 hours after it is
-ready unless Shopify already has an owner.
+engaged prospect for review; a website demo becomes eligible 48 hours after readiness and is removed in
+the next 03:00 California cleanup window, unless Shopify already has an owner.
 """
 
 from __future__ import annotations
@@ -13,8 +13,11 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, List
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import outreach_tracking
+from anonymous_lifecycle import DELETION_CLAIM, is_deletion_claim
 
 
 _INSTALL_LOCK = threading.Lock()
@@ -25,6 +28,23 @@ def enabled() -> bool:
     return os.getenv("ANONYMOUS_DEMO_RETENTION_ENABLED", "").strip().lower() in {"1", "true", "yes"}
 
 
+CLEANUP_ZONE = ZoneInfo("America/Los_Angeles")
+
+
+def overnight_deadline(eligible_at: datetime) -> datetime:
+    """First 03:00 California occurrence at or after the 48-hour threshold."""
+    local = eligible_at.astimezone(CLEANUP_ZONE)
+    due = local.replace(hour=3, minute=0, second=0, microsecond=0)
+    if due < local:
+        due += timedelta(days=1)
+    return due.astimezone(timezone.utc)
+
+
+def cleanup_window(now: float) -> bool:
+    # Restarting during the daytime must never trigger daytime deletions.
+    return datetime.fromtimestamp(now, CLEANUP_ZONE).hour == 3
+
+
 def _eligible(state: Dict[str, Any], now: float) -> bool:
     if not outreach_tracking.is_anonymous_demo_source(state.get("source")):
         return False
@@ -32,10 +52,13 @@ def _eligible(state: Dict[str, Any], now: float) -> bool:
         return False
     if str(state.get("claim_status") or "unclaimed").lower() == "claimed":
         return False
-    if str(state.get("status") or "").lower() != "ready":
+    if str(state.get("status") or "").lower() not in {"ready", "failed", "building", "queued"}:
         return False
-    due = outreach_tracking.parse_iso(state.get("expires_at"))
-    return bool(due and due.timestamp() <= now)
+    expiry = outreach_tracking.parse_iso(state.get("expires_at"))
+    if not expiry:
+        return False
+    due = overnight_deadline(expiry)
+    return due.timestamp() <= now
 
 
 def due_now(core: Any, *, now: float | None = None) -> List[str]:
@@ -60,7 +83,15 @@ def _owner(core: Any, handle: str) -> str | None:
     fields = shop.get("fields") or {}
     raw = str(fields.get("owner_customer_id") or "").strip()
     normalizer = getattr(core, "_normalize_store_owner", None)
-    return str(normalizer(raw) if callable(normalizer) else ("" if raw.lower() == "unclaimed" else raw))
+    owner = str(normalizer(raw) if callable(normalizer) else ("" if raw.lower() == "unclaimed" else raw))
+    collection = fields.get("collection_gid")
+    reader = getattr(core, "_get_collection_claim_owner", None)
+    if not owner and collection and callable(reader):
+        try:
+            owner = str(reader(collection) or "")
+        except Exception:
+            return None
+    return owner
 
 
 def _delete(core: Any, handle: str) -> bool:
@@ -70,7 +101,7 @@ def _delete(core: Any, handle: str) -> bool:
         owner = _owner(core, handle)
         if owner is None:
             return False
-        if owner:
+        if owner and not is_deletion_claim(owner):
             try:
                 outreach_tracking.update(core, handle, {
                     "claim_status": "claimed",
@@ -83,6 +114,22 @@ def _delete(core: Any, handle: str) -> bool:
             except Exception as exc:
                 print(f"[anonymous-demo-retention] claim heal failed for {handle}: {exc}")
             return False
+
+        # Compete with first claim using the very same Shopify CAS field.
+        # The winner is durable across processes and restarts. Keep a deletion
+        # marker on failure: a partially removed store must never be claimed.
+        if not is_deletion_claim(owner):
+            try:
+                shop = core._get_custom_shop(handle)
+                collection = ((shop or {}).get("fields") or {}).get("collection_gid")
+                claim = getattr(core, "_try_create_collection_claim", None)
+                if not collection or not callable(claim):
+                    return False
+                if not claim(collection, DELETION_CLAIM):
+                    return False
+            except Exception as exc:
+                print(f"[anonymous-demo-retention] cleanup reservation failed for {handle}: {exc}")
+                return False
 
         job_id = str(uuid.uuid4())
         try:
@@ -113,7 +160,10 @@ def _delete(core: Any, handle: str) -> bool:
 
 
 def process_due(core: Any, *, dry_run: bool = False, now: float | None = None) -> Dict[str, Any]:
-    due = due_now(core, now=now)
+    moment = time.time() if now is None else now
+    if not dry_run and not cleanup_window(moment):
+        return {"ok": True, "dry_run": False, "considered": 0, "deleted": [], "outside_cleanup_window": True}
+    due = due_now(core, now=moment)
     deleted = [] if dry_run else [handle for handle in due if _delete(core, handle)]
     return {"ok": True, "dry_run": dry_run, "considered": len(due), "deleted": deleted}
 

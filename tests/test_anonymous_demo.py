@@ -25,9 +25,10 @@ class FakeCore:
     def __init__(self):
         self.jobs = {}
         self.tagged = []
+        self.ready = True
 
     def _get_custom_shop(self, _handle):
-        return None
+        return {"fields": {"is_fully_ready": "true" if self.ready else "false"}}
 
     def _job_set(self, job_id, **patch):
         self.jobs.setdefault(job_id, {}).update(patch)
@@ -53,6 +54,8 @@ class FakeCore:
 
 
 def _setup(monkeypatch):
+    import anonymous_preview_api
+    monkeypatch.setattr(anonymous_preview_api, "builder_ready", lambda: True)
     monkeypatch.setenv("ANONYMOUS_DEMO_ENABLED", "true")
     monkeypatch.setenv("ANONYMOUS_DEMO_SECRET", "test-secret-that-is-at-least-thirty-two-bytes")
     monkeypatch.setattr(anonymous_demo, "_rate_allowed", lambda _request: True)
@@ -181,3 +184,33 @@ def test_status_remains_available_when_new_demo_entry_is_disabled(monkeypatch):
     assert status.status_code == 200
     assert status.json()["phase"] == "ready"
 
+
+
+def test_waits_for_real_products_then_marks_ready_once(monkeypatch):
+    client, core, states = _setup(monkeypatch)
+    core.ready = False
+    response = client.post('/api/demo/storefront-request', data={'storefront_name':'Raptors'}, files={'storefront_logo_file':('logo.png',b'fake','image/png')})
+    headers = {'Authorization': 'Bearer ' + response.json()['resume_token']}
+    first = client.get('/api/demo/status', headers=headers).json()
+    assert first['phase'] == 'building'
+    assert first['build_stage'] == 'products'
+    assert 'preview_url' not in first
+    assert core.tagged == []
+    core.ready = True
+    ready = client.get('/api/demo/status', headers=headers).json()
+    assert ready['phase'] == 'ready'
+    assert core.tagged == ['gid://shopify/Product/1']
+    again = client.get('/api/demo/status', headers=headers)
+    assert again.json()['ready_at'] == ready['ready_at']
+    assert again.headers['cache-control'] == 'no-store'
+
+
+def test_readiness_failure_does_not_expose_store(monkeypatch):
+    client, core, states = _setup(monkeypatch)
+    core.ready = False
+    response = client.post('/api/demo/storefront-request', data={'storefront_name':'Raptors'}, files={'storefront_logo_file':('logo.png',b'fake','image/png')})
+    core.ready = True
+    monkeypatch.setattr(anonymous_demo, '_tag_existing_store_products', lambda *_: (_ for _ in ()).throw(RuntimeError('lock failed')))
+    response = client.get('/api/demo/status', headers={'Authorization':'Bearer '+response.json()['resume_token']})
+    assert response.status_code == 503
+    assert states['raptors-demo-a1b2c3']['status'] == 'building'

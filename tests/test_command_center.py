@@ -412,6 +412,13 @@ def test_summary_is_query_only_and_exposes_decision_cockpit_totals():
                     }],
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                 }}
+            if variables.get("type") == "ss_site_session":
+                state = {"started_at": "2026-08-10T12:00:00Z", "last_seen_at": "2026-08-19T11:00:00Z",
+                    "signed_in": True, "visited_stores": ["team-one"],
+                    "pages": [{"id": "page-12345", "store_handle": "team-one", "signed_in": True,
+                               "at": "2026-08-19T11:00:00Z", "path": "/collections/team-one"}]}
+                return {"metaobjects": {"nodes": [{"handle": "a" * 64,
+                    "fields": [{"key": "data", "value": json.dumps(state)}]}], "pageInfo": {"hasNextPage": False}}}
             if "CommandCenterActivities" in query:
                 state = {
                     "tracking_started_at": "2026-08-10T12:00:00Z",
