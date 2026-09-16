@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import requests
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 import anonymous_demo as demo
 import outreach_tracking
 
@@ -181,7 +182,9 @@ def install(app, core):
         body = await request.json()
         if len(products(core, handle)) >= 60 and not body.get("product_handle"):
             raise HTTPException(409, "This preview has 60 products. Remove one to make room for a new design.")
-        data = gateway("POST", f"/api/anonymous-preview/{handle}/builder", body)
+        # The builder rechecks eligibility with this service. Keep its callback
+        # free to run instead of blocking the event loop while waiting on it.
+        data = await run_in_threadpool(gateway, "POST", f"/api/anonymous-preview/{handle}/builder", body)
         base = os.environ["ANONYMOUS_PREVIEW_BUILDER_URL"].rstrip("/")
         path = str(data.get("path") or "")
         if not path.startswith("/editor/"):
