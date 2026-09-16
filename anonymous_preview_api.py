@@ -148,6 +148,9 @@ def install(app, core):
             return JSONResponse({"claimed": True, "store_url": f"https://stellasageco.com/collections/{handle}",
                 "admin_url": f"https://stellasageco.com/pages/admin-powers?shop={handle}"}, headers={"Cache-Control": "no-store"})
         fields = shop.get("fields") or {}
+        import prospect_demo
+        preview_state = prospect_demo._public_state(handle, state,
+            unclaimed=prospect_demo._confirm_unclaimed(core, handle, state))
         logo_data = core._shopify_graphql("""query PreviewLogo($id: ID!) {
           metaobject(id: $id) { field(key: "logo") { reference { ... on MediaImage { image { url } } } } }
         }""", {"id": shop["id"]})
@@ -159,7 +162,9 @@ def install(app, core):
             appearance = {}
         return JSONResponse({"handle": handle, "name": fields.get("name") or state.get("organization_name") or handle,
             "logo_url": logo, "appearance": appearance, "products": products(core, handle),
-            "build": demo._public_status(handle, state), "draft_only": True}, headers={"Cache-Control": "no-store"})
+            "build": demo._public_status(handle, state), "design": preview_state,
+            "products_ready": str(fields.get("is_fully_ready") or "").lower() == "true",
+            "draft_only": True}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/demo/catalog")
     def catalog(request: Request):
