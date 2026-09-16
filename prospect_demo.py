@@ -110,6 +110,20 @@ def _confirm_unclaimed(core: Any, handle: str, state: Dict[str, Any]) -> bool:
     """
     if not _is_unclaimed_prospect(state):
         return False
+    if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+        # Anonymous previews have no signed-in owner to fall back on. Refuse
+        # design access if the authoritative Shopify check is unavailable.
+        try:
+            shop = core._get_custom_shop(handle)
+            if not shop:
+                return False
+            fields = shop.get("fields") or {}
+            owner = core._normalize_store_owner(fields.get("owner_customer_id") or "")
+            collection = fields.get("collection_gid")
+            marker = core._get_collection_claim_owner(collection) if collection else ""
+            return not owner and not marker
+        except Exception:
+            return False
     if not _shopify_owner(core, handle):
         return True
 

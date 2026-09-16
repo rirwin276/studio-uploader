@@ -22,6 +22,15 @@ class FakeCore:
     def _fr_get_owner_from_custom_shop(self, _handle: str) -> str:
         return self.shopify_owner
 
+    def _get_custom_shop(self, _handle):
+        return {"fields": {"owner_customer_id": self.shopify_owner, "collection_gid": "collection"}}
+
+    def _normalize_store_owner(self, owner):
+        return "" if owner == "unclaimed" else owner
+
+    def _get_collection_claim_owner(self, _collection):
+        return ""
+
 
 def _client(monkeypatch, source="direct_outreach_api", shopify_owner=""):
     states = {
@@ -313,3 +322,13 @@ def test_anonymous_preview_can_build_again_but_not_concurrently(monkeypatch):
     # Replaying the same completed builder cannot create an extra product.
     assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'bc3413','request_id':'first','job_id':'repeat'}).status_code == 409
     assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'m2580','request_id':'second','job_id':'two'}).status_code == 200
+
+
+def test_anonymous_design_denied_when_shopify_owner_check_fails():
+    state = {'source':'anonymous_demo', 'store_status':'anonymous_demo_unclaimed', 'claim_status':'unclaimed'}
+    core = FakeCore()
+    core._get_custom_shop = lambda _: (_ for _ in ()).throw(RuntimeError('offline'))
+    assert prospect_demo._confirm_unclaimed(core, 'example-club', state) is False
+    core = FakeCore()
+    core._get_collection_claim_owner = lambda _: '__anonymous_preview_deleting__'
+    assert prospect_demo._confirm_unclaimed(core, 'example-club', state) is False
