@@ -1,35 +1,39 @@
-# Anonymous store preview: implementation and release status
+# Anonymous store preview — isolated test deployment
 
-This draft ports the older preview code onto main as of September 15, 2026. It does not enable the public entry point or change the active theme.
+Updated September 16, 2026. The full trial is enabled only in the unpublished Shopify theme “Anonymous Store Builder Preview” (166579110138), with dedicated uploader and draft-builder Railway services. The active customer theme, main application services, order service, and homepage CTA are unchanged.
 
-## Visitor experience
+## Experience
 
-Team name and logo are required; group type and color are optional. No email or account is required. The waiting room uses actual backend stages, includes Cashmere product imagery, explains the next steps, and answers questions about setup fees, sizes/payment collection, personalization, fabrics/care, delivery and keeping the preview.
+Visitors supply a team name and logo without an account. The waiting room follows actual product readiness and includes existing product imagery, approved customer reviews, FAQs, and an optional video setting. The browser keeps its private return session. Completed builds offer a private store, design tools, and activation without automatically interrupting someone reading an FAQ.
 
-The existing approved featured-review section is reused inside the waiting room. It renders nothing when there are no approved reviews or its service fails. A Shopify-hosted how-to video can be added through the section setting; no empty video placeholder is shown.
+The private store shows real Shopify draft products, variants, images and prices. The admin preview supports additional designs, existing-product editing, hide/show/remove, store name, welcome text and team colors. Artwork, placement, garment colors and personalization use the existing product editor. Copying the preview URL does not transfer the private browser session. Sharing, invitations and ordering require activation.
 
-Progress is saved in the current browser. Readiness does not redirect someone away from an FAQ or video. Store and design-tool links appear when products are ready. Requests time out and retry; stale return links offer a new start. The claim handoff retains the same store and existing products.
+## Purchase and claim boundary
 
-## Companion backend changes
+The isolated builder creates products as DRAFT from the initial Shopify mutation and does not publish them to the Online Store. Direct cart requests cannot buy these products. Liquid button locks are supplementary, not the security boundary.
 
-Use the matching studio-uploader draft. Provision acknowledgement is no longer treated as product readiness. The normal is_fully_ready metaobject flag is checked before readiness and the product-marker pass. Anonymous previews may create sequential additional products; the older outreach demo retains its one-product allowance. The response includes last_product_status so the UI can show success while the next builder is available.
+Private bearer endpoints validate the exact anonymous ledger entry and Shopify ownership/cleanup markers. Builder tokens are scoped to the store, model and, for editing, the exact product. Ownership lookup failures deny design access. Builder authorization runs off the uploader event loop so the builder can call back to verify eligibility.
 
-Deletion eligibility starts 48 hours after readiness; incomplete builds have an initial 48-hour deadline to avoid indefinite orphaning. Removal runs only during 03:00–03:59 America/Los_Angeles and honors daylight saving. Missed overnight windows wait for a later overnight pass. The UI shows the next scheduled removal date.
+Activation uses the existing signed Shopify app-proxy join flow. A numeric verified owner and completed builds are required before the same visible draft products are published. Hidden products stay draft. A restart-safe reconciler finishes the transition; it does not create a replacement store.
 
-## Release blockers — do not enable yet
+## Retention
 
-1. The inherited product tag plus Liquid purchase-button lock is UI-only. Direct Shopify cart/checkout must be enforced before enabling. Automatic products may also be published before the end-of-build tagging pass. A safe production release requires a verified Shopify checkout validation or a draft-product preview path with activation publishing; do not represent the current tag as server-enforced checkout protection.
-2. The inherited admin demo supports appearance and new-product builders. Existing-product edit/hide/delete and store identity remain locked; those need scoped anonymous endpoints before claiming this is the complete admin trial requested.
-3. Cleanup now reserves the same atomic Shopify claim marker before removal. Claim requests reject the deletion marker with HTTP 410. A failed cleanup keeps the marker so a partially removed store cannot be claimed; the next overnight pass can retry. Verify this against Shopify in staging before enabling cleanup.
-4. Validate the entire anonymous upload → automatic product build → additional design → signed Shopify login → same-store claim in a non-production environment. Test direct cart URLs, sharing/invites and post-claim unlock. Do not restore the stale anonymous feature branch over main.
-5. A rendered browser QA pass is still required. The cloud browser could not open the local review server; automated DOM tests are provided, but these do not prove visual rendering.
+A completed preview receives 48 hours from readiness. An incomplete build has a 48-hour fallback deadline from creation. Removal runs only during 03:00–03:59 America/Los_Angeles, at the first overnight window after eligibility; daylight saving is handled. Cleanup reserves the existing atomic collection claim marker before deletion and skips claimed stores. The preview service retention flag is enabled. Scheduled overnight execution is covered by automated tests; no claimed store was deleted as a test.
 
-The design-review HTML now contains only the waiting-room state, with no signup form or account-choice cards. It renders the waiting state even when scripts are disabled.
+Anonymous builds use their own internal status so the existing live outreach queue cannot reclassify them. Previously reclassified preview states recover when product readiness is verified.
 
-## Validation
+## Verification and remaining acceptance check
 
-Nine DOM behavior tests cover building, ready, failure recovery, expired-session reset, claimed handoff, network failure and untrusted returned URLs, team identity, and the waiting-only preview with scripts disabled. Backend tests cover readiness, multi-build reservation behavior, owner/claim-marker protection, daylight-saving dates and the no-daytime-deletion guard.
+72 automated tests passed: 52 uploader lifecycle/claim/preview tests, 8 isolated builder tests, and 12 browser-DOM behavior tests. A real anonymous test store completed its initial build and a further design. Browser checks covered waiting-room readiness, private products, catalog and editor. Saved appearance and hide/show were verified against the deployed API. A fresh unauthenticated direct Shopify cart request for both an initial product and an added design returned HTTP 422, “Cannot find variant.”
 
-## Scope safety
+The connected browser uses a platform administrator account. That role deliberately does not become a prospect-store owner. Final signed-in customer claim and post-claim checkout therefore remain an acceptance check using an ordinary customer account; activation behavior is tested at the backend unit level. No purchase was placed.
 
-The public demo setting defaults off. No homepage CTA has been switched. Production checkout, orders, live customer stores and Railway settings have not been changed.
+## Deployment references
+
+- Theme start: https://stellasageco.com/pages/storefront?view=start-team-store&preview_theme_id=166579110138
+- Preview API: https://anonymous-demo-preview-production.up.railway.app
+- Draft builder: https://anonymous-draft-builder-production.up.railway.app
+- Theme PR: https://github.com/rirwin276/Shopify-code/pull/201
+- Uploader PR: https://github.com/rirwin276/studio-uploader/pull/86
+
+Keep all three feature changes together for a future main rollout. The standard theme entry setting still defaults off; the deployment manifest enables only the dedicated unpublished test theme. Do not apply unrelated staged Railway environment changes.
