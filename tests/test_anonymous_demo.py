@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -56,6 +57,27 @@ class FakeCore:
     def _shopify_rest_put(self, path, body):
         self.activated.append((path, body))
         return body
+
+
+def test_capacity_counts_only_unexpired_builds(monkeypatch):
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    states = {
+        "building": {"source": "anonymous_demo", "status": "anonymous_building", "claim_status": "unclaimed", "expires_at": future},
+        "finished": {"source": "anonymous_demo", "status": "ready", "claim_status": "unclaimed", "expires_at": future},
+        "claimed": {"source": "anonymous_demo", "status": "building", "claim_status": "claimed", "expires_at": future},
+        "stale": {"source": "anonymous_demo", "status": "queued", "claim_status": "unclaimed", "expires_at": past},
+        "other": {"source": "direct_outreach_api", "status": "building", "claim_status": "unclaimed", "expires_at": future},
+    }
+    monkeypatch.setattr(anonymous_demo.outreach_tracking, "list_all", lambda _core: states)
+    monkeypatch.setenv("ANONYMOUS_DEMO_MAX_ACTIVE", "1")
+
+    assert anonymous_demo._active_count(object()) == 1
+    assert anonymous_demo._at_capacity(object()) is True
+
+    states["building"]["status"] = "ready"
+    assert anonymous_demo._active_count(object()) == 0
+    assert anonymous_demo._at_capacity(object()) is False
 
 
 def _setup(monkeypatch):
