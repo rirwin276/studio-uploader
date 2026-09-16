@@ -1863,6 +1863,13 @@ async def storefront_join(handle: str, request: Request):
                 if not claim_owner_id:
                     raise RuntimeError("Claim marker was not available after claim attempt")
 
+                from anonymous_lifecycle import is_deletion_claim
+                if is_deletion_claim(claim_owner_id):
+                    return JSONResponse(
+                        {"error": "This unclaimed preview has expired and is being removed. Please start a new store.", "code": "preview_expired"},
+                        status_code=410,
+                    )
+
                 claimed_admin = claim_owner_id == customer_id
                 # Keep the public custom_shop owner field in sync with the
                 # atomic collection marker. Retried requests safely repair a
