@@ -28,6 +28,7 @@ _STORE_LOCKS_GUARD = threading.Lock()
 _MAX_EVENTS = 100
 
 ALLOWED_EVENTS = {
+    "anonymous_demo_started",
     "prospect_store_opened",
     "admin_demo_opened",
     "store_customizer_opened",
@@ -77,12 +78,7 @@ def _normalize_handle(raw: Any) -> str:
 
 def _is_unclaimed_prospect(state: Dict[str, Any]) -> bool:
     """Cheap ledger check. Says "maybe" — see _confirm_unclaimed for the answer."""
-    return bool(
-        state
-        and outreach_tracking.is_outreach_source(state.get("source"))
-        and str(state.get("store_status") or "").lower() == "prospect_unclaimed"
-        and str(state.get("claim_status") or "unclaimed").lower() == "unclaimed"
-    )
+    return outreach_tracking.is_unclaimed_demo_state(state)
 
 
 def _shopify_owner(core: Any, handle: str) -> str:
@@ -114,6 +110,20 @@ def _confirm_unclaimed(core: Any, handle: str, state: Dict[str, Any]) -> bool:
     """
     if not _is_unclaimed_prospect(state):
         return False
+    if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+        # Anonymous previews have no signed-in owner to fall back on. Refuse
+        # design access if the authoritative Shopify check is unavailable.
+        try:
+            shop = core._get_custom_shop(handle)
+            if not shop:
+                return False
+            fields = shop.get("fields") or {}
+            owner = core._normalize_store_owner(fields.get("owner_customer_id") or "")
+            collection = fields.get("collection_gid")
+            marker = core._get_collection_claim_owner(collection) if collection else ""
+            return not owner and not marker
+        except Exception:
+            return False
     if not _shopify_owner(core, handle):
         return True
 
@@ -139,6 +149,23 @@ def _demo(state: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+def _product_limit(state: Dict[str, Any], demo: Dict[str, Any]) -> int:
+    if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+        return 2
+    try:
+        return max(1, int(demo.get("product_limit") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _products_created(demo: Dict[str, Any]) -> int:
+    counts = demo.get("event_counts") or {}
+    try:
+        return max(0, int(counts.get("demo_product_successfully_created") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _public_state(
     handle: str,
     state: Dict[str, Any],
@@ -149,16 +176,27 @@ def _public_state(
     authoritative. Without it this falls back to the ledger, which can only be
     stale in the permissive direction."""
     demo = _demo(state)
+    product_limit = _product_limit(state, demo)
+    products_created = _products_created(demo)
+    stored_status = demo.get("product_status") or "available"
+    can_build_another = products_created < product_limit
     if unclaimed is None:
         unclaimed = _is_unclaimed_prospect(state)
     return {
         "ok": True,
         "handle": handle,
+        "demo_source": str(state.get("source") or ""),
         "store_status": state.get("store_status") or "",
         "claim_status": state.get("claim_status") or "unclaimed",
         "enabled": unclaimed and bool(demo.get("enabled", True)),
-        "product_limit": 1,
-        "product_status": demo.get("product_status") or "available",
+        "product_limit": product_limit,
+        "products_created": products_created,
+        "products_remaining": max(0, product_limit - products_created),
+        "last_product_status": stored_status,
+        "product_status": (
+            "available" if outreach_tracking.is_anonymous_demo_source(state.get("source"))
+            and stored_status == "completed" and can_build_another else stored_status
+        ),
         "product_model": demo.get("product_model"),
         "product_id": demo.get("product_id"),
         "product_handle": demo.get("product_handle"),
@@ -262,7 +300,7 @@ def mark_claimed(core: Any, handle: str, customer_id: str) -> None:
         return
     with _store_lock(normalized):
         state = outreach_tracking.read(core, normalized)
-        if not state or not outreach_tracking.is_outreach_source(state.get("source")):
+        if not state or not outreach_tracking.is_demo_source(state.get("source")):
             return
         if str(state.get("claim_status") or "").strip().lower() == "claimed":
             return
@@ -270,6 +308,12 @@ def mark_claimed(core: Any, handle: str, customer_id: str) -> None:
         state["store_status"] = "claimed"
         state["claimed_at"] = outreach_tracking.utc_iso()
         state["claimed_customer_id"] = str(customer_id or "")[:80]
+        # Anonymous demos expire strictly 48 hours after they become ready.
+        # Claiming turns the exact same store into a permanent one, so clear the
+        # deadline in the same best-effort transition that records the claim.
+        if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+            state["expires_at"] = None
+            state["delete_due_at"] = None
         _append_event(
             state,
             "store_successfully_claimed",
@@ -359,10 +403,25 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 return JSONResponse({"error": "Store is not an unclaimed prospect"}, status_code=409)
             demo = _demo(state)
             status = str(demo.get("product_status") or "available")
-            # Testing the builder must not spend the prospect's one free
-            # product. Finding it already used, by someone they never met, is
+            product_limit = _product_limit(state, demo)
+            products_created = _products_created(demo)
+            # Staff testing must not spend either of the prospect's free
+            # products. Finding the preview used by someone they never met is
             # a worse first impression than the demo is a good one.
             if staff and status in {"reserved", "building", "completed"}:
+                status = "available"
+            if not staff and products_created >= product_limit:
+                return JSONResponse(
+                    {
+                        "error": f"You created both preview products. Claim your free store to build more.",
+                        "product_status": "completed",
+                        "product_limit": product_limit,
+                        "products_created": products_created,
+                    },
+                    status_code=409,
+                )
+            if (status == "completed" and outreach_tracking.is_anonymous_demo_source(state.get("source"))
+                    and demo.get("request_id") != request_id):
                 status = "available"
             if status in {"reserved", "building", "completed"}:
                 if status != "completed" and demo.get("request_id") == request_id:
@@ -442,6 +501,22 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 "demo_product_successfully_created",
                 details={"product_id": product_id, "product_handle": product_handle},
             )
+            # Products created before an anonymous visitor owns the store must
+            # be viewable but not purchasable. The theme enforces this marker
+            # while custom_shop still says unclaimed.
+            try:
+                from anonymous_demo import tag_product_if_anonymous
+
+                tag_product_if_anonymous(core, state, product_id)
+            except Exception as exc:
+                if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+                    demo["product_status"] = "building"
+                    state["prospect_demo"] = demo
+                    outreach_tracking.upsert(core, normalized, state)
+                    return JSONResponse(
+                        {"error": "Product built, but checkout protection could not be applied"},
+                        status_code=502,
+                    )
             outreach_tracking.upsert(core, normalized, state)
             return {"ok": True, "status": "completed", "product_id": product_id, "product_handle": product_handle}
 

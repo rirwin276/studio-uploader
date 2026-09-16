@@ -42,9 +42,45 @@ def _request(customer_id: str, secret: str = "test-secret") -> Request:
 class StoreClaimTests(unittest.TestCase):
     def setUp(self):
         app_module._ADMIN_SECRET = "test-secret"
+        tracking = patch('prospect_demo.mark_claimed')
+        tracking.start()
+        self.addCleanup(tracking.stop)
 
     def _join(self, customer_id: str):
         return asyncio.run(app_module.storefront_join("test-store", _request(customer_id)))
+
+    def test_cleanup_winner_cannot_be_claimed_or_granted_membership(self):
+        from anonymous_lifecycle import DELETION_CLAIM
+        store = {"id":"gid://shopify/Metaobject/1", "fields":{
+            "owner_customer_id":"unclaimed", "collection_gid":"gid://shopify/Collection/1"}}
+        with (
+            patch.object(app_module, "_get_customer_tags", return_value=[]),
+            patch.object(app_module, "_get_custom_shop", return_value=store),
+            patch.object(app_module, "_get_collection_claim_owner", return_value=DELETION_CLAIM),
+            patch.object(app_module, "_set_custom_shop_owner") as set_owner,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
+        ):
+            result = self._join("101")
+        self.assertEqual(result.status_code, 410)
+        set_owner.assert_not_called()
+        add_tags.assert_not_called()
+
+    def test_cleanup_winning_after_claim_read_is_also_rejected(self):
+        from anonymous_lifecycle import DELETION_CLAIM
+        store = {"id":"gid://shopify/Metaobject/1", "fields":{
+            "owner_customer_id":"unclaimed", "collection_gid":"gid://shopify/Collection/1"}}
+        with (
+            patch.object(app_module, "_get_customer_tags", return_value=[]),
+            patch.object(app_module, "_get_custom_shop", return_value=store),
+            patch.object(app_module, "_get_collection_claim_owner", side_effect=["",DELETION_CLAIM]),
+            patch.object(app_module, "_try_create_collection_claim", return_value=False),
+            patch.object(app_module, "_set_custom_shop_owner") as set_owner,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
+        ):
+            result = self._join("101")
+        self.assertEqual(result.status_code, 410)
+        set_owner.assert_not_called()
+        add_tags.assert_not_called()
 
     def test_claimable_build_requires_admin_secret(self):
         result = asyncio.run(
@@ -103,16 +139,16 @@ class StoreClaimTests(unittest.TestCase):
             patch.object(app_module, "_get_customer_tags", return_value=[]),
             patch.object(app_module, "_get_custom_shop", return_value=store),
             patch.object(app_module, "_get_collection_claim_owner") as marker,
-            patch.object(app_module, "_customer_add_tag") as add_tag,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
         ):
             result = self._join("202")
 
         self.assertEqual(result["role"], "member")
         self.assertFalse(result["claimed_admin"])
         marker.assert_not_called()
-        add_tag.assert_called_once_with(
+        add_tags.assert_called_once_with(
             "gid://shopify/Customer/202",
-            "storefront-member--test-store",
+            ["storefront-member--test-store"],
         )
 
     def test_first_claimant_gets_admin_and_member(self):
@@ -129,7 +165,7 @@ class StoreClaimTests(unittest.TestCase):
             patch.object(app_module, "_get_collection_claim_owner", return_value=""),
             patch.object(app_module, "_try_create_collection_claim", return_value=True),
             patch.object(app_module, "_set_custom_shop_owner") as set_owner,
-            patch.object(app_module, "_customer_add_tag") as add_tag,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
         ):
             result = self._join("101")
 
@@ -137,17 +173,37 @@ class StoreClaimTests(unittest.TestCase):
         self.assertTrue(result["claimed_admin"])
         set_owner.assert_called_once_with("gid://shopify/Metaobject/1", "101")
         self.assertEqual(
-            add_tag.call_args_list,
-            [
-                unittest.mock.call(
-                    "gid://shopify/Customer/101",
-                    "storefront-admin--test-store",
-                ),
-                unittest.mock.call(
-                    "gid://shopify/Customer/101",
-                    "storefront-member--test-store",
-                ),
-            ],
+            add_tags.call_args_list,
+            [unittest.mock.call(
+                "gid://shopify/Customer/101",
+                ["storefront-admin--test-store", "storefront-member--test-store"],
+            )],
+        )
+
+    def test_platform_operator_can_explicitly_claim_and_get_store_admin_tag(self):
+        store = {
+            "id": "gid://shopify/Metaobject/1",
+            "fields": {
+                "owner_customer_id": "unclaimed",
+                "collection_gid": "gid://shopify/Collection/1",
+            },
+        }
+        with (
+            patch.object(app_module, "_get_customer_tags", return_value=["super-admin"]),
+            patch.object(app_module, "_get_custom_shop", return_value=store),
+            patch.object(app_module, "_get_collection_claim_owner", return_value=""),
+            patch.object(app_module, "_try_create_collection_claim", return_value=True),
+            patch.object(app_module, "_set_custom_shop_owner") as set_owner,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
+        ):
+            result = self._join("101")
+
+        self.assertTrue(result["claimed_admin"])
+        self.assertTrue(result["platform_operator"])
+        set_owner.assert_called_once_with("gid://shopify/Metaobject/1", "101")
+        add_tags.assert_called_once_with(
+            "gid://shopify/Customer/101",
+            ["storefront-admin--test-store", "storefront-member--test-store"],
         )
 
     def test_later_claimant_gets_member_only(self):
@@ -164,7 +220,7 @@ class StoreClaimTests(unittest.TestCase):
             patch.object(app_module, "_get_collection_claim_owner", return_value="101"),
             patch.object(app_module, "_try_create_collection_claim") as try_claim,
             patch.object(app_module, "_set_custom_shop_owner") as set_owner,
-            patch.object(app_module, "_customer_add_tag") as add_tag,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
         ):
             result = self._join("202")
 
@@ -172,9 +228,9 @@ class StoreClaimTests(unittest.TestCase):
         self.assertFalse(result["claimed_admin"])
         try_claim.assert_not_called()
         set_owner.assert_called_once_with("gid://shopify/Metaobject/1", "101")
-        add_tag.assert_called_once_with(
+        add_tags.assert_called_once_with(
             "gid://shopify/Customer/202",
-            "storefront-member--test-store",
+            ["storefront-member--test-store"],
         )
 
     def test_claim_owner_retry_repairs_missing_admin_tag(self):
@@ -189,12 +245,15 @@ class StoreClaimTests(unittest.TestCase):
             patch.object(app_module, "_get_customer_tags", return_value=[]),
             patch.object(app_module, "_get_custom_shop", return_value=store),
             patch.object(app_module, "_get_collection_claim_owner", return_value="101"),
-            patch.object(app_module, "_customer_add_tag") as add_tag,
+            patch.object(app_module, "_customer_add_tags") as add_tags,
         ):
             result = self._join("101")
 
         self.assertEqual(result["role"], "admin")
-        self.assertEqual(add_tag.call_count, 2)
+        add_tags.assert_called_once_with(
+            "gid://shopify/Customer/101",
+            ["storefront-admin--test-store", "storefront-member--test-store"],
+        )
 
     def test_atomic_claim_conflict_is_a_normal_loss(self):
         with patch.object(
