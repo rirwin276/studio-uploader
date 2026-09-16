@@ -43,6 +43,7 @@ _RATE_LOCK = threading.Lock()
 _RATE_BUCKETS: Dict[str, Deque[float]] = defaultdict(deque)
 _RATE_WINDOW_SECONDS = 60 * 60
 _DEFAULT_RATE_LIMIT = 2
+_ACTIVE_BUILD_STATUSES = frozenset({"anonymous_building", "building", "queued", "provisioned"})
 _TOKEN_VERSION = 1
 _TOKEN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 _PRODUCT_TAG = "ss-anonymous-demo"
@@ -211,11 +212,6 @@ def _send_ready_email(email: str, name: str, token: str) -> None:
 
 
 def _active_count(core: Any) -> int:
-    maximum_raw = os.getenv("ANONYMOUS_DEMO_MAX_ACTIVE", "20")
-    try:
-        maximum = max(1, min(200, int(maximum_raw)))
-    except ValueError:
-        maximum = 20
     count = 0
     now = datetime.now(timezone.utc)
     for state in outreach_tracking.list_all(core).values():
@@ -223,11 +219,13 @@ def _active_count(core: Any) -> int:
             continue
         if str(state.get("claim_status") or "unclaimed").lower() == "claimed":
             continue
-        if str(state.get("status") or "").lower() in {"deleted", "expired", "failed"}:
+        if str(state.get("status") or "").lower() not in _ACTIVE_BUILD_STATUSES:
             continue
         expiry = outreach_tracking.parse_iso(state.get("expires_at"))
+        if expiry and expiry <= now:
+            continue
         count += 1
-    return count if count < maximum else maximum
+    return count
 
 
 def _at_capacity(core: Any) -> bool:
