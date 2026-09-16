@@ -361,7 +361,7 @@ def _run_build(
 
 def _refresh_readiness(core: Any, handle: str) -> Dict[str, Any]:
     state = outreach_tracking.read(core, handle)
-    if str(state.get("status") or "") not in {"building", "queued"}:
+    if str(state.get("status") or "") not in {"anonymous_building", "building", "queued", "provisioned"}:
         return state
     shop = core._get_custom_shop(handle)
     fields = (shop or {}).get("fields") or {}
@@ -384,6 +384,7 @@ def _public_status(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
     phase = {
         "queued": "queued",
         "building": "building",
+        "anonymous_building": "building",
         "ready": "ready",
         "failed": "failed",
         "deleted": "expired",
@@ -481,7 +482,7 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat(),
             "delete_due_at": overnight_deadline(datetime.now(timezone.utc) + timedelta(hours=48)).isoformat(),
             "build_stage": "store",
-            "status": "building",
+            "status": "anonymous_building",
             "store_status": STORE_STATUS,
             "claim_status": "unclaimed",
             "resume_token_hash": _token_hash(token),
@@ -547,7 +548,7 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             return JSONResponse({"error": "Demo not found"}, status_code=404)
         if not hmac.compare_digest(str(state.get("resume_token_hash") or ""), _token_hash(token)):
             return JSONResponse({"error": "invalid return link"}, status_code=401)
-        if str(state.get("status") or "") in {"building", "queued"}:
+        if str(state.get("status") or "") in {"anonymous_building", "building", "queued", "provisioned"}:
             try:
                 state = _refresh_readiness(core, handle)
             except Exception:

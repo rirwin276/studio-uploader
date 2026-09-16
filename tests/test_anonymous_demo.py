@@ -213,4 +213,17 @@ def test_readiness_failure_does_not_expose_store(monkeypatch):
     monkeypatch.setattr(anonymous_demo, '_tag_existing_store_products', lambda *_: (_ for _ in ()).throw(RuntimeError('lock failed')))
     response = client.get('/api/demo/status', headers={'Authorization':'Bearer '+response.json()['resume_token']})
     assert response.status_code == 503
-    assert states['raptors-demo-a1b2c3']['status'] == 'building'
+    assert states['raptors-demo-a1b2c3']['status'] == 'anonymous_building'
+
+
+def test_recovers_preview_reclassified_by_legacy_intake_worker(monkeypatch):
+    client, core, states = _setup(monkeypatch)
+    core.ready = False
+    response = client.post('/api/demo/storefront-request', data={'storefront_name':'Raptors'}, files={'storefront_logo_file':('logo.png',b'fake','image/png')})
+    state = states['raptors-demo-a1b2c3']
+    assert state['status'] == 'anonymous_building'
+    state.update(status='provisioned', store_status='prospect_unclaimed')
+    core.ready = True
+    result = client.get('/api/demo/status', headers={'Authorization':'Bearer '+response.json()['resume_token']})
+    assert result.json()['phase'] == 'ready'
+    assert states['raptors-demo-a1b2c3']['store_status'] == 'anonymous_demo_unclaimed'

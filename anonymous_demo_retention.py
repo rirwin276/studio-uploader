@@ -52,7 +52,7 @@ def _eligible(state: Dict[str, Any], now: float) -> bool:
         return False
     if str(state.get("claim_status") or "unclaimed").lower() == "claimed":
         return False
-    if str(state.get("status") or "").lower() not in {"ready", "failed", "building", "queued"}:
+    if str(state.get("status") or "").lower() not in {"ready", "failed", "anonymous_building", "building", "queued"}:
         return False
     expiry = outreach_tracking.parse_iso(state.get("expires_at"))
     if not expiry:

@@ -133,7 +133,7 @@ def reconcile(core):
     for handle, state in outreach_tracking.list_all(core).items():
         if outreach_tracking.is_anonymous_demo_source(state.get("source")) and state.get("status") not in {"deleted", "deleting"}:
             try:
-                if not activate_claimed(core, handle) and state.get("status") in {"queued", "building"}:
+                if not activate_claimed(core, handle) and state.get("status") in {"anonymous_building", "queued", "building", "provisioned"}:
                     demo._refresh_readiness(core, handle)
             except Exception:
                 # Leave state retryable; never mark a partially published store complete.
