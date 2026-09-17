@@ -28,6 +28,7 @@ class FakeCore:
         self.tagged = []
         self.activated = []
         self.ready = True
+        self.product_status = "DRAFT"
 
     def _get_custom_shop(self, _handle):
         return {"fields": {"is_fully_ready": "true" if self.ready else "false"}}
@@ -45,7 +46,7 @@ class FakeCore:
         if "AnonymousDemoProducts" in query or "AnonymousStoreProducts" in query:
             return {
                 "products": {
-                    "nodes": [{"id": "gid://shopify/Product/1", "status": "DRAFT", "tags": ["raptors-demo-a1b2c3"]}],
+                    "nodes": [{"id": "gid://shopify/Product/1", "status": self.product_status, "tags": ["raptors-demo-a1b2c3"]}],
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                 }
             }
@@ -164,7 +165,24 @@ def test_start_builds_ownerless_demo_and_returns_secure_resume_token(monkeypatch
     status = client.get("/api/demo/status", headers={"Authorization": f"Bearer {token}"})
     assert status.status_code == 200
     assert status.json()["phase"] == "ready"
+    assert status.json()["created_at"] == state["created_at"]
+    assert status.json()["logo_url"] == "/preview/anonymous-logo-session?version=original"
     assert status.json()["admin_url"].endswith("shop=raptors-demo-a1b2c3&prospect_demo=1")
+
+
+def test_new_active_product_is_tagged_without_republishing_it():
+    core = FakeCore()
+    core.product_status = "ACTIVE"
+    state = {
+        "source": "anonymous_demo",
+        "handle": "raptors-demo-a1b2c3",
+        "status": "ready",
+    }
+
+    anonymous_demo.tag_product_if_anonymous(core, state, "1")
+
+    assert core.tagged[0] == "gid://shopify/Product/1"
+    assert core.activated == []
 
 
 def test_return_token_cannot_be_swapped_between_stores(monkeypatch):
