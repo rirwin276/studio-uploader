@@ -333,6 +333,47 @@ def test_anonymous_preview_can_build_again_but_not_concurrently(monkeypatch):
     assert client.post(path+'/demo-product/reserve',headers=_headers(),json={'model':'nl6733','request_id':'third','job_id':'three'}).status_code == 409
 
 
+def test_anonymous_product_completion_recovers_on_next_state_poll(monkeypatch):
+    import anonymous_demo
+
+    attempts = []
+
+    def protect(_core, _state, product_id):
+        attempts.append(product_id)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary Shopify failure")
+
+    monkeypatch.setattr(anonymous_demo, "tag_product_if_anonymous", protect)
+    client, states = _client(monkeypatch, source="anonymous_demo")
+    states["example-club"]["store_status"] = "anonymous_demo_unclaimed"
+    path = "/api/outreach/store/example-club"
+    reserved = client.post(
+        path + "/demo-product/reserve",
+        headers=_headers(),
+        json={"model": "bc3413", "request_id": "first", "job_id": "one"},
+    )
+    completed = client.post(
+        path + "/demo-product/complete",
+        headers=_headers(),
+        json={
+            "reservation_id": reserved.json()["reservation_id"],
+            "product_id": "gid://shopify/Product/123",
+            "product_handle": "example-product",
+        },
+    )
+    assert completed.status_code == 502
+    assert states["example-club"]["prospect_demo"]["product_status"] == "building"
+
+    healed = client.get(path + "/demo-state", headers=_headers())
+
+    assert healed.status_code == 200
+    assert healed.json()["last_product_status"] == "completed"
+    assert healed.json()["product_status"] == "available"
+    assert healed.json()["product_handle"] == "example-product"
+    assert attempts == ["gid://shopify/Product/123", "gid://shopify/Product/123"]
+    assert states["example-club"]["prospect_demo"]["product_status"] == "completed"
+
+
 def test_anonymous_design_denied_when_shopify_owner_check_fails():
     state = {'source':'anonymous_demo', 'store_status':'anonymous_demo_unclaimed', 'claim_status':'unclaimed'}
     core = FakeCore()
