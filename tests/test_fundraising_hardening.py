@@ -104,6 +104,7 @@ def env_setup(monkeypatch):
     monkeypatch.setenv("SHOP", "example.myshopify.com")
     monkeypatch.setenv("CLIENT_SECRET", "shopify-access-token")
     monkeypatch.setenv("ADMIN_SECRET", ADMIN_SECRET)
+    monkeypatch.setenv("FUNDRAISING_SETUP_ENABLED", "true")
     monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.setenv("FUNDRAISING_SUPERADMIN_CUSTOMER_IDS", SUPERADMIN_ID)
     # Reload module-level constants that read env at import time.

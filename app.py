@@ -2048,6 +2048,17 @@ async def storefront_nuke(handle: str, request: Request):
 # here so a direct call without it is rejected.
 _FR_METAOBJECT_TYPE = "store_fundraising"
 
+def _fundraising_setup_enabled() -> bool:
+    """New fundraiser setup is paused by default; settlements remain available."""
+    return os.getenv("FUNDRAISING_SETUP_ENABLED", "false").strip().lower() == "true"
+
+def _fundraising_coming_soon():
+    return JSONResponse(
+        {"ok": False, "code": "fundraising_coming_soon",
+         "error": "Fundraising is coming soon. New fundraiser setup is currently unavailable."},
+        status_code=503,
+    )
+
 # Platform fee added on top of the fundraising amount on launch.
 # Defined once here so both the POST handler and _fr_sync_pricing stay in sync.
 _FR_PLATFORM_FEE = 1
@@ -2548,6 +2559,13 @@ async def fundraising_post(handle: str, request: Request):
     if not isinstance(body, dict):
         return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
 
+    # Allow an explicit stop to restore prices and settle existing obligations.
+    # Cached admin pages cannot save drafts, launch, or edit while setup is paused.
+    if not _fundraising_setup_enabled():
+        if body.get("enabled") is not False or _fr_is_edit_request(body):
+            return _fundraising_coming_soon()
+        body = {"enabled": False}  # A stop cannot smuggle new setup fields.
+
     try:
         _ensure_fundraising_definition()
         current = _fr_get_state(handle)
@@ -2920,6 +2938,8 @@ async def fundraising_stripe_connect(handle: str, request: Request):
     denied = _require_admin_secret(request)
     if denied is not None:
         return denied
+    if not _fundraising_setup_enabled():
+        return _fundraising_coming_soon()
 
     handle = (handle or "").strip()
     if not handle:
