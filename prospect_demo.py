@@ -166,6 +166,38 @@ def _products_created(demo: Dict[str, Any]) -> int:
         return 0
 
 
+def _reconcile_completed_anonymous_product(core: Any, handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Finish a product whose builder callback reached Shopify but not us.
+
+    The completion route stores the returned product id before applying the
+    anonymous-preview tag. If that final Shopify operation has a transient
+    failure, a later state poll can safely retry it and clear the stale
+    ``building`` badge without asking the visitor to build the product again.
+    """
+    if not outreach_tracking.is_anonymous_demo_source(state.get("source")):
+        return state
+    demo = _demo(state)
+    product_id = str(demo.get("product_id") or "").strip()
+    if demo.get("product_status") != "building" or not product_id:
+        return state
+    try:
+        from anonymous_demo import tag_product_if_anonymous
+
+        tag_product_if_anonymous(core, state, product_id)
+    except Exception as exc:
+        print(
+            f"[prospect-demo] product reconciliation pending for {handle} "
+            f"({product_id[:80]}): {type(exc).__name__}: {exc}"
+        )
+        return state
+    demo["product_status"] = "completed"
+    demo.setdefault("completed_at", outreach_tracking.utc_iso())
+    state["prospect_demo"] = demo
+    outreach_tracking.upsert(core, handle, state)
+    print(f"[prospect-demo] reconciled completed product for {handle} ({product_id[:80]})")
+    return state
+
+
 def _public_state(
     handle: str,
     state: Dict[str, Any],
@@ -343,6 +375,7 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
         state = outreach_tracking.read(core, normalized)
         if not state:
             return JSONResponse({"error": "Outreach tracking not found"}, status_code=404)
+        state = _reconcile_completed_anonymous_product(core, normalized, state)
         # This response is what unhides Try the admin and what mints the demo
         # token, so the claim check here has to be the authoritative one.
         return _public_state(
@@ -510,6 +543,10 @@ def install_prospect_demo_routes(app: Any, core: Any) -> bool:
                 tag_product_if_anonymous(core, state, product_id)
             except Exception as exc:
                 if outreach_tracking.is_anonymous_demo_source(state.get("source")):
+                    print(
+                        f"[prospect-demo] product protection pending for {normalized} "
+                        f"({product_id[:80]}): {type(exc).__name__}: {exc}"
+                    )
                     demo["product_status"] = "building"
                     state["prospect_demo"] = demo
                     outreach_tracking.upsert(core, normalized, state)

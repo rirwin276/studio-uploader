@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Deque, Dict, Iterable
 from email.mime.text import MIMEText
+from urllib.parse import quote
 
 from fastapi import File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -284,24 +285,38 @@ def _tag_products(core: Any, product_ids: Iterable[str], *extra_tags: str) -> No
     for product_id in product_ids:
         if not product_id:
             continue
+        normalized_id = str(product_id).strip()
+        if normalized_id.isdigit():
+            normalized_id = f"gid://shopify/Product/{normalized_id}"
+        if not re.fullmatch(r"gid://shopify/Product/\d+", normalized_id):
+            raise RuntimeError(f"Invalid Shopify product id: {normalized_id[:80]}")
         tags = list(dict.fromkeys([_PRODUCT_TAG, *[tag for tag in extra_tags if tag]]))
-        result = core._shopify_graphql(mutation, {"id": product_id, "tags": tags})
-        errors = ((result.get("tagsAdd") or {}).get("userErrors")) or []
-        if errors:
-            raise RuntimeError("Unable to mark anonymous demo product")
+        last_error = ""
+        for attempt in range(3):
+            result = core._shopify_graphql(mutation, {"id": normalized_id, "tags": tags})
+            errors = ((result.get("tagsAdd") or {}).get("userErrors")) or []
+            if not errors:
+                last_error = ""
+                break
+            last_error = "; ".join(str(error.get("message") or error) for error in errors)
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+        if last_error:
+            raise RuntimeError(f"Unable to mark anonymous demo product: {last_error[:300]}")
 
 
 def tag_product_if_anonymous(core: Any, state: Dict[str, Any], product_id: str) -> None:
     if outreach_tracking.is_anonymous_demo_source(state.get("source")):
         handle = str(state.get("handle") or state.get("storefront_handle") or "").strip()
+        if not handle:
+            raise RuntimeError("Anonymous demo product has no store handle")
         _tag_products(core, [product_id], handle)
-        if handle and str(state.get("status") or "").lower() in {"ready", "claimed"}:
-            legacy_id = str(product_id).rsplit("/", 1)[-1]
-            if legacy_id.isdigit():
-                core._shopify_rest_put(
-                    f"products/{legacy_id}.json",
-                    {"product": {"id": int(legacy_id), "status": "active", "published": True}},
-                )
+        if str(state.get("status") or "").lower() in {"ready", "claimed"}:
+            # Re-read the store products before activating. Builders can return
+            # an already-active product; the old unconditional REST write was
+            # the reason a successfully-created product was left forever in
+            # the UI's "building" state when Shopify rejected that extra write.
+            _activate_store_products(core, handle)
 
 
 def _tag_existing_store_products(core: Any, handle: str) -> None:
@@ -454,12 +469,16 @@ def _public_status(handle: str, state: Dict[str, Any]) -> Dict[str, Any]:
         "phase": phase,
         "storefront_name": state.get("storefront_name") or "Your team store",
         "storefront_handle": handle,
+        "created_at": state.get("created_at"),
         "build_stage": state.get("build_stage") or "store",
         "delete_due_at": state.get("delete_due_at"),
         "ready_at": state.get("ready_at"),
         "expires_at": state.get("expires_at"),
         "error": state.get("build_error") if phase == "failed" else None,
     }
+    logo_session_id = str(state.get("logo_session_id") or "").strip()
+    if logo_session_id:
+        result["logo_url"] = f"/preview/{quote(logo_session_id, safe='')}?version=original"
     if phase in {"ready", "claimed"}:
         result.update(_store_urls(handle, claimed=phase == "claimed"))
     return result
@@ -542,6 +561,7 @@ def install_anonymous_demo_routes(app: Any, core: Any) -> bool:
             "store_status": STORE_STATUS,
             "claim_status": "unclaimed",
             "resume_token_hash": _token_hash(token),
+            "logo_session_id": session_id,
             "prospect_demo": {
                 "enabled": True,
                 "product_limit": 0,
