@@ -1844,6 +1844,20 @@ async def storefront_join(handle: str, request: Request):
         if custom_shop is None:
             return JSONResponse({"error": "Store not found"}, status_code=404)
 
+        if platform_operator:
+            # Global management access must not consume the first customer's
+            # claim or record an operator inspection as a customer conversion.
+            return {
+                "ok": True,
+                "role": "admin",
+                "claimed_admin": False,
+                "already_member": member_tag in tags,
+                "already_admin": True,
+                "member_tag": member_tag if member_tag in tags else None,
+                "admin_tag": admin_tag if admin_tag in tags else None,
+                "platform_operator": True,
+            }
+
         fields = custom_shop["fields"]
         owner_id = _normalize_store_owner(fields.get("owner_customer_id") or "")
         collection_gid = (fields.get("collection_gid") or "").strip()

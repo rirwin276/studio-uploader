@@ -180,7 +180,7 @@ class StoreClaimTests(unittest.TestCase):
             )],
         )
 
-    def test_platform_operator_can_explicitly_claim_and_get_store_admin_tag(self):
+    def test_store_admin_is_not_a_platform_operator_and_can_claim(self):
         store = {
             "id": "gid://shopify/Metaobject/1",
             "fields": {
@@ -189,7 +189,7 @@ class StoreClaimTests(unittest.TestCase):
             },
         }
         with (
-            patch.object(app_module, "_get_customer_tags", return_value=["super-admin"]),
+            patch.object(app_module, "_get_customer_tags", return_value=["storefront-admin--other-store"]),
             patch.object(app_module, "_get_custom_shop", return_value=store),
             patch.object(app_module, "_get_collection_claim_owner", return_value=""),
             patch.object(app_module, "_try_create_collection_claim", return_value=True),
@@ -199,7 +199,7 @@ class StoreClaimTests(unittest.TestCase):
             result = self._join("101")
 
         self.assertTrue(result["claimed_admin"])
-        self.assertTrue(result["platform_operator"])
+        self.assertFalse(result["platform_operator"])
         set_owner.assert_called_once_with("gid://shopify/Metaobject/1", "101")
         add_tags.assert_called_once_with(
             "gid://shopify/Customer/101",
