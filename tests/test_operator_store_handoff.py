@@ -5,6 +5,7 @@ all Shopify reads/writes and build jobs are replaced with controlled fixtures.
 """
 import importlib
 import os
+from copy import deepcopy
 from unittest.mock import Mock
 
 import pytest
@@ -127,16 +128,17 @@ def test_explicit_claimable_api_still_requires_its_existing_auth(boundary):
     thread.assert_not_called()
 
 
-@pytest.mark.parametrize("owner", ["unclaimed", "202"])
-def test_operator_join_never_claims_or_changes_owner(boundary, monkeypatch, owner):
+@pytest.mark.parametrize("owner", ["unclaimed", "202", "101"])
+@pytest.mark.parametrize("operator_tags", [["super-admin"], [" Super-Admin ", "storefront-admin--handoff-test"]])
+def test_operator_join_never_claims_or_changes_owner(boundary, monkeypatch, owner, operator_tags):
     client, tags, store, job, thread = boundary
-    tags.return_value = ["super-admin", "storefront-admin--handoff-test"]
+    tags.return_value = operator_tags
     store.return_value = {
         "id": "store-1",
         "fields": {"owner_customer_id": owner, "collection_gid": "collection-1"},
     }
     forbidden = {}
-    for key in ("_get_collection_claim_owner", "_try_create_collection_claim", "_set_custom_shop_owner", "_customer_add_tag"):
+    for key in ("_get_collection_claim_owner", "_try_create_collection_claim", "_set_custom_shop_owner", "_customer_add_tags"):
         forbidden[key] = Mock(side_effect=AssertionError("Operator must not consume/change a customer claim"))
         monkeypatch.setattr(core, key, forbidden[key])
     response = client.post("/api/storefront/handoff-test/join", json={"customer_id": "101"}, headers={"X-Admin-Secret": "test-secret"})
@@ -144,11 +146,12 @@ def test_operator_join_never_claims_or_changes_owner(boundary, monkeypatch, owne
     assert response.json()["role"] == "admin"
     assert response.json()["claimed_admin"] is False
     assert response.json()["platform_operator"] is True
+    assert response.json()["already_admin"] is True
     for fn in forbidden.values():
         fn.assert_not_called()
 
 
-def test_operator_then_first_customer_then_member_lifecycle(boundary, monkeypatch):
+def test_operator_then_recovered_product_then_customer_claim_lifecycle(boundary, monkeypatch):
     client, tags, store, job, thread = boundary
     state = {"id": "store-1", "fields": {"owner_customer_id": "unclaimed", "collection_gid": "collection-1"}}
     tags_by_id = {"101": ["super-admin"], "202": [], "303": []}
@@ -165,9 +168,23 @@ def test_operator_then_first_customer_then_member_lifecycle(boundary, monkeypatc
 
     monkeypatch.setattr(core, "_try_create_collection_claim", claim)
     monkeypatch.setattr(core, "_set_custom_shop_owner", lambda gid, cid: state["fields"].update(owner_customer_id=cid))
-    monkeypatch.setattr(core, "_customer_add_tag", lambda gid, tag: tags_by_id[gid.split("/")[-1]].append(tag))
+    monkeypatch.setattr(core, "_customer_add_tags", lambda gid, added: tags_by_id[gid.split("/")[-1]].extend(added))
     import prospect_demo
-    claimed = Mock()
+    import anonymous_demo
+    ledger = {
+        "handle": "handoff-test", "source": "anonymous_demo", "status": "ready",
+        "store_status": "anonymous_demo_unclaimed", "claim_status": "unclaimed",
+        "expires_at": "2026-09-21T00:00:00Z", "delete_due_at": "2026-09-21T10:00:00Z",
+        "prospect_demo": {
+            "product_status": "building", "product_id": "gid://shopify/Product/123",
+            "product_handle": "recovered-shirt", "reservation_id": "reservation-1",
+        },
+    }
+    monkeypatch.setattr(prospect_demo.outreach_tracking, "read", lambda *_: deepcopy(ledger))
+    monkeypatch.setattr(prospect_demo.outreach_tracking, "upsert", lambda _core, _handle, updated: ledger.update(deepcopy(updated)))
+    protect = Mock()
+    monkeypatch.setattr(anonymous_demo, "tag_product_if_anonymous", protect)
+    claimed = Mock(wraps=prospect_demo.mark_claimed)
     monkeypatch.setattr(prospect_demo, "mark_claimed", claimed)
 
     def join(cid):
@@ -178,6 +195,12 @@ def test_operator_then_first_customer_then_member_lifecycle(boundary, monkeypatc
     assert join("101")["claimed_admin"] is False
     assert marker["owner"] == ""
     assert state["fields"]["owner_customer_id"] == "unclaimed"
+    claimed.assert_not_called()
+    prospect_demo._reconcile_completed_anonymous_product(core, "handoff-test", deepcopy(ledger))
+    protect.assert_called_once()
+    recovered_product = deepcopy(ledger["prospect_demo"])
+    assert recovered_product["product_status"] == "completed"
+    assert prospect_demo._confirm_unclaimed(core, "handoff-test", ledger) is True
     assert join("202")["claimed_admin"] is True
     assert state["fields"]["owner_customer_id"] == marker["owner"] == "202"
     assert join("303")["role"] == "member"
@@ -186,7 +209,18 @@ def test_operator_then_first_customer_then_member_lifecycle(boundary, monkeypatc
     assert join("101")["platform_operator"] is True
     assert state["fields"]["owner_customer_id"] == "202"
     assert tags_by_id["101"] == ["super-admin"]
-    claimed.assert_called_once()
+    claimed.assert_called_once_with(core, "handoff-test", "202")
+    assert ledger["claim_status"] == "claimed"
+    assert ledger["claimed_customer_id"] == "202"
+    assert ledger["expires_at"] is None
+    assert ledger["delete_due_at"] is None
+    for key in ("product_status", "product_id", "product_handle", "reservation_id", "completed_at"):
+        assert ledger["prospect_demo"][key] == recovered_product[key]
+    assert ledger["prospect_demo"]["event_counts"]["store_successfully_claimed"] == 1
+    assert prospect_demo._confirm_unclaimed(core, "handoff-test", ledger) is False
+    # A failed bookkeeping write must not reopen demo access after Shopify claims.
+    stale_ledger = dict(ledger, claim_status="unclaimed", store_status="anonymous_demo_unclaimed")
+    assert prospect_demo._confirm_unclaimed(core, "handoff-test", stale_ledger) is False
 
 
 def test_operator_join_still_requires_authenticated_relay(boundary):
