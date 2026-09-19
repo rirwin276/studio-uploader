@@ -4,12 +4,13 @@
 # Steps:
 # 1. Look up custom_shop metaobject by handle via GraphQL Admin API
 # 2. Extract logo file GIDs, collection GID from the metaobject
-# 3. Find all products with the store handle as a tag (tag-based search) and DELETE them
-# 4. Delete the Shopify collection
-# 5. Strip storefront-admin--{handle} and storefront-member--{handle} tags from ALL
+# 3. Inventory product/variant print-file metafields before deleting anything
+# 4. Delete all products with the store handle tag, then their unique Shopify Files
+# 5. Delete the Shopify collection
+# 6. Strip storefront-admin--{handle} and storefront-member--{handle} tags from ALL
 #    customers who have them (paginated, cursor-based GraphQL)
-# 6. Delete the custom_shop metaobject entry
 # 7. Delete logo files from Shopify Files API (if GIDs available)
+# 8. Delete the custom_shop metaobject entry
 #
 # Usage as CLI:
 #   python shopify_deprovision.py --handle <store-handle>
@@ -25,7 +26,8 @@ import os
 import json
 import time
 import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 
@@ -196,6 +198,203 @@ def get_products_by_tag(handle: str) -> List[Dict[str, Any]]:
         cursor = page_info.get("endCursor")
 
     return products
+
+
+# -----------------------------
+# Product-owned Shopify Files
+# -----------------------------
+def _canonical_url(value: str) -> str:
+    """Normalize a CDN URL for exact identity comparisons."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
+
+
+def _shopify_file_url(value: Any) -> str:
+    """Return a canonical Shopify Files URL, never an arbitrary external URL."""
+    url = _canonical_url(str(value or ""))
+    if not url:
+        return ""
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower()
+    if "/files/" not in parsed.path or not (
+        host == "cdn.shopify.com" or host.endswith(".myshopify.com")
+    ):
+        return ""
+    return url
+
+
+def _urls_in_json(value: Any) -> Set[str]:
+    found: Set[str] = set()
+    if isinstance(value, dict):
+        for nested in value.values():
+            found.update(_urls_in_json(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(_urls_in_json(nested))
+    elif isinstance(value, str):
+        url = _shopify_file_url(value)
+        if url:
+            found.add(url)
+    return found
+
+
+def print_file_urls_from_metafields(metafields: Iterable[Dict[str, Any]]) -> Set[str]:
+    """Collect print assets from product and variant ``custom`` metafields.
+
+    Today those are primarily product-level ``*_print_file_url`` values and
+    variant-level ``print_map`` JSON. Walking every custom JSON value keeps the
+    nuke path safe when new placements (sleeves, embroidery, etc.) are added.
+    Only Shopify Files URLs are accepted; external/shared service URLs are not.
+    """
+    found: Set[str] = set()
+    for metafield in metafields or []:
+        if str(metafield.get("namespace") or "custom") != "custom":
+            continue
+        raw = metafield.get("value")
+        direct = _shopify_file_url(raw)
+        if direct:
+            found.add(direct)
+            continue
+        if not isinstance(raw, str):
+            continue
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        found.update(_urls_in_json(decoded))
+    return found
+
+
+def get_product_print_file_urls(product_id: str) -> Set[str]:
+    """Read all product and variant metafields before the product is deleted."""
+    q = """
+    query getProductPrintFiles($id: ID!, $after: String) {
+      product(id: $id) {
+        metafields(first: 100, namespace: "custom") {
+          nodes { namespace key type value }
+        }
+        variants(first: 100, after: $after) {
+          nodes {
+            metafields(first: 100, namespace: "custom") {
+              nodes { namespace key type value }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+    """
+    urls: Set[str] = set()
+    cursor = None
+    while True:
+        data = shopify_graphql(q, {"id": product_id, "after": cursor})
+        product = data.get("product")
+        if not product:
+            return urls
+        urls.update(print_file_urls_from_metafields((product.get("metafields") or {}).get("nodes") or []))
+        variants = product.get("variants") or {}
+        for variant in variants.get("nodes") or []:
+            urls.update(
+                print_file_urls_from_metafields(
+                    ((variant or {}).get("metafields") or {}).get("nodes") or []
+                )
+            )
+        page = variants.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return urls
+        cursor = page.get("endCursor")
+
+
+def _file_node_urls(node: Dict[str, Any]) -> Set[str]:
+    urls: Set[str] = set()
+    direct = _shopify_file_url(node.get("url"))
+    if direct:
+        urls.add(direct)
+    image = node.get("image") or {}
+    image_url = _shopify_file_url(image.get("url"))
+    if image_url:
+        urls.add(image_url)
+    return urls
+
+
+def get_files(query: str) -> List[Dict[str, Any]]:
+    """Search Shopify Files with complete cursor pagination."""
+    q = """
+    query getStoreFiles($query: String!, $after: String) {
+      files(first: 100, query: $query, after: $after) {
+        nodes {
+          id
+          ... on MediaImage { image { url } }
+          ... on GenericFile { url }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    result: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        data = shopify_graphql(q, {"query": query, "after": cursor})
+        page = data.get("files") or {}
+        result.extend(page.get("nodes") or [])
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return result
+        cursor = info.get("endCursor")
+
+
+def _url_filename(url: str) -> str:
+    return unquote(urlsplit(str(url or "")).path.rsplit("/", 1)[-1]).lower()
+
+
+def get_file_gids_for_urls(urls: Iterable[str]) -> Set[str]:
+    """Resolve current Shopify File GIDs from the URLs stored in metafields."""
+    wanted = {_canonical_url(url) for url in urls}
+    wanted.discard("")
+    by_filename: Dict[str, Set[str]] = {}
+    for url in wanted:
+        by_filename.setdefault(_url_filename(url), set()).add(url)
+
+    found: Set[str] = set()
+    for filename, expected_urls in by_filename.items():
+        # Filename search avoids scanning the merchant's entire Files library.
+        for node in get_files(f'filename:"{filename}"'):
+            if _file_node_urls(node) & expected_urls and node.get("id"):
+                found.add(str(node["id"]))
+    return found
+
+
+def _store_owned_filename(filename: str, handle: str) -> bool:
+    """Recognize only names generated uniquely for one storefront."""
+    filename = str(filename or "").lower()
+    handle = str(handle or "").lower()
+    return bool(handle) and (
+        filename.startswith(f"print_{handle}_")
+        or filename.startswith(f"mockup_{handle}_")
+        or filename.startswith(f"{handle}__")
+    )
+
+
+def get_store_named_file_gids(handle: str) -> Set[str]:
+    """Find retryable/orphaned generated assets even after products are gone."""
+    prefixes = (
+        f"print_{handle}_",
+        f"mockup_{handle}_",
+        f"{handle}__",
+    )
+    found: Set[str] = set()
+    for prefix in prefixes:
+        for node in get_files(f"filename:{prefix}*"):
+            if not node.get("id"):
+                continue
+            if any(_store_owned_filename(_url_filename(url), handle) for url in _file_node_urls(node)):
+                found.add(str(node["id"]))
+    return found
 
 
 # -----------------------------
@@ -387,9 +586,6 @@ def delete_metaobject(metaobject_id: str) -> None:
 # -----------------------------
 def delete_files(file_gids: List[str]) -> None:
     """Delete one or more files from Shopify Files (by GID)."""
-    if not file_gids:
-        return
-
     q = """
     mutation fileDelete($fileIds: [ID!]!) {
       fileDelete(fileIds: $fileIds) {
@@ -398,11 +594,20 @@ def delete_files(file_gids: List[str]) -> None:
       }
     }
     """
-    data = shopify_graphql(q, {"fileIds": file_gids})
-    res = data.get("fileDelete") or {}
-    errs = res.get("userErrors") or []
-    if errs:
-        raise RuntimeError(f"fileDelete userErrors: {json.dumps(errs, indent=2)}")
+    # Shopify input arrays are capped. Chunking also gives a precise failure
+    # instead of turning a large store cleanup into one oversized mutation.
+    unique = list(dict.fromkeys(str(gid) for gid in file_gids if gid))
+    for offset in range(0, len(unique), 100):
+        batch = unique[offset:offset + 100]
+        data = shopify_graphql(q, {"fileIds": batch})
+        res = data.get("fileDelete") or {}
+        errs = res.get("userErrors") or []
+        if errs:
+            raise RuntimeError(f"fileDelete userErrors: {json.dumps(errs, indent=2)}")
+        deleted = {str(gid) for gid in (res.get("deletedFileIds") or [])}
+        missing = [gid for gid in batch if gid not in deleted]
+        if missing:
+            raise RuntimeError(f"fileDelete did not confirm deletion of: {missing}")
 
 
 # -----------------------------
@@ -469,47 +674,88 @@ def deprovision(handle: str, log: List[str]) -> List[str]:
         _log(f"🖼️  secondary_logo_gid: {secondary_logo_gid}")
 
     # ------------------------------------------------------------------
-    # Step 3: Find and DELETE all products tagged with this store handle
+    # Step 3: Inventory products and their separately stored print files.
+    # This must finish before a product is deleted or its metafields disappear.
     # ------------------------------------------------------------------
-    _log(f"🗑️  Step 3: Finding and deleting all products with tag {handle!r}")
+    _log(f"🔍 Step 3: Inventorying products and generated files for {handle!r}")
     try:
         tagged_products = get_products_by_tag(handle)
-        _log(f"   Found {len(tagged_products)} product(s) to delete")
-        for product in tagged_products:
-            pid = product["id"]
-            # Double-check the tag is actually on this product (safety check)
-            if handle in (product.get("tags") or []):
-                try:
-                    _log(f"   Deleting product {pid}")
-                    delete_product(pid)
-                    _log(f"   ✅ Product deleted: {pid}")
-                except Exception as e:
-                    _log(f"   ⚠️  Failed to delete product {pid}: {e}")
-                    _failed("product", f"{pid} {e}")
-            else:
-                _log(f"   ℹ️  Product {pid} does not have tag {handle!r} — skipping (safety)")
+        safe_products = [
+            product for product in tagged_products
+            if handle in (product.get("tags") or [])
+        ]
+        print_file_urls: Set[str] = set()
+        for product in safe_products:
+            print_file_urls.update(get_product_print_file_urls(product["id"]))
+        product_file_gids = get_file_gids_for_urls(print_file_urls)
+        # The filename scan is essential for retries: after a partial cleanup,
+        # the product/metafield may already be gone while its file remains.
+        product_file_gids.update(get_store_named_file_gids(handle))
+        _log(
+            f"   Found {len(safe_products)} product(s), "
+            f"{len(print_file_urls)} referenced print URL(s), and "
+            f"{len(product_file_gids)} generated Shopify file(s)"
+        )
     except Exception as e:
-        _log(f"⚠️  Step 3 error (non-fatal): {e}")
-        _failed("products", e)
+        _log(f"❌ Step 3 inventory failed before deletion: {e}")
+        _failed("inventory", e)
+        return failures
 
     # ------------------------------------------------------------------
-    # Step 4: Delete the collection
+    # Step 4: Delete products, then their unique print/mockup files.
+    # Do not remove files while any product survives: its Printful print_map
+    # still needs those URLs to fulfill an order.
+    # ------------------------------------------------------------------
+    _log(f"🗑️  Step 4: Deleting {len(safe_products)} product(s)")
+    product_delete_failed = False
+    for product in safe_products:
+        pid = product["id"]
+        try:
+            _log(f"   Deleting product {pid}")
+            delete_product(pid)
+            _log(f"   ✅ Product deleted: {pid}")
+        except Exception as e:
+            product_delete_failed = True
+            _log(f"   ⚠️  Failed to delete product {pid}: {e}")
+            _failed("product", f"{pid} {e}")
+
+    if product_delete_failed:
+        _log("❌ Skipping generated-file deletion because at least one product still exists")
+        return failures
+
+    if product_file_gids:
+        try:
+            delete_files(sorted(product_file_gids))
+            _log(f"✅ Deleted {len(product_file_gids)} product print/mockup file(s)")
+        except Exception as e:
+            _log(f"⚠️  Product file deletion failed: {e}")
+            _failed("product-files", e)
+            # Preserve the collection/metaobject for a clean retry. The next
+            # pass can recover files by their handle-specific filenames even
+            # though the products and metafields are already gone.
+            return failures
+    else:
+        _log("ℹ️  No separate product print/mockup files found")
+
+    # ------------------------------------------------------------------
+    # Step 5: Delete the collection
     # ------------------------------------------------------------------
     if collection_gid:
-        _log(f"🗑️  Step 4: Deleting collection {collection_gid}")
+        _log(f"🗑️  Step 5: Deleting collection {collection_gid}")
         try:
             delete_collection(collection_gid)
             _log(f"✅ Collection deleted: {collection_gid}")
         except Exception as e:
-            _log(f"⚠️  Step 4 error (non-fatal): {e}")
+            _log(f"⚠️  Step 5 error (non-fatal): {e}")
             _failed("collection", e)
+            return failures
     else:
-        _log("ℹ️  Step 4: No collection_gid — skipping collection deletion")
+        _log("ℹ️  Step 5: No collection_gid — skipping collection deletion")
 
     # ------------------------------------------------------------------
-    # Step 5: Strip storefront-admin/member tags from ALL customers
+    # Step 6: Strip storefront-admin/member tags from ALL customers
     # ------------------------------------------------------------------
-    _log(f"👥 Step 5: Stripping tags {admin_tag!r} and {member_tag!r} from all customers")
+    _log(f"👥 Step 6: Stripping tags {admin_tag!r} and {member_tag!r} from all customers")
 
     tags_to_strip = [admin_tag, member_tag]
     # Collect unique customer IDs from both tag searches
@@ -522,7 +768,7 @@ def deprovision(handle: str, log: List[str]) -> List[str]:
             for c in customers:
                 tagged_customers[c["id"]] = c
         except Exception as e:
-            _log(f"⚠️  Step 5 tag search error ({search_tag!r}): {e}")
+            _log(f"⚠️  Step 6 tag search error ({search_tag!r}): {e}")
             _failed("customer-tag-search", f"{search_tag} {e}")
 
     _log(f"   Total unique customers to untag: {len(tagged_customers)}")
@@ -531,22 +777,8 @@ def deprovision(handle: str, log: List[str]) -> List[str]:
             customer_remove_tags(cid, tags_to_strip)
             _log(f"   ✅ Untagged customer {cid}")
         except Exception as e:
-            _log(f"⚠️  Step 5 untag error for {cid}: {e}")
+            _log(f"⚠️  Step 6 untag error for {cid}: {e}")
             _failed("customer-untag", f"{cid} {e}")
-
-    # ------------------------------------------------------------------
-    # Step 6: Delete the metaobject
-    # ------------------------------------------------------------------
-    if metaobject_id:
-        _log(f"🗑️  Step 6: Deleting metaobject {metaobject_id}")
-        try:
-            delete_metaobject(metaobject_id)
-            _log(f"✅ Metaobject deleted: {metaobject_id}")
-        except Exception as e:
-            _log(f"⚠️  Step 6 error (non-fatal): {e}")
-            _failed("metaobject", e)
-    else:
-        _log("ℹ️  Step 6: No metaobject_id — skipping")
 
     # ------------------------------------------------------------------
     # Step 7: Delete logo files
@@ -562,6 +794,26 @@ def deprovision(handle: str, log: List[str]) -> List[str]:
             _failed("logo-files", e)
     else:
         _log("ℹ️  Step 7: No logo files to delete")
+
+    # Keep the metaobject until every referenced logo is gone. If fileDelete
+    # fails, leaving the reference in place makes the next nuke retryable.
+    if any(failure.startswith("logo-files:") for failure in failures):
+        _log("❌ Keeping the custom_shop metaobject so logo deletion can retry")
+        return failures
+
+    # ------------------------------------------------------------------
+    # Step 8: Delete the metaobject last
+    # ------------------------------------------------------------------
+    if metaobject_id:
+        _log(f"🗑️  Step 8: Deleting metaobject {metaobject_id}")
+        try:
+            delete_metaobject(metaobject_id)
+            _log(f"✅ Metaobject deleted: {metaobject_id}")
+        except Exception as e:
+            _log(f"⚠️  Step 8 error (non-fatal): {e}")
+            _failed("metaobject", e)
+    else:
+        _log("ℹ️  Step 8: No metaobject_id — skipping")
 
     if failures:
         _log(f"❌ Deprovision INCOMPLETE for {handle!r} — {len(failures)} step(s) failed:")
