@@ -1,0 +1,27 @@
+name: Editor source review
+on:
+  push:
+    branches: [fix/editor-logo-padding-20261015]
+    paths: [.github/workflows/editor-source-review.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rirwin276/Printful_Automation
+          ref: main
+          persist-credentials: false
+      - name: Export source without credentials or generated files
+        run: |
+          mkdir -p review
+          git rev-parse HEAD > review/commit.txt
+          git archive --format=zip HEAD -o review/printful-source.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editor-source-review
+          path: review/
+          retention-days: 1
