@@ -1,0 +1,118 @@
+name: Verify editor artwork (read only)
+
+on:
+  push:
+    branches: [fix/editor-logo-padding-20261015]
+    paths: [.github/workflows/verify-editor-artwork.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install Pillow
+      - name: Export checked-out source for local regression tests
+        run: |
+          mkdir -p review
+          git archive --format=zip HEAD -o review/source.zip
+      - name: Compare original artwork and exact transparent-border crop
+        env:
+          SOURCE_URL: https://cdn.shopify.com/s/files/1/0798/2055/4490/files/all-for-children-llc-demo-a8ab34_logo_544ccb57-eca1-4795-9467-a055dff9166c.png?v=1792118934
+        run: |
+          python - <<'PY'
+          import hashlib, io, json, os, urllib.request
+          from pathlib import Path
+          from PIL import Image, ImageDraw, ImageFont
+          out = Path('review')
+          url = os.environ['SOURCE_URL']
+          try:
+              request = urllib.request.Request(url, headers={'User-Agent': 'StellaSage-Artwork-Verification/1.0'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  data = response.read(20 * 1024 * 1024 + 1)
+              if len(data) > 20 * 1024 * 1024:
+                  raise ValueError('Image exceeds the verification size limit')
+              raw = Image.open(io.BytesIO(data))
+              raw.load()
+              if raw.format != 'PNG' or getattr(raw, 'n_frames', 1) != 1:
+                  raise ValueError('Expected the original single-frame PNG')
+              original = raw.convert('RGBA')
+              bbox = original.getchannel('A').getbbox()
+              if not bbox:
+                  raise ValueError('Fully transparent image: keep original, do not publish a crop')
+              cropped = original.crop(bbox)
+              (out / 'all_for_children_original.png').write_bytes(data)
+              options = {k: raw.info[k] for k in ('icc_profile', 'dpi') if k in raw.info}
+              cropped.save(out / 'all_for_children_no_padding.png', format='PNG', **options)
+              verified = Image.open(out / 'all_for_children_no_padding.png').convert('RGBA')
+              assert verified.size == cropped.size
+              assert verified.tobytes() == cropped.tobytes(), 'Retained RGBA pixels changed'
+              restored = Image.new('RGBA', original.size)
+              restored.paste(verified, (bbox[0], bbox[1]))
+              assert restored.getchannel('A').tobytes() == original.getchannel('A').tobytes(), 'Alpha changed'
+              for background in ((255,255,255,255), (0,0,0,255), (64,128,192,255)):
+                  base = Image.new('RGBA', original.size, background)
+                  assert Image.alpha_composite(base, original).tobytes() == Image.alpha_composite(base, restored).tobytes(), 'Visible pixels changed'
+              report = {
+                  'status': 'verified',
+                  'source_url': url,
+                  'source_sha256': hashlib.sha256(data).hexdigest(),
+                  'original_size': original.size,
+                  'crop_box_exclusive': bbox,
+                  'cropped_size': cropped.size,
+                  'retained_rgba_pixels_identical': True,
+                  'alpha_identical_after_repositioning': True,
+                  'visible_pixels_identical_on_three_backgrounds': True,
+                  'operations': ['crop fully transparent outer rows/columns', 'lossless PNG encoding'],
+                  'resized': False,
+                  'redrawn': False,
+                  'shopify_modified': False,
+                  'crop_sha256': hashlib.sha256((out / 'all_for_children_no_padding.png').read_bytes()).hexdigest(),
+              }
+              (out / 'verification.json').write_text(json.dumps(report, indent=2))
+              canvas = Image.new('RGB', (1440, 880), 'white')
+              draw = ImageDraw.Draw(canvas)
+              font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+              title = ImageFont.truetype(font_path, 29)
+              text = ImageFont.truetype(font_path, 19)
+              draw.text((40, 24), 'ALL for Children — original and exact crop', fill=(25,25,25), font=title)
+              scale = min(640 / original.width, 640 / original.height)
+              for panel, (image, label) in enumerate(((original, 'Original saved image'), (cropped, 'No-padding editor copy'))):
+                  left = 40 + panel * 720
+                  draw.text((left, 83), label, fill=(25,25,25), font=title)
+                  draw.text((left, 125), f'{image.width} × {image.height} pixels · same viewing scale', fill=(70,70,70), font=text)
+                  size = (max(1, round(image.width*scale)), max(1, round(image.height*scale)))
+                  preview = image.resize(size, Image.Resampling.LANCZOS)
+                  check = Image.new('RGBA', size, (245,245,245,255))
+                  checker = ImageDraw.Draw(check)
+                  for y in range(0, size[1], 16):
+                      for x in range(0, size[0], 16):
+                          if (x//16+y//16)%2:
+                              checker.rectangle((x,y,x+15,y+15), fill=(222,222,222,255))
+                  check = Image.alpha_composite(check, preview).convert('RGB')
+                  x = left + (640-size[0])//2
+                  y = 166 + (640-size[1])//2
+                  canvas.paste(check, (x,y))
+                  draw.rectangle((x-1,y-1,x+size[0],y+size[1]), outline=(120,120,120), width=1)
+              draw.text((40, 839), 'Only empty outer canvas removed. Every visible source pixel preserved. Store unchanged.', fill=(25,25,25), font=text)
+              canvas.save(out / 'original_vs_no_padding.png')
+              print(json.dumps(report, indent=2))
+          except Exception as exc:
+              (out / 'verification_error.json').write_text(json.dumps({'status':'blocked','error':str(exc),'shopify_modified':False}, indent=2))
+              raise
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-artwork-review
+          path: review/
+          retention-days: 1
+          if-no-files-found: error
